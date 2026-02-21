@@ -56,6 +56,7 @@ import { handleOpenResponsesHttpRequest } from "./openresponses-http.js";
 import { GATEWAY_CLIENT_MODES, normalizeGatewayClientMode } from "./protocol/client-info.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
 import { handleToolsInvokeHttpRequest } from "./tools-invoke-http.js";
+import { handleUsageHttpRequest } from "./usage-http.js";
 
 type SubsystemLogger = ReturnType<typeof createSubsystemLogger>;
 type HookAuthFailure = { count: number; windowStartedAtMs: number };
@@ -531,6 +532,14 @@ export function createGatewayHttpServer(opts: {
         return;
       }
       if (await handleSlackHttpRequest(req, res)) {
+        return;
+      }
+      if (
+        await handleUsageHttpRequest(req, res, {
+          auth: resolvedAuth,
+          rateLimiter,
+        })
+      ) {
         return;
       }
       if (handlePluginRequest) {
