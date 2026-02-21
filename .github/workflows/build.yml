@@ -1,0 +1,25 @@
+name: Build & publish
+on:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: latest }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - run: pnpm install
+      - run: pnpm ui:build
+      - run: pnpm build
+      - run: npm pack
+      - name: Upload to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: eu-west-2
+        run: |
+          aws s3 cp openclaw-*.tgz s3://cody-openclaw-builds/openclaw-cody.tgz \
+            --acl public-read

@@ -81,6 +81,7 @@ import type { GatewayWsClient } from "./server/ws-types.js";
 import { handleSessionKillHttpRequest } from "./session-kill-http.js";
 import { handleSessionHistoryHttpRequest } from "./sessions-history-http.js";
 import { handleToolsInvokeHttpRequest } from "./tools-invoke-http.js";
+import { handleUsageHttpRequest } from "./usage-http.js";
 
 type SubsystemLogger = ReturnType<typeof createSubsystemLogger>;
 
@@ -940,6 +941,14 @@ export function createGatewayHttpServer(opts: {
         }),
       );
 
+      requestStages.push({
+        name: "usage",
+        run: () =>
+          handleUsageHttpRequest(req, res, {
+            auth: resolvedAuth,
+            rateLimiter,
+          }),
+      });
       if (controlUiEnabled) {
         requestStages.push({
           name: "control-ui-avatar",
