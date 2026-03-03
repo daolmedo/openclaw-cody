@@ -109,6 +109,29 @@ export const AgentDefaultsSchema = z
           })
           .strict()
           .optional(),
+        debrief: z
+          .object({
+            enabled: z.boolean().optional(),
+            prompt: z.string().optional(),
+          })
+          .strict()
+          .optional(),
+        dailyConsolidation: z
+          .object({
+            enabled: z.boolean().optional(),
+            cronExpr: z.string().optional(),
+            model: z.string().optional(),
+          })
+          .strict()
+          .optional(),
+        weeklyCuration: z
+          .object({
+            enabled: z.boolean().optional(),
+            cronExpr: z.string().optional(),
+            model: z.string().optional(),
+          })
+          .strict()
+          .optional(),
       })
       .strict()
       .optional(),

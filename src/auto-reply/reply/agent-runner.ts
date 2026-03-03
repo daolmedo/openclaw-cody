@@ -37,7 +37,7 @@ import {
   isAudioPayload,
   signalTypingIfNeeded,
 } from "./agent-runner-helpers.js";
-import { runMemoryFlushIfNeeded } from "./agent-runner-memory.js";
+import { runMemoryDebriefIfNeeded, runMemoryFlushIfNeeded } from "./agent-runner-memory.js";
 import { buildReplyPayloads } from "./agent-runner-payloads.js";
 import {
   appendUnscheduledReminderNote,
@@ -218,21 +218,37 @@ export async function runReplyAgent(params: {
 
   await typingSignals.signalRunStart();
 
-  activeSessionEntry = await runMemoryFlushIfNeeded({
-    cfg,
-    followupRun,
-    promptForEstimate: followupRun.prompt,
-    sessionCtx,
-    opts,
-    defaultModel,
-    agentCfgContextTokens,
-    resolvedVerboseLevel,
-    sessionEntry: activeSessionEntry,
-    sessionStore: activeSessionStore,
-    sessionKey,
-    storePath,
-    isHeartbeat,
-  });
+  activeSessionEntry =
+    (await runMemoryDebriefIfNeeded({
+      cfg,
+      followupRun,
+      promptForEstimate: followupRun.prompt,
+      sessionCtx,
+      opts,
+      defaultModel,
+      agentCfgContextTokens,
+      resolvedVerboseLevel,
+      sessionEntry: activeSessionEntry,
+      sessionStore: activeSessionStore,
+      sessionKey,
+      storePath,
+      isHeartbeat,
+    })) ??
+    (await runMemoryFlushIfNeeded({
+      cfg,
+      followupRun,
+      promptForEstimate: followupRun.prompt,
+      sessionCtx,
+      opts,
+      defaultModel,
+      agentCfgContextTokens,
+      resolvedVerboseLevel,
+      sessionEntry: activeSessionEntry,
+      sessionStore: activeSessionStore,
+      sessionKey,
+      storePath,
+      isHeartbeat,
+    }));
 
   const runFollowupTurn = createFollowupRunner({
     opts,

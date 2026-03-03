@@ -16,6 +16,7 @@ import {
   resolveCronRunLogPath,
   resolveCronRunLogPruneOptions,
 } from "../cron/run-log.js";
+import { registerMemoryConsolidationJobs } from "../cron/jobs/memory-consolidation.js";
 import { CronService } from "../cron/service.js";
 import { resolveCronStorePath } from "../cron/store.js";
 import { normalizeHttpWebhookUrl } from "../cron/webhook-url.js";
@@ -500,6 +501,12 @@ export function buildGatewayCronService(params: {
       }
     },
   });
+
+  if (cronEnabled) {
+    void registerMemoryConsolidationJobs(cron, params.cfg).catch((err) => {
+      cronLogger.warn({ err: String(err) }, "cron: failed to register memory consolidation jobs");
+    });
+  }
 
   return { cron, storePath, cronEnabled };
 }

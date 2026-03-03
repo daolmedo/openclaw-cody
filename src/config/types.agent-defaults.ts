@@ -299,6 +299,12 @@ export type AgentCompactionConfig = {
   identifierInstructions?: string;
   /** Pre-compaction memory flush (agentic turn). Default: enabled. */
   memoryFlush?: AgentCompactionMemoryFlushConfig;
+  /** Structured pre-compaction debrief (replaces generic flush when enabled). Default: enabled. */
+  debrief?: AgentCompactionDebriefConfig;
+  /** Daily memory consolidation cron job. Default: disabled (opt-in). */
+  dailyConsolidation?: AgentCompactionConsolidationConfig;
+  /** Weekly memory curation cron job. Default: disabled (opt-in). */
+  weeklyCuration?: AgentCompactionConsolidationConfig;
 };
 
 export type AgentCompactionMemoryFlushConfig = {
@@ -315,4 +321,20 @@ export type AgentCompactionMemoryFlushConfig = {
   prompt?: string;
   /** System prompt appended for the memory flush turn. */
   systemPrompt?: string;
+};
+
+export type AgentCompactionDebriefConfig = {
+  /** Enable the structured debrief (default: true). When enabled, runs instead of the generic flush. */
+  enabled?: boolean;
+  /** Override the debrief prompt (NO_REPLY is enforced if missing). */
+  prompt?: string;
+};
+
+export type AgentCompactionConsolidationConfig = {
+  /** Enable this cron job (default: false — opt-in). */
+  enabled?: boolean;
+  /** Cron expression for the job schedule. */
+  cronExpr?: string;
+  /** Optional model override for this job. */
+  model?: string;
 };

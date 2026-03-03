@@ -37,6 +37,7 @@ import {
   resolveMemoryFlushSettings,
   shouldRunMemoryFlush,
 } from "./memory-flush.js";
+import { resolveDebriefSettings } from "./memory-debrief.js";
 import type { FollowupRun } from "./queue.js";
 import { incrementCompactionCount } from "./session-updates.js";
 
@@ -541,4 +542,63 @@ export async function runMemoryFlushIfNeeded(params: {
   }
 
   return activeSessionEntry;
+}
+
+/**
+ * Runs a structured debrief agent turn if the debrief feature is enabled and
+ * conditions match those for a memory flush (same token threshold, same
+ * one-per-compaction-cycle guard, same sandbox writability check).
+ *
+ * Returns the (possibly updated) session entry when a debrief was attempted,
+ * or undefined when debrief is disabled — allowing the caller to fall back to
+ * the generic memory flush.
+ */
+export async function runMemoryDebriefIfNeeded(params: {
+  cfg: OpenClawConfig;
+  followupRun: FollowupRun;
+  promptForEstimate?: string;
+  sessionCtx: TemplateContext;
+  opts?: GetReplyOptions;
+  defaultModel: string;
+  agentCfgContextTokens?: number;
+  resolvedVerboseLevel: VerboseLevel;
+  sessionEntry?: SessionEntry;
+  sessionStore?: Record<string, SessionEntry>;
+  sessionKey?: string;
+  storePath?: string;
+  isHeartbeat: boolean;
+}): Promise<SessionEntry | undefined> {
+  const debriefSettings = resolveDebriefSettings(params.cfg);
+  if (!debriefSettings) {
+    // Debrief disabled — caller should fall through to generic flush.
+    return undefined;
+  }
+
+  // Reuse the memory flush infrastructure for trigger gating (same token
+  // threshold, same one-per-compaction-cycle guard, same sandbox writability
+  // check). Override the prompt with the structured debrief prompt so the
+  // embedded agent writes to memory/debriefs/ instead of the generic log.
+  // Force memoryFlush.enabled=true so the debrief always runs when the
+  // threshold is met, regardless of any separate memoryFlush.enabled setting.
+  const existingMemoryFlush = params.cfg.agents?.defaults?.compaction?.memoryFlush;
+  return runMemoryFlushIfNeeded({
+    ...params,
+    cfg: {
+      ...params.cfg,
+      agents: {
+        ...params.cfg.agents,
+        defaults: {
+          ...params.cfg.agents?.defaults,
+          compaction: {
+            ...params.cfg.agents?.defaults?.compaction,
+            memoryFlush: {
+              ...existingMemoryFlush,
+              enabled: true,
+              prompt: debriefSettings.prompt,
+            },
+          },
+        },
+      },
+    },
+  });
 }
