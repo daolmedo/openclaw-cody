@@ -132,6 +132,65 @@ Skills provide your tools. When you need one, check its `SKILL.md`. Keep local n
 - **Discord links:** Wrap multiple links in `<>` to suppress embeds: `<https://example.com>`
 - **WhatsApp:** No headers — use **bold** or CAPS for emphasis
 
+## Integrations — Use SAK First
+
+The user has a Cody dashboard where they enable third-party integrations (CRM, LinkedIn, GitHub,
+Stripe, analytics tools, etc.) and store their credentials securely. **SAK (`sak`) is your
+gateway to all of them.**
+
+### The rule: check before you act
+
+Whenever the user asks about anything involving an external service, **always run this first:**
+
+    sak integrations
+
+This queries their live dashboard and returns which services are connected:
+
+    hubspot (connected)
+    salesforce
+    github (connected)
+    linkedin
+    stripe (connected)
+
+**Connected → proceed.** Use SAK commands or `sak <service> credentials` to get credentials and
+call the API. See the `integrations` skill for the full command reference.
+
+**Not connected → tell them, clearly:**
+> "I can see from your Cody dashboard that [Service] isn't connected yet. You can enable it and
+> add your credentials from the integrations panel."
+
+Always try to go through SAK before looking for a workaround — the dashboard is the preferred
+source of truth for credentials. That said, if the user explicitly provides API keys or asks you
+to proceed manually, you can do so.
+
+### Available integrations (17)
+
+| Service ID      | What it covers |
+|-----------------|----------------|
+| `hubspot`       | CRM — contacts, deals, companies |
+| `salesforce`    | CRM — leads, opportunities, accounts |
+| `github`        | Repos, issues, pull requests, code |
+| `gitlab`        | Projects, issues, merge requests |
+| `linear`        | Issues, projects, cycles |
+| `jira`          | Issues, projects, sprints |
+| `google_drive`  | Files and folders |
+| `notion`        | Pages, databases, blocks |
+| `asana`         | Tasks, projects, workspaces |
+| `intercom`      | Conversations, contacts, companies |
+| `mailchimp`     | Campaigns, audiences, analytics |
+| `stripe`        | Customers, subscriptions, invoices |
+| `chartmogul`    | MRR, churn, revenue metrics |
+| `mixpanel`      | Events, funnels, retention |
+| `amplitude`     | Analytics, user behaviour, funnels |
+| `airtable`      | Bases, tables, records |
+| `linkedin`      | Profiles, messaging, search, connections, company, jobs |
+
+### Error handling
+
+- **401 / expired token:** Tell the user to reconnect the service from the dashboard.
+- **Integration was working, now isn't:** Same — reconnect from dashboard.
+- **Service not in the list above:** It's not a supported integration yet; say so honestly.
+
 ## 💓 Heartbeats - Be Proactive!
 
 When you receive a heartbeat poll (message matches the configured heartbeat prompt), don't just reply `HEARTBEAT_OK` every time. Use heartbeats productively!
