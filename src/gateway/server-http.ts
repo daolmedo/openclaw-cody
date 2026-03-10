@@ -61,6 +61,7 @@ import {
 } from "./server/plugins-http.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
 import { handleToolsInvokeHttpRequest } from "./tools-invoke-http.js";
+import { handleAgentsApplyHttpRequest } from "./agents-apply-http.js";
 import { handleUsageHttpRequest } from "./usage-http.js";
 
 type SubsystemLogger = ReturnType<typeof createSubsystemLogger>;
@@ -595,6 +596,14 @@ export function createGatewayHttpServer(opts: {
           name: "usage",
           run: () =>
             handleUsageHttpRequest(req, res, {
+              auth: resolvedAuth,
+              rateLimiter,
+            }),
+        },
+        {
+          name: "agents-apply",
+          run: () =>
+            handleAgentsApplyHttpRequest(req, res, {
               auth: resolvedAuth,
               rateLimiter,
             }),
