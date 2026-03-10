@@ -1,4 +1,4 @@
-import { execSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -114,10 +114,11 @@ export async function handleAgentsApplyHttpRequest(
       }
     }
 
-    // Restart gateway so config changes take effect
-    execSync("openclaw gateway restart", { timeout: 15_000 });
-
+    // Send response first, then restart gateway (restart kills this process)
     sendJson(res, 200, { ok: true, agentCount: incoming.length });
+
+    // Fire-and-forget restart so config changes take effect
+    spawn("openclaw", ["gateway", "restart"], { detached: true, stdio: "ignore" }).unref();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     sendJson(res, 500, { ok: false, error: msg });
