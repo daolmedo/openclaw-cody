@@ -81,6 +81,7 @@ import type { GatewayWsClient } from "./server/ws-types.js";
 import { handleSessionKillHttpRequest } from "./session-kill-http.js";
 import { handleSessionHistoryHttpRequest } from "./sessions-history-http.js";
 import { handleToolsInvokeHttpRequest } from "./tools-invoke-http.js";
+import { handleAgentsApplyHttpRequest } from "./agents-apply-http.js";
 import { handleUsageHttpRequest } from "./usage-http.js";
 
 type SubsystemLogger = ReturnType<typeof createSubsystemLogger>;
@@ -859,6 +860,14 @@ export function createGatewayHttpServer(opts: {
               auth: resolvedAuth,
               trustedProxies,
               allowRealIpFallback,
+              rateLimiter,
+            }),
+        },
+        {
+          name: "agents-apply",
+          run: () =>
+            handleAgentsApplyHttpRequest(req, res, {
+              auth: resolvedAuth,
               rateLimiter,
             }),
         },

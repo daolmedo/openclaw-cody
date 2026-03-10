@@ -1,0 +1,124 @@
+import { execSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import type { AuthRateLimiter } from "./auth-rate-limit.js";
+import { authorizeHttpGatewayConnect, type ResolvedGatewayAuth } from "./auth.js";
+import { sendGatewayAuthFailure, sendJson, sendMethodNotAllowed } from "./http-common.js";
+import { getBearerToken } from "./http-utils.js";
+
+type AgentEntry = {
+  id: string;
+  name: string;
+  workspace: string;
+  agentDir: string;
+  [key: string]: unknown;
+};
+
+type Binding = {
+  agentId: string;
+  match: unknown;
+};
+
+export async function handleAgentsApplyHttpRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  opts: { auth: ResolvedGatewayAuth; rateLimiter?: AuthRateLimiter },
+): Promise<boolean> {
+  const url = new URL(req.url ?? "/", "http://localhost");
+  if (url.pathname !== "/api/agents/apply") return false;
+
+  if (req.method !== "POST") {
+    sendMethodNotAllowed(res, "POST");
+    return true;
+  }
+
+  const token = getBearerToken(req);
+  const authResult = await authorizeHttpGatewayConnect({
+    auth: opts.auth,
+    connectAuth: token ? { token, password: token } : null,
+    req,
+    trustedProxies: [],
+    allowRealIpFallback: false,
+    rateLimiter: opts.rateLimiter,
+  });
+  if (!authResult.ok) {
+    sendGatewayAuthFailure(res, authResult);
+    return true;
+  }
+
+  // Read request body
+  let body: Record<string, unknown>;
+  try {
+    const rawBody = await new Promise<string>((resolve, reject) => {
+      let data = "";
+      req.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+      req.on("end", () => resolve(data));
+      req.on("error", reject);
+    });
+    body = JSON.parse(rawBody);
+  } catch {
+    sendJson(res, 400, { ok: false, error: "Invalid JSON body" });
+    return true;
+  }
+
+  try {
+    const configPath = path.join(os.homedir(), ".openclaw", "openclaw.json");
+    const raw = fs.readFileSync(configPath, "utf8");
+    const config = JSON.parse(raw) as Record<string, unknown>;
+
+    // Backup
+    const backupPath = `${configPath}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+    fs.writeFileSync(backupPath, raw);
+
+    // Merge agents.list (upsert by id, preserve unknown agents)
+    const incoming = (body.agentsList as AgentEntry[]) ?? [];
+    const existingAgents = config.agents as { list?: AgentEntry[] } | undefined;
+    const existingList: AgentEntry[] = existingAgents?.list ?? [];
+    for (const agent of incoming) {
+      const idx = existingList.findIndex((a) => a.id === agent.id);
+      if (idx >= 0) existingList[idx] = { ...existingList[idx], ...agent };
+      else existingList.push(agent);
+    }
+    config.agents = { ...(config.agents as object ?? {}), list: existingList };
+
+    // Merge bindings (append new, never remove existing, never touch main's binding)
+    const existingBindings: Binding[] = (config.bindings as Binding[]) ?? [];
+    for (const b of (body.bindings as Binding[]) ?? []) {
+      if (!existingBindings.find((e) => e.agentId === b.agentId)) {
+        existingBindings.push(b);
+      }
+    }
+    config.bindings = existingBindings;
+
+    // Write atomically (temp file + rename)
+    const tmpPath = `${configPath}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(config, null, 2));
+    fs.renameSync(tmpPath, configPath);
+
+    // Create directories + write workspace files
+    const workspaceFiles = (body.workspaceFiles as Record<string, Record<string, string>>) ?? {};
+    for (const [agentId, files] of Object.entries(workspaceFiles)) {
+      const agent = incoming.find((a) => a.id === agentId);
+      if (!agent) continue;
+      fs.mkdirSync(agent.agentDir, { recursive: true });
+      fs.mkdirSync(agent.workspace, { recursive: true });
+      for (const [filename, content] of Object.entries(files)) {
+        if (content) {
+          fs.writeFileSync(path.join(agent.agentDir, filename.toUpperCase() + ".md"), content);
+        }
+      }
+    }
+
+    // Restart gateway so config changes take effect
+    execSync("openclaw gateway restart", { timeout: 15_000 });
+
+    sendJson(res, 200, { ok: true, agentCount: incoming.length });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    sendJson(res, 500, { ok: false, error: msg });
+  }
+
+  return true;
+}
