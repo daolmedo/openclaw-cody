@@ -83,10 +83,13 @@ export async function handleAgentsApplyHttpRequest(
     }
     config.agents = { ...(config.agents as object ?? {}), list: existingList };
 
-    // Merge bindings (append new, never remove existing, never touch main's binding)
+    // Merge bindings: update if agentId already has one, append if new, never remove others
     const existingBindings: Binding[] = (config.bindings as Binding[]) ?? [];
     for (const b of (body.bindings as Binding[]) ?? []) {
-      if (!existingBindings.find((e) => e.agentId === b.agentId)) {
+      const idx = existingBindings.findIndex((e) => e.agentId === b.agentId);
+      if (idx >= 0) {
+        existingBindings[idx] = b; // update channel assignment on re-deploy
+      } else {
         existingBindings.push(b);
       }
     }
@@ -105,8 +108,8 @@ export async function handleAgentsApplyHttpRequest(
       fs.mkdirSync(agent.agentDir, { recursive: true });
       fs.mkdirSync(agent.workspace, { recursive: true });
       for (const [filename, content] of Object.entries(files)) {
-        if (content) {
-          fs.writeFileSync(path.join(agent.agentDir, filename.toUpperCase() + ".md"), content);
+        if (content !== undefined && content !== "") {
+          fs.writeFileSync(path.join(agent.agentDir, filename), content);
         }
       }
     }
