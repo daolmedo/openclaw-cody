@@ -132,6 +132,14 @@ export async function handleAgentsApplyHttpRequest(
       }
     }
 
+    // Write skill files to ~/.openclaw/skills/<id>/SKILL.md
+    const skillFiles = (body.skillFiles as Record<string, string>) ?? {};
+    for (const [skillId, content] of Object.entries(skillFiles)) {
+      const skillDir = path.join(os.homedir(), ".openclaw", "skills", skillId);
+      fs.mkdirSync(skillDir, { recursive: true });
+      fs.writeFileSync(path.join(skillDir, "SKILL.md"), content, "utf8");
+    }
+
     // Send response first, then restart gateway (restart kills this process)
     sendJson(res, 200, { ok: true, agentCount: incoming.length });
 
