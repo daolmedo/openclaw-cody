@@ -117,8 +117,13 @@ export async function handleAgentsApplyHttpRequest(
     // Send response first, then restart gateway (restart kills this process)
     sendJson(res, 200, { ok: true, agentCount: incoming.length });
 
-    // Fire-and-forget restart so config changes take effect
-    spawn("openclaw", ["gateway", "restart"], { detached: true, stdio: "ignore" }).unref();
+    // Fire-and-forget restart via systemctl (openclaw gateway restart uses WebSocket
+    // which fails if gateway.remote.token != gateway.auth.token)
+    spawn("systemctl", ["--user", "restart", "openclaw-gateway.service"], {
+      detached: true,
+      stdio: "ignore",
+      env: { ...process.env, XDG_RUNTIME_DIR: "/run/user/1000" },
+    }).unref();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     sendJson(res, 500, { ok: false, error: msg });
