@@ -95,6 +95,12 @@ export async function handleAgentsApplyHttpRequest(
     }
     config.bindings = existingBindings;
 
+    // Ensure cron concurrency is always set — without this a zombie job blocks everything
+    const cron = config.cron as Record<string, unknown> | undefined ?? {};
+    if (!cron.maxConcurrentRuns || (cron.maxConcurrentRuns as number) < 4) {
+      config.cron = { ...cron, maxConcurrentRuns: 4 };
+    }
+
     // Merge channel configs (requireMention etc.) into channels.slack.channels
     const channelConfigs = (body.channelConfigs as Record<string, Record<string, unknown>>) ?? {};
     if (Object.keys(channelConfigs).length > 0) {
