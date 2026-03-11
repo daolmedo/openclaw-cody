@@ -95,6 +95,18 @@ export async function handleAgentsApplyHttpRequest(
     }
     config.bindings = existingBindings;
 
+    // Merge channel configs (requireMention etc.) into channels.slack.channels
+    const channelConfigs = (body.channelConfigs as Record<string, Record<string, unknown>>) ?? {};
+    if (Object.keys(channelConfigs).length > 0) {
+      const channels = config.channels as Record<string, unknown> | undefined ?? {};
+      const slack = channels.slack as Record<string, unknown> | undefined ?? {};
+      const slackChannels = slack.channels as Record<string, unknown> | undefined ?? {};
+      for (const [chId, chCfg] of Object.entries(channelConfigs)) {
+        slackChannels[chId] = { ...(slackChannels[chId] as object ?? {}), ...chCfg };
+      }
+      config.channels = { ...channels, slack: { ...slack, channels: slackChannels } };
+    }
+
     // Write atomically (temp file + rename)
     const tmpPath = `${configPath}.tmp`;
     fs.writeFileSync(tmpPath, JSON.stringify(config, null, 2));
