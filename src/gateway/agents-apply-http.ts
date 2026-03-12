@@ -133,11 +133,15 @@ export async function handleAgentsApplyHttpRequest(
     }
 
     // Write skill files to ~/.openclaw/skills/<id>/SKILL.md
+    // Only write if the file doesn't exist — agents may have customised it since initial deploy
     const skillFiles = (body.skillFiles as Record<string, string>) ?? {};
     for (const [skillId, content] of Object.entries(skillFiles)) {
       const skillDir = path.join(os.homedir(), ".openclaw", "skills", skillId);
-      fs.mkdirSync(skillDir, { recursive: true });
-      fs.writeFileSync(path.join(skillDir, "SKILL.md"), content, "utf8");
+      const skillPath = path.join(skillDir, "SKILL.md");
+      if (!fs.existsSync(skillPath)) {
+        fs.mkdirSync(skillDir, { recursive: true });
+        fs.writeFileSync(skillPath, content, "utf8");
+      }
     }
 
     // Send response first, then restart gateway (restart kills this process)
