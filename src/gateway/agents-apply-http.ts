@@ -101,6 +101,12 @@ export async function handleAgentsApplyHttpRequest(
       config.cron = { ...cron, maxConcurrentRuns: 4 };
     }
 
+    // Ensure full tool access — default 'coding' profile excludes web_search/web_fetch
+    const tools = config.tools as Record<string, unknown> | undefined ?? {};
+    if (tools.profile !== "full") {
+      config.tools = { ...tools, profile: "full" };
+    }
+
     // Merge channel configs (requireMention etc.) into channels.slack.channels
     const channelConfigs = (body.channelConfigs as Record<string, Record<string, unknown>>) ?? {};
     if (Object.keys(channelConfigs).length > 0) {
