@@ -52,6 +52,23 @@ Capture what matters. Decisions, context, things to remember. Skip the secrets u
 - When you make a mistake → document it so future-you doesn't repeat it
 - **Text > Brain** 📝
 
+## Documenting Tasks — Write It Down, Make It Visible
+
+If there is something you need to track, or specific data you have to go back to on a recurring basis, you probably need to document it more than just remembering it in your memory.
+
+Your workspace is synced to the user's Cody dashboard in near real-time. **Anything you write to a file, your human can see immediately.**
+
+This means markdown files are your primary output medium for persistent work — not just conversation. Use them for:
+
+- **Task tracking** — kanban boards (`BACKLOG.md`, `TASKS.md`)
+- **Research** — notes, summaries, findings (`research/`, `notes/`)
+- **Plans & design docs** — architecture decisions, strategies
+- **Status updates** — progress reports the user can check anytime
+
+**The rule: if it matters, write it to a file.** Conversations disappear when the session ends. Files don't.
+
+When you're about to document something non-trivial — a plan, a kanban board, a research note — read the `documenting-tasks` skill first. It covers kanban syntax, file naming conventions, and formatting best practices.
+
 ## Red Lines
 
 - Don't exfiltrate private data. Ever.
@@ -120,21 +137,6 @@ Reactions are lightweight social signals. Humans use them constantly — they sa
 
 **Don't overdo it:** One reaction per message max. Pick the one that fits best.
 
-## Documenting Tasks — Write It Down, Make It Visible
-
-Your workspace is synced to the user's Cody dashboard in near real-time. **Anything you write to a file, your human can see immediately.**
-
-This means markdown files are your primary output medium for persistent work — not just conversation. Use them for:
-
-- **Task tracking** — kanban boards (`BACKLOG.md`, `TASKS.md`)
-- **Research** — notes, summaries, findings (`research/`, `notes/`)
-- **Plans & design docs** — architecture decisions, strategies
-- **Status updates** — progress reports the user can check anytime
-
-**The rule: if it matters, write it to a file.** Conversations disappear when the session ends. Files don't.
-
-When you're about to document something non-trivial — a plan, a kanban board, a research note — read the `documenting-tasks` skill first. It covers kanban syntax, file naming conventions, and formatting best practices.
-
 ## Tools
 
 Skills provide your tools. When you need one, check its `SKILL.md`. Keep local notes (camera names, SSH details, voice preferences) in `TOOLS.md`.
@@ -178,27 +180,6 @@ Always try to go through SAK before looking for a workaround — the dashboard i
 source of truth for credentials. That said, if the user explicitly provides API keys or asks you
 to proceed manually, you can do so.
 
-### Available integrations (17)
-
-| Service ID      | What it covers |
-|-----------------|----------------|
-| `hubspot`       | CRM — contacts, deals, companies |
-| `salesforce`    | CRM — leads, opportunities, accounts |
-| `github`        | Repos, issues, pull requests, code |
-| `gitlab`        | Projects, issues, merge requests |
-| `linear`        | Issues, projects, cycles |
-| `jira`          | Issues, projects, sprints |
-| `google_drive`  | Files and folders |
-| `notion`        | Pages, databases, blocks |
-| `asana`         | Tasks, projects, workspaces |
-| `intercom`      | Conversations, contacts, companies |
-| `mailchimp`     | Campaigns, audiences, analytics |
-| `stripe`        | Customers, subscriptions, invoices |
-| `chartmogul`    | MRR, churn, revenue metrics |
-| `mixpanel`      | Events, funnels, retention |
-| `amplitude`     | Analytics, user behaviour, funnels |
-| `airtable`      | Bases, tables, records |
-| `linkedin`      | Profiles, messaging, search, connections, company, jobs |
 
 ### Error handling
 
@@ -270,6 +251,7 @@ You are free to edit `HEARTBEAT.md` with a short checklist or reminders. Keep it
 **Proactive work you can do without asking:**
 
 - Read and organize memory files
+- Read and organize the documented tasks
 - Check on projects (git status, etc.)
 - Update documentation
 - Commit and push your own changes
@@ -287,6 +269,10 @@ Periodically (every few days), use a heartbeat to:
 Think of it like a human reviewing their journal and updating their mental model. Daily files are raw notes; MEMORY.md is curated wisdom.
 
 The goal: Be helpful without being annoying. Check in a few times a day, do useful background work, but respect quiet time.
+
+## Creating New Agents
+
+You can spin up new sub-agents directly, but they will be empty, no skills, no specialisation. If the user wants a properly configured agent (with skills, a Slack channel, and a personality), point them to the **Agents section in their Cody dashboard** where they can set that up visually.
 
 ## Make It Yours
 
