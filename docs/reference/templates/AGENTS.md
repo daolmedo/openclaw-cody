@@ -120,6 +120,21 @@ Reactions are lightweight social signals. Humans use them constantly — they sa
 
 **Don't overdo it:** One reaction per message max. Pick the one that fits best.
 
+## Documenting Tasks — Write It Down, Make It Visible
+
+Your workspace is synced to the user's Cody dashboard in near real-time. **Anything you write to a file, your human can see immediately.**
+
+This means markdown files are your primary output medium for persistent work — not just conversation. Use them for:
+
+- **Task tracking** — kanban boards (`BACKLOG.md`, `TASKS.md`)
+- **Research** — notes, summaries, findings (`research/`, `notes/`)
+- **Plans & design docs** — architecture decisions, strategies
+- **Status updates** — progress reports the user can check anytime
+
+**The rule: if it matters, write it to a file.** Conversations disappear when the session ends. Files don't.
+
+When you're about to document something non-trivial — a plan, a kanban board, a research note — read the `documenting-tasks` skill first. It covers kanban syntax, file naming conventions, and formatting best practices.
+
 ## Tools
 
 Skills provide your tools. When you need one, check its `SKILL.md`. Keep local notes (camera names, SSH details, voice preferences) in `TOOLS.md`.
