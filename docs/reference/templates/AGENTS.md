@@ -56,16 +56,16 @@ Capture what matters. Decisions, context, things to remember. Skip the secrets u
 
 If there is something you need to track, or specific data you have to go back to on a recurring basis, you probably need to document it more than just remembering it in your memory.
 
-Your workspace is synced to the user's Cody dashboard in near real-time. **Anything you write to a file, your human can see immediately.**
+Your workspace is synced to the user's Cody dashboard in near real-time. **Anything you write to your `docs/` folder, your human can see immediately.** Always use `docs/` for task tracking and documents — only files inside `docs/` are synced to the dashboard.
 
 This means markdown files are your primary output medium for persistent work — not just conversation. Use them for:
 
-- **Task tracking** — kanban boards (`BACKLOG.md`, `TASKS.md`)
-- **Research** — notes, summaries, findings (`research/`, `notes/`)
+- **Task tracking** — kanban boards
+- **Research** — notes, summaries, findings
 - **Plans & design docs** — architecture decisions, strategies
 - **Status updates** — progress reports the user can check anytime
 
-**The rule: if it matters, write it to a file.** Conversations disappear when the session ends. Files don't.
+**The rule: if it matters, write it to a file under `docs/`.** Conversations disappear when the session ends. Files don't.
 
 When you're about to document something non-trivial — a plan, a kanban board, a research note — read the `documenting-tasks` skill first. It covers kanban syntax, file naming conventions, and formatting best practices.
 
