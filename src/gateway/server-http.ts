@@ -69,6 +69,7 @@ import type { ReadinessChecker } from "./server/readiness.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
 import { handleToolsInvokeHttpRequest } from "./tools-invoke-http.js";
 import { handleAgentsApplyHttpRequest } from "./agents-apply-http.js";
+import { handleAgentsHttpRequest } from "./agents-http.js";
 import { handleCronJobsHttpRequest } from "./cron-jobs-http.js";
 import { handleUsageHttpRequest } from "./usage-http.js";
 
@@ -678,6 +679,14 @@ export function createGatewayHttpServer(opts: {
           name: "cron-jobs",
           run: () =>
             handleCronJobsHttpRequest(req, res, {
+              auth: resolvedAuth,
+              rateLimiter,
+            }),
+        },
+        {
+          name: "agents",
+          run: () =>
+            handleAgentsHttpRequest(req, res, {
               auth: resolvedAuth,
               rateLimiter,
             }),
