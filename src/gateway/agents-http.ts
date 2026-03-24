@@ -51,13 +51,15 @@ export async function handleAgentsHttpRequest(
     const agentsList =
       (config.agents as { list?: Array<{ id: string; name?: string; workspace?: string }> } | undefined)?.list ?? [];
 
+    // Shared skills visible to all agents
+    const sharedSkillIds = listSkillIds(path.join(os.homedir(), ".openclaw", "skills"));
+
     const agents = agentsList.map((agent) => {
-      // Only return workspace skills — these are agent-specific (deployed or self-created).
-      // Shared skills (~/.openclaw/skills/) are system-wide and not surfaced here.
-      const skills = agent.workspace
+      const workspaceSkillIds = agent.workspace
         ? listSkillIds(path.join(agent.workspace, "skills"))
         : [];
-      return { id: agent.id, name: agent.name, skills };
+      const skills = [...new Set([...workspaceSkillIds, ...sharedSkillIds])];
+      return { id: agent.id, name: agent.name, skills, workspaceSkills: workspaceSkillIds };
     });
 
     sendJson(res, 200, { ok: true, agents });
