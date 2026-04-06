@@ -1,5 +1,10 @@
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  loadValidatedConfigForPluginRegistration,
+  registerSubCliByName,
+  registerSubCliCommands,
+} from "./register.subclis.js";
 
 const { acpAction, registerAcpCli } = vi.hoisted(() => {
   const action = vi.fn();
@@ -18,6 +23,13 @@ const { nodesAction, registerNodesCli } = vi.hoisted(() => {
   return { nodesAction: action, registerNodesCli: register };
 });
 
+const { registerQaCli } = vi.hoisted(() => ({
+  registerQaCli: vi.fn((program: Command) => {
+    const qa = program.command("qa");
+    qa.command("run").action(() => undefined);
+  }),
+}));
+
 const configModule = vi.hoisted(() => ({
   loadConfig: vi.fn(),
   readConfigFileSnapshot: vi.fn(),
@@ -25,10 +37,8 @@ const configModule = vi.hoisted(() => ({
 
 vi.mock("../acp-cli.js", () => ({ registerAcpCli }));
 vi.mock("../nodes-cli.js", () => ({ registerNodesCli }));
+vi.mock("../qa-cli.js", () => ({ registerQaCli }));
 vi.mock("../../config/config.js", () => configModule);
-
-const { loadValidatedConfigForPluginRegistration, registerSubCliByName, registerSubCliCommands } =
-  await import("./register.subclis.js");
 
 describe("registerSubCliCommands", () => {
   const originalArgv = process.argv;
@@ -85,6 +95,7 @@ describe("registerSubCliCommands", () => {
     expect(names).toContain("acp");
     expect(names).toContain("gateway");
     expect(names).toContain("clawbot");
+    expect(names).toContain("qa");
     expect(registerAcpCli).not.toHaveBeenCalled();
   });
 

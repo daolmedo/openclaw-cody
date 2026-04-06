@@ -5,6 +5,7 @@ public enum GatewayConnectAuthDetailCode: String, Sendable {
     case authRequired = "AUTH_REQUIRED"
     case authUnauthorized = "AUTH_UNAUTHORIZED"
     case authTokenMismatch = "AUTH_TOKEN_MISMATCH"
+    case authBootstrapTokenInvalid = "AUTH_BOOTSTRAP_TOKEN_INVALID"
     case authDeviceTokenMismatch = "AUTH_DEVICE_TOKEN_MISMATCH"
     case authTokenMissing = "AUTH_TOKEN_MISSING"
     case authTokenNotConfigured = "AUTH_TOKEN_NOT_CONFIGURED"
@@ -92,6 +93,7 @@ public struct GatewayConnectAuthError: LocalizedError, Sendable {
     public var isNonRecoverable: Bool {
         switch self.detail {
         case .authTokenMissing,
+            .authBootstrapTokenInvalid,
             .authTokenNotConfigured,
             .authPasswordMissing,
             .authPasswordMismatch,
@@ -123,6 +125,12 @@ public struct GatewayResponseError: LocalizedError, @unchecked Sendable {
             ? message!.trimmingCharacters(in: .whitespacesAndNewlines)
             : "gateway error"
         self.details = details ?? [:]
+    }
+
+    public var detailsReason: String? {
+        let raw = self.details["reason"]?.value as? String
+        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     public var errorDescription: String? {
