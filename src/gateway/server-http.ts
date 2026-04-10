@@ -85,6 +85,7 @@ import { handleAgentsApplyHttpRequest } from "./agents-apply-http.js";
 import { handleAgentsHttpRequest } from "./agents-http.js";
 import { handleCronJobsHttpRequest } from "./cron-jobs-http.js";
 import { handleUsageHttpRequest } from "./usage-http.js";
+import { handleFilesHttpRequest } from "./files-http.js";
 
 type SubsystemLogger = ReturnType<typeof createSubsystemLogger>;
 
@@ -972,6 +973,14 @@ export function createGatewayHttpServer(opts: {
         name: "usage",
         run: () =>
           handleUsageHttpRequest(req, res, {
+            auth: resolvedAuth,
+            rateLimiter,
+          }),
+      });
+      requestStages.push({
+        name: "files-write",
+        run: () =>
+          handleFilesHttpRequest(req, res, {
             auth: resolvedAuth,
             rateLimiter,
           }),
