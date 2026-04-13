@@ -83,6 +83,7 @@ import { handleSessionHistoryHttpRequest } from "./sessions-history-http.js";
 import { handleToolsInvokeHttpRequest } from "./tools-invoke-http.js";
 import { handleAgentsApplyHttpRequest } from "./agents-apply-http.js";
 import { handleAgentsHttpRequest } from "./agents-http.js";
+import { handleAgentSessionsHttpRequest } from "./agent-sessions-http.js";
 import { handleCronJobsHttpRequest } from "./cron-jobs-http.js";
 import { handleUsageHttpRequest } from "./usage-http.js";
 import { handleFilesHttpRequest } from "./files-http.js";
@@ -886,6 +887,14 @@ export function createGatewayHttpServer(opts: {
           name: "agents",
           run: () =>
             handleAgentsHttpRequest(req, res, {
+              auth: resolvedAuth,
+              rateLimiter,
+            }),
+        },
+        {
+          name: "agent-sessions",
+          run: () =>
+            handleAgentSessionsHttpRequest(req, res, {
               auth: resolvedAuth,
               rateLimiter,
             }),
