@@ -244,8 +244,9 @@ export async function handleAgentSessionsHttpRequest(
     return true;
   }
 
-  // List sessions for the agent
+  // List sessions for the agent — deduplicate by sessionId (multiple store keys can share one session)
   const store = readSessionStore(sessionsDir);
+  const seen = new Set<string>();
   const sessions = Object.values(store).map((entry) => {
     const e = entry as Record<string, unknown>;
     const sessionFile = typeof e.sessionFile === "string" ? e.sessionFile : undefined;
@@ -260,7 +261,12 @@ export async function handleAgentSessionsHttpRequest(
       sessionFile: sessionFile ? path.basename(sessionFile) : undefined,
       preview,
     };
-  }).filter((s) => s.sessionId);
+  }).filter((s) => {
+    if (!s.sessionId) return false;
+    if (seen.has(s.sessionId)) return false;
+    seen.add(s.sessionId);
+    return true;
+  });
 
   sessions.sort((a, b) => {
     const ta = typeof a.updatedAt === "number" ? a.updatedAt : 0;
