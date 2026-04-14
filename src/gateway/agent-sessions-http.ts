@@ -260,6 +260,7 @@ export async function handleAgentSessionsHttpRequest(
       origin: e.origin,
       sessionFile: sessionFile ? path.basename(sessionFile) : undefined,
       preview,
+      label: typeof e.label === "string" ? e.label : undefined,
     };
   }).filter((s) => {
     if (!s.sessionId) return false;
