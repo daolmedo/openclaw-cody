@@ -74,16 +74,21 @@ export async function handleAgentsApplyHttpRequest(
 
     // Merge agents.list (upsert by id, preserve unknown agents)
     const incoming = (body.agentsList as AgentEntry[]) ?? [];
+    const removeAgentIds = new Set<string>((body.removeAgentIds as string[] | undefined) ?? []);
     const existingAgents = config.agents as { list?: AgentEntry[] } | undefined;
-    const existingList: AgentEntry[] = existingAgents?.list ?? [];
+    let existingList: AgentEntry[] = existingAgents?.list ?? [];
     for (const agent of incoming) {
       const idx = existingList.findIndex((a) => a.id === agent.id);
       if (idx >= 0) existingList[idx] = { ...existingList[idx], ...agent };
       else existingList.push(agent);
     }
+    // Remove agents that were explicitly deleted from the canvas
+    if (removeAgentIds.size > 0) {
+      existingList = existingList.filter((a) => !removeAgentIds.has(a.id));
+    }
     config.agents = { ...(config.agents as object ?? {}), list: existingList };
 
-    // Merge bindings: update if agentId already has one, append if new, never remove others
+    // Merge bindings: update if agentId already has one, append if new
     const existingBindings: Binding[] = (config.bindings as Binding[]) ?? [];
     for (const b of (body.bindings as Binding[]) ?? []) {
       const idx = existingBindings.findIndex((e) => e.agentId === b.agentId);
@@ -93,7 +98,12 @@ export async function handleAgentsApplyHttpRequest(
         existingBindings.push(b);
       }
     }
-    config.bindings = existingBindings;
+    // Remove bindings for deleted agents
+    if (removeAgentIds.size > 0) {
+      config.bindings = existingBindings.filter((b) => !removeAgentIds.has(b.agentId));
+    } else {
+      config.bindings = existingBindings;
+    }
 
     // Ensure cron concurrency is always set — without this a zombie job blocks everything
     const cron = config.cron as Record<string, unknown> | undefined ?? {};
