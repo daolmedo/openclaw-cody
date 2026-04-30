@@ -129,6 +129,19 @@ export async function handleAgentsApplyHttpRequest(
       config.channels = { ...channels, slack: { ...slack, channels: slackChannels } };
     }
 
+    // Update WhatsApp phone number if provided
+    const whatsappPhoneNumber = body.whatsappPhoneNumber as string | undefined;
+    if (whatsappPhoneNumber) {
+      const channels = config.channels as Record<string, unknown> | undefined ?? {};
+      const tw = channels["twilio-whatsapp"] as Record<string, unknown> | undefined ?? {};
+      const accounts = tw.accounts as Record<string, unknown> | undefined ?? {};
+      const def = accounts.default as Record<string, unknown> | undefined ?? {};
+      accounts.default = { ...def, phoneNumber: whatsappPhoneNumber };
+      tw.accounts = accounts;
+      channels["twilio-whatsapp"] = tw;
+      config.channels = channels;
+    }
+
     // Write atomically (temp file + rename)
     const tmpPath = `${configPath}.tmp`;
     fs.writeFileSync(tmpPath, JSON.stringify(config, null, 2));
