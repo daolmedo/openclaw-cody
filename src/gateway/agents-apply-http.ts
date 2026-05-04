@@ -129,14 +129,27 @@ export async function handleAgentsApplyHttpRequest(
       config.channels = { ...channels, slack: { ...slack, channels: slackChannels } };
     }
 
-    // Update WhatsApp phone number if provided
+    // Update WhatsApp accounts.
+    // whatsappPhoneNumber (legacy): updates only accounts.default.phoneNumber
+    // whatsappAccounts (new): { accountId: phoneNumber } — each account inherits shared
+    // credentials (accountSid, authToken) from the existing default account.
     const whatsappPhoneNumber = body.whatsappPhoneNumber as string | undefined;
-    if (whatsappPhoneNumber) {
+    const whatsappAccounts = body.whatsappAccounts as Record<string, string> | undefined;
+    if (whatsappPhoneNumber || whatsappAccounts) {
       const channels = config.channels as Record<string, unknown> | undefined ?? {};
       const tw = channels["twilio-whatsapp"] as Record<string, unknown> | undefined ?? {};
-      const accounts = tw.accounts as Record<string, unknown> | undefined ?? {};
-      const def = accounts.default as Record<string, unknown> | undefined ?? {};
-      accounts.default = { ...def, phoneNumber: whatsappPhoneNumber };
+      const accounts = tw.accounts as Record<string, Record<string, unknown>> | undefined ?? {};
+      const sharedCreds = accounts.default
+        ? { accountSid: accounts.default.accountSid, authToken: accounts.default.authToken }
+        : {};
+      if (whatsappPhoneNumber) {
+        accounts.default = { ...sharedCreds, ...(accounts.default ?? {}), phoneNumber: whatsappPhoneNumber };
+      }
+      if (whatsappAccounts) {
+        for (const [accountId, phoneNumber] of Object.entries(whatsappAccounts)) {
+          accounts[accountId] = { ...sharedCreds, ...(accounts[accountId] ?? {}), phoneNumber };
+        }
+      }
       tw.accounts = accounts;
       channels["twilio-whatsapp"] = tw;
       config.channels = channels;
