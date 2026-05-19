@@ -206,6 +206,60 @@ export async function handleAgentsApplyHttpRequest(
       }
     }
 
+    // Sync exec-approvals.json for agents in "integrations-only" mode (exec.security: "allowlist").
+    // Only SAK is pre-approved; all other bash is hard-blocked for those agents.
+    // Only writes when something actually needs to change.
+    const SAK_PATH = "/home/ubuntu/.npm-global/bin/sak";
+    const approvalsPath = path.join(os.homedir(), ".openclaw", "exec-approvals.json");
+
+    const allowlistAgentIds = new Set(
+      existingList
+        .filter((a) => {
+          const tools = a.tools as Record<string, unknown> | undefined;
+          return (tools?.exec as Record<string, unknown> | undefined)?.security === "allowlist";
+        })
+        .map((a) => a.id),
+    );
+
+    let existingApprovals: Record<string, unknown> | null = null;
+    try {
+      existingApprovals = JSON.parse(fs.readFileSync(approvalsPath, "utf8"));
+    } catch { /* file may not exist */ }
+
+    const existingAgentApprovals = (existingApprovals?.agents as Record<string, unknown>) ?? {};
+    const agentsWithSak = new Set(
+      Object.keys(existingAgentApprovals).filter((id) => {
+        const allowlist = (existingAgentApprovals[id] as Record<string, unknown>)?.allowlist as Array<Record<string, unknown>> | undefined;
+        return allowlist?.some((e) => e.pattern === SAK_PATH);
+      }),
+    );
+
+    const needsApprovalsWrite = allowlistAgentIds.size > 0 || agentsWithSak.size > 0;
+    if (needsApprovalsWrite) {
+      if (!existingApprovals) existingApprovals = { version: 1, socket: {}, defaults: {}, agents: {} };
+      const agentApprovals = (existingApprovals.agents as Record<string, Record<string, unknown>>) ?? {};
+
+      for (const agent of existingList) {
+        if (allowlistAgentIds.has(agent.id)) {
+          const existing = agentApprovals[agent.id] ?? {};
+          const allowlist = (existing.allowlist as Array<Record<string, unknown>>) ?? [];
+          if (!allowlist.some((e) => e.pattern === SAK_PATH)) {
+            allowlist.push({ pattern: SAK_PATH });
+          }
+          agentApprovals[agent.id] = { ...existing, security: "allowlist", ask: "on-miss", askFallback: "deny", allowlist };
+        } else if (agentsWithSak.has(agent.id)) {
+          // Agent left allowlist mode — delete entry entirely so no stale security override remains
+          // (effective policy = stricter of openclaw.json and exec-approvals.json)
+          delete agentApprovals[agent.id];
+        }
+      }
+
+      existingApprovals.agents = agentApprovals;
+      const tmpApprovals = `${approvalsPath}.tmp`;
+      fs.writeFileSync(tmpApprovals, JSON.stringify(existingApprovals, null, 2));
+      fs.renameSync(tmpApprovals, approvalsPath);
+    }
+
     // Send response first, then restart gateway (restart kills this process)
     sendJson(res, 200, { ok: true, agentCount: incoming.length });
 

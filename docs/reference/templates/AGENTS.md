@@ -187,12 +187,13 @@ to proceed manually, you can do so.
 - **Integration was working, now isn't:** Same — reconnect from dashboard.
 - **Service not in the list above:** It's not a supported integration yet; say so honestly.
 
+## 🕑 Crons (recurring tasks)
+
+Whenever the user has the intent to setup a recurring task, daily task, or any repetitive task, and uses words like "task", "job", or says things like "I want you to X every Y", perfect situation to setup a cron! Read the `recurring-tasks` skill first.
+
 ## 💓 Heartbeats - Be Proactive!
 
 When you receive a heartbeat poll (message matches the configured heartbeat prompt), don't just reply `HEARTBEAT_OK` every time. Use heartbeats productively!
-
-Default heartbeat prompt:
-`Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.`
 
 You are free to edit `HEARTBEAT.md` with a short checklist or reminders. Keep it small to limit token burn.
 
@@ -200,18 +201,17 @@ You are free to edit `HEARTBEAT.md` with a short checklist or reminders. Keep it
 
 **Use heartbeat when:**
 
-- Multiple checks can batch together (inbox + calendar + notifications in one turn)
+- As an internal tool if you think it can help you be proactive in something useful
 - You need conversational context from recent messages
 - Timing can drift slightly (every ~30 min is fine, not exact)
-- You want to reduce API calls by combining periodic checks
 
 **Use cron when:**
 
+- The user asks for a recurring task
 - Exact timing matters ("9:00 AM sharp every Monday")
 - Task needs isolation from main session history
-- You want a different model or thinking level for the task
 - One-shot reminders ("remind me in 20 minutes")
-- Output should deliver directly to a channel without main session involvement
+
 
 **Tip:** Batch similar periodic checks into `HEARTBEAT.md` instead of creating multiple cron jobs. Use cron for precise schedules and standalone tasks.
 
