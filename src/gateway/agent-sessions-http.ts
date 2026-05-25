@@ -75,10 +75,10 @@ function readSessionPreview(sessionsDir: string, sessionFile: string | undefined
 }
 
 type TranscriptEntry =
-  | { kind: "user"; text: string }
-  | { kind: "assistant"; blocks: AssistantBlock[] }
-  | { kind: "tool_result"; toolCallId: string; text: string; isError: boolean }
-  | { kind: "status"; event: string; data?: unknown };
+  | { kind: "user"; text: string; timestamp?: string }
+  | { kind: "assistant"; blocks: AssistantBlock[]; timestamp?: string }
+  | { kind: "tool_result"; toolCallId: string; text: string; isError: boolean; timestamp?: string }
+  | { kind: "status"; event: string; data?: unknown; timestamp?: string };
 
 type AssistantBlock =
   | { type: "text"; text: string }
@@ -106,11 +106,12 @@ function parseTranscript(sessionsDir: string, sessionId: string): TranscriptEntr
     }
 
     const type = obj.type as string | undefined;
+    const timestamp = typeof obj.timestamp === "string" ? obj.timestamp : undefined;
 
     if (type === "session" || type === "thinking_level_change") continue;
 
     if (type === "model_change") {
-      entries.push({ kind: "status", event: "model_change", data: { provider: obj.provider, modelId: obj.modelId } });
+      entries.push({ kind: "status", event: "model_change", data: { provider: obj.provider, modelId: obj.modelId }, timestamp });
       continue;
     }
 
@@ -142,7 +143,7 @@ function parseTranscript(sessionsDir: string, sessionId: string): TranscriptEntr
       }
       // strip cron prefix
       text = text.replace(/^\[cron:[^\]]+\]\s*/, "").trim();
-      if (text) entries.push({ kind: "user", text });
+      if (text) entries.push({ kind: "user", text, timestamp });
       continue;
     }
 
@@ -166,7 +167,7 @@ function parseTranscript(sessionsDir: string, sessionId: string): TranscriptEntr
       } else if (typeof content === "string" && content.trim()) {
         blocks.push({ type: "text", text: content });
       }
-      if (blocks.length > 0) entries.push({ kind: "assistant", blocks });
+      if (blocks.length > 0) entries.push({ kind: "assistant", blocks, timestamp });
       continue;
     }
 
@@ -187,7 +188,7 @@ function parseTranscript(sessionsDir: string, sessionId: string): TranscriptEntr
       } else if (typeof content === "string") {
         text = content;
       }
-      entries.push({ kind: "tool_result", toolCallId, text, isError });
+      entries.push({ kind: "tool_result", toolCallId, text, isError, timestamp });
     }
   }
 
