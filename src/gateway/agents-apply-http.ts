@@ -129,20 +129,24 @@ export async function handleAgentsApplyHttpRequest(
       config.channels = { ...channels, slack: { ...slack, channels: slackChannels } };
     }
 
-    // Write Slack credentials when slackAccount is provided — used for WhatsApp-provisioned
-    // machines that later connect Slack, and to keep credentials fresh on re-deploy.
+    // Update Slack credentials — sets up channels.slack if not present yet.
+    // Accepts { botToken, appToken, signingSecret }. On first deploy for accounts
+    // provisioned without Slack (e.g. WhatsApp-first), this writes the full channel
+    // config. On re-deploys it only updates credentials, preserving other settings.
     const slackAccount = body.slackAccount as { botToken?: string; appToken?: string; signingSecret?: string } | undefined;
-    if (slackAccount?.botToken && slackAccount.appToken && slackAccount.signingSecret) {
+    if (slackAccount?.botToken && slackAccount?.appToken && slackAccount?.signingSecret) {
       const channels = config.channels as Record<string, unknown> | undefined ?? {};
       const existingSlack = channels.slack as Record<string, unknown> | undefined ?? {};
       channels.slack = {
-        enabled: true,
         mode: "http",
-        dmPolicy: "open",
+        webhookPath: "/slack/events",
+        enabled: true,
+        commands: { native: true },
+        userTokenReadOnly: false,
         groupPolicy: "open",
+        dmPolicy: "open",
         allowFrom: ["*"],
         ackReaction: "hourglass_flowing_sand",
-        ackReactionScope: "all",
         ...existingSlack,
         botToken: slackAccount.botToken,
         appToken: slackAccount.appToken,
