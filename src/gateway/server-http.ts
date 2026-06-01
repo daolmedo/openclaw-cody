@@ -39,6 +39,12 @@ import {
 import type { PreauthConnectionBudget } from "./server/preauth-connection-budget.js";
 import type { ReadinessChecker } from "./server/readiness.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
+import { handleAgentsApplyHttpRequest } from "./agents-apply-http.js";
+import { handleAgentsHttpRequest } from "./agents-http.js";
+import { handleAgentSessionsHttpRequest } from "./agent-sessions-http.js";
+import { handleCronJobsHttpRequest } from "./cron-jobs-http.js";
+import { handleUsageHttpRequest } from "./usage-http.js";
+import { handleFilesHttpRequest } from "./files-http.js";
 
 type PluginHttpRequestHandler = (
   req: IncomingMessage,
@@ -651,6 +657,30 @@ export function createGatewayHttpServer(opts: {
               allowRealIpFallback,
               rateLimiter,
             }),
+        });
+        requestStages.push({
+          name: "agents-apply",
+          run: () => handleAgentsApplyHttpRequest(req, res, { auth: resolvedAuth, rateLimiter }),
+        });
+        requestStages.push({
+          name: "cron-jobs",
+          run: () => handleCronJobsHttpRequest(req, res, { auth: resolvedAuth, rateLimiter }),
+        });
+        requestStages.push({
+          name: "agents",
+          run: () => handleAgentsHttpRequest(req, res, { auth: resolvedAuth, rateLimiter }),
+        });
+        requestStages.push({
+          name: "agent-sessions",
+          run: () => handleAgentSessionsHttpRequest(req, res, { auth: resolvedAuth, rateLimiter }),
+        });
+        requestStages.push({
+          name: "usage",
+          run: () => handleUsageHttpRequest(req, res, { auth: resolvedAuth, rateLimiter }),
+        });
+        requestStages.push({
+          name: "files-write",
+          run: () => handleFilesHttpRequest(req, res, { auth: resolvedAuth, rateLimiter }),
         });
       }
       if (openResponsesEnabled && isOpenResponsesPath(scopedRequestPath)) {
