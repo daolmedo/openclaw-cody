@@ -129,6 +129,29 @@ export async function handleAgentsApplyHttpRequest(
       config.channels = { ...channels, slack: { ...slack, channels: slackChannels } };
     }
 
+    // Write Slack credentials when slackAccount is provided — used for WhatsApp-provisioned
+    // machines that later connect Slack, and to keep credentials fresh on re-deploy.
+    const slackAccount = body.slackAccount as { botToken?: string; appToken?: string; signingSecret?: string } | undefined;
+    if (slackAccount?.botToken && slackAccount.appToken && slackAccount.signingSecret) {
+      const channels = config.channels as Record<string, unknown> | undefined ?? {};
+      const existingSlack = channels.slack as Record<string, unknown> | undefined ?? {};
+      channels.slack = {
+        enabled: true,
+        mode: "http",
+        dmPolicy: "open",
+        groupPolicy: "open",
+        allowFrom: ["*"],
+        ackReaction: "hourglass_flowing_sand",
+        ackReactionScope: "all",
+        ...existingSlack,
+        botToken: slackAccount.botToken,
+        appToken: slackAccount.appToken,
+        signingSecret: slackAccount.signingSecret,
+        streaming: { mode: "off", nativeTransport: false },
+      };
+      config.channels = channels;
+    }
+
     // Update WhatsApp accounts.
     // whatsappPhoneNumber (legacy): updates only accounts.default.phoneNumber
     // whatsappAccounts (new): { accountId: phoneNumber } — each account inherits shared
