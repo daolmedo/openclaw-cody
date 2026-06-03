@@ -90,7 +90,8 @@ export async function handleAgentsApplyHttpRequest(
 
     // Merge bindings: update if agentId already has one, append if new
     const existingBindings: Binding[] = (config.bindings as Binding[]) ?? [];
-    for (const b of (body.bindings as Binding[]) ?? []) {
+    const newBindings = (body.bindings as Binding[]) ?? [];
+    for (const b of newBindings) {
       const idx = existingBindings.findIndex((e) => e.agentId === b.agentId);
       if (idx >= 0) {
         existingBindings[idx] = b; // update channel assignment on re-deploy
@@ -98,12 +99,18 @@ export async function handleAgentsApplyHttpRequest(
         existingBindings.push(b);
       }
     }
+    // Remove stale bindings: canvas agents with no binding in this deploy had their
+    // channel removed — keep bindings only for non-canvas agents or agents with a new binding.
+    const canvasAgentIds = new Set(incoming.map((a) => a.id));
+    const newBindingAgentIds = new Set(newBindings.map((b) => b.agentId));
+    let updatedBindings = existingBindings.filter(
+      (b) => !canvasAgentIds.has(b.agentId) || newBindingAgentIds.has(b.agentId),
+    );
     // Remove bindings for deleted agents
     if (removeAgentIds.size > 0) {
-      config.bindings = existingBindings.filter((b) => !removeAgentIds.has(b.agentId));
-    } else {
-      config.bindings = existingBindings;
+      updatedBindings = updatedBindings.filter((b) => !removeAgentIds.has(b.agentId));
     }
+    config.bindings = updatedBindings;
 
     // Ensure cron concurrency is always set — without this a zombie job blocks everything
     const cron = config.cron as Record<string, unknown> | undefined ?? {};
