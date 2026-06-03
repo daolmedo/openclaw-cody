@@ -165,26 +165,39 @@ export async function handleAgentsApplyHttpRequest(
 
     // Update WhatsApp accounts.
     // whatsappPhoneNumber (legacy): updates only accounts.default.phoneNumber
-    // whatsappAccounts (new): { accountId: phoneNumber } — each account inherits shared
-    // credentials (accountSid, authToken) from the existing default account.
+    // whatsappAccounts: { accountId: { phoneNumber, accountSid, authToken } } (preferred)
+    //                or { accountId: phoneNumber } (legacy string format, backward compat)
     const whatsappPhoneNumber = body.whatsappPhoneNumber as string | undefined;
-    const whatsappAccounts = body.whatsappAccounts as Record<string, string> | undefined;
+    const whatsappAccounts = body.whatsappAccounts as Record<string, string | Record<string, unknown>> | undefined;
     if (whatsappPhoneNumber || whatsappAccounts) {
       const channels = config.channels as Record<string, unknown> | undefined ?? {};
       const tw = channels["twilio-whatsapp"] as Record<string, unknown> | undefined ?? {};
       const accounts = tw.accounts as Record<string, Record<string, unknown>> | undefined ?? {};
-      const sharedCreds = accounts.default
-        ? { accountSid: accounts.default.accountSid, authToken: accounts.default.authToken }
-        : {};
+
+      // Fallback shared creds for legacy string-format entries (scan all existing accounts)
+      const sharedCreds: { accountSid?: unknown; authToken?: unknown } = (() => {
+        for (const acct of Object.values(accounts)) {
+          if (acct.accountSid && acct.authToken) {
+            return { accountSid: acct.accountSid, authToken: acct.authToken };
+          }
+        }
+        return {};
+      })();
+
       if (whatsappPhoneNumber) {
         accounts.default = { ...sharedCreds, ...(accounts.default ?? {}), phoneNumber: whatsappPhoneNumber };
       }
       if (whatsappAccounts) {
         // Replace the entire accounts map so phones removed from the canvas are cleared.
-        // Preserving credentials per-account: prefer the existing entry's creds, fall back to sharedCreds.
         const newAccounts: Record<string, Record<string, unknown>> = {};
-        for (const [accountId, phoneNumber] of Object.entries(whatsappAccounts)) {
-          newAccounts[accountId] = { ...sharedCreds, ...(accounts[accountId] ?? {}), phoneNumber };
+        for (const [accountId, value] of Object.entries(whatsappAccounts)) {
+          if (typeof value === "string") {
+            // Legacy: just a phone number — inherit credentials from existing or shared
+            newAccounts[accountId] = { ...sharedCreds, ...(accounts[accountId] ?? {}), phoneNumber: value };
+          } else {
+            // New format: full account object with credentials supplied by backend
+            newAccounts[accountId] = { ...(accounts[accountId] ?? {}), ...value };
+          }
         }
         tw.accounts = newAccounts;
       } else {
