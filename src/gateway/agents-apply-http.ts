@@ -173,11 +173,16 @@ export async function handleAgentsApplyHttpRequest(
         accounts.default = { ...sharedCreds, ...(accounts.default ?? {}), phoneNumber: whatsappPhoneNumber };
       }
       if (whatsappAccounts) {
+        // Replace the entire accounts map so phones removed from the canvas are cleared.
+        // Preserving credentials per-account: prefer the existing entry's creds, fall back to sharedCreds.
+        const newAccounts: Record<string, Record<string, unknown>> = {};
         for (const [accountId, phoneNumber] of Object.entries(whatsappAccounts)) {
-          accounts[accountId] = { ...sharedCreds, ...(accounts[accountId] ?? {}), phoneNumber };
+          newAccounts[accountId] = { ...sharedCreds, ...(accounts[accountId] ?? {}), phoneNumber };
         }
+        tw.accounts = newAccounts;
+      } else {
+        tw.accounts = accounts;
       }
-      tw.accounts = accounts;
       channels["twilio-whatsapp"] = tw;
       config.channels = channels;
     }
