@@ -88,25 +88,29 @@ export async function handleAgentsApplyHttpRequest(
     }
     config.agents = { ...(config.agents as object ?? {}), list: existingList };
 
-    // Merge bindings: update if agentId already has one, append if new
+    // Merge bindings keyed on agentId + channel: an agent can have up to one binding
+    // per channel (slack, twilio-whatsapp, cody-direct-chat) so we must not clobber
+    // a different-channel binding when upserting.
     const existingBindings: Binding[] = (config.bindings as Binding[]) ?? [];
     const newBindings = (body.bindings as Binding[]) ?? [];
+    const bindingChannel = (b: Binding) => (b.match as Record<string, unknown>)?.channel as string | undefined;
+    const bindingKey = (b: Binding) => `${b.agentId}:${bindingChannel(b)}`;
     for (const b of newBindings) {
-      const idx = existingBindings.findIndex((e) => e.agentId === b.agentId);
+      const key = bindingKey(b);
+      const idx = existingBindings.findIndex((e) => bindingKey(e) === key);
       if (idx >= 0) {
-        existingBindings[idx] = b; // update channel assignment on re-deploy
+        existingBindings[idx] = b;
       } else {
         existingBindings.push(b);
       }
     }
-    // Remove stale bindings: canvas agents with no binding in this deploy had their
-    // channel removed — keep bindings only for non-canvas agents or agents with a new binding.
+    // Remove stale bindings per agentId+channel: if a canvas agent has no new binding
+    // for a specific channel, that channel binding is removed (e.g. Slack unassigned).
     const canvasAgentIds = new Set(incoming.map((a) => a.id));
-    const newBindingAgentIds = new Set(newBindings.map((b) => b.agentId));
+    const newBindingKeys = new Set(newBindings.map(bindingKey));
     let updatedBindings = existingBindings.filter(
-      (b) => !canvasAgentIds.has(b.agentId) || newBindingAgentIds.has(b.agentId),
+      (b) => !canvasAgentIds.has(b.agentId) || newBindingKeys.has(bindingKey(b)),
     );
-    // Remove bindings for deleted agents
     if (removeAgentIds.size > 0) {
       updatedBindings = updatedBindings.filter((b) => !removeAgentIds.has(b.agentId));
     }
