@@ -40,6 +40,7 @@ import type { PreauthConnectionBudget } from "./server/preauth-connection-budget
 import type { ReadinessChecker } from "./server/readiness.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
 import { handleAgentsApplyHttpRequest } from "./agents-apply-http.js";
+import { handleAgentBehaviorHttpRequest } from "./agent-behavior-http.js";
 import { handleAgentsHttpRequest } from "./agents-http.js";
 import { handleAgentSessionsHttpRequest } from "./agent-sessions-http.js";
 import { handleCronJobsHttpRequest } from "./cron-jobs-http.js";
@@ -670,6 +671,10 @@ export function createGatewayHttpServer(opts: {
       requestStages.push({
         name: "agents",
         run: () => handleAgentsHttpRequest(req, res, { auth: resolvedAuth, rateLimiter }),
+      });
+      requestStages.push({
+        name: "agent-behavior",
+        run: () => handleAgentBehaviorHttpRequest(req, res, { auth: resolvedAuth, rateLimiter }),
       });
       requestStages.push({
         name: "agent-sessions",
