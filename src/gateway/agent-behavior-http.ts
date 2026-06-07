@@ -55,7 +55,7 @@ function resolveBehaviorDir(agent: AgentEntry): string {
   const candidates =
     agent.id === "main"
       ? [agent.workspace, path.join(home, ".openclaw", "workspace"), agent.agentDir]
-      : [agent.agentDir, agent.workspace, path.join(home, `${agent.id}-agent`)];
+      : [agent.workspace, path.join(home, `${agent.id}-agent`), agent.agentDir];
 
   for (const candidate of candidates) {
     if (candidate && fs.existsSync(candidate)) {
