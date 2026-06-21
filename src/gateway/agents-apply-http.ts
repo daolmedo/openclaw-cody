@@ -140,6 +140,27 @@ export async function handleAgentsApplyHttpRequest(
       config.channels = { ...channels, slack: { ...slack, channels: slackChannels } };
     }
 
+    // Merge MS Teams per-channel configs (requireMention etc.) into the deeper
+    // channels.msteams.teams.<teamId>.channels.<conversationId> path. Teams nests one
+    // level deeper than Slack (channels.slack.channels.<id>) because Teams channels live
+    // under a team. Shape: { [teamId]: { [conversationId]: { ...chCfg } } }.
+    const msteamsChannelConfigs =
+      (body.msteamsChannelConfigs as Record<string, Record<string, Record<string, unknown>>>) ?? {};
+    if (Object.keys(msteamsChannelConfigs).length > 0) {
+      const channels = config.channels as Record<string, unknown> | undefined ?? {};
+      const msteams = channels.msteams as Record<string, unknown> | undefined ?? {};
+      const teams = msteams.teams as Record<string, Record<string, unknown>> | undefined ?? {};
+      for (const [teamId, convConfigs] of Object.entries(msteamsChannelConfigs)) {
+        const team = (teams[teamId] as Record<string, unknown> | undefined) ?? {};
+        const teamChannels = (team.channels as Record<string, unknown> | undefined) ?? {};
+        for (const [convId, chCfg] of Object.entries(convConfigs)) {
+          teamChannels[convId] = { ...(teamChannels[convId] as object ?? {}), ...chCfg };
+        }
+        teams[teamId] = { ...team, channels: teamChannels };
+      }
+      config.channels = { ...channels, msteams: { ...msteams, teams } };
+    }
+
     // Update Slack credentials — sets up channels.slack if not present yet.
     // Accepts { botToken, appToken, signingSecret }. On first deploy for accounts
     // provisioned without Slack (e.g. WhatsApp-first), this writes the full channel
