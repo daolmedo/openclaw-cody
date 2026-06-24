@@ -188,6 +188,31 @@ export async function handleAgentsApplyHttpRequest(
       config.channels = channels;
     }
 
+    // Update MS Teams credentials — sets up channels.msteams if not present yet.
+    // Accepts { appId, appPassword, tenantId }. On first deploy for accounts provisioned
+    // without Teams (e.g. Slack-first), this writes the full channel config; on re-deploys
+    // it only updates credentials, preserving other settings (e.g. teams.* per-channel config).
+    // OpenClaw msteams runs its own webhook server on port 3978; requireMention:false so a
+    // bound channel's agent answers every message ("each agent owns its channel").
+    const msteamsAccount = body.msteamsAccount as { appId?: string; appPassword?: string; tenantId?: string } | undefined;
+    if (msteamsAccount?.appId && msteamsAccount?.appPassword && msteamsAccount?.tenantId) {
+      const channels = config.channels as Record<string, unknown> | undefined ?? {};
+      const existingMsteams = channels.msteams as Record<string, unknown> | undefined ?? {};
+      channels.msteams = {
+        enabled: true,
+        webhook: { port: 3978, path: "/api/messages" },
+        dmPolicy: "open",
+        groupPolicy: "open",
+        allowFrom: ["*"],
+        requireMention: false,
+        ...existingMsteams,
+        appId: msteamsAccount.appId,
+        appPassword: msteamsAccount.appPassword,
+        tenantId: msteamsAccount.tenantId,
+      };
+      config.channels = channels;
+    }
+
     // Update WhatsApp accounts.
     // whatsappPhoneNumber (legacy): updates only accounts.default.phoneNumber
     // whatsappAccounts: { accountId: { phoneNumber, accountSid, authToken } } (preferred)
