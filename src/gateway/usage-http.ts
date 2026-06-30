@@ -10,6 +10,21 @@ import { sendGatewayAuthFailure, sendJson, sendMethodNotAllowed } from "./http-c
 import { getBearerToken } from "./http-utils.js";
 import { listAgentsForGateway } from "./session-utils.js";
 
+type GatewayUsageAgent = ReturnType<typeof listAgentsForGateway>["agents"][number];
+
+type AgentUsageSummary = {
+  id: string;
+  name?: GatewayUsageAgent["name"];
+  identity?: GatewayUsageAgent["identity"];
+  model?: GatewayUsageAgent["model"];
+  totals: CostUsageTotals;
+  daily: CostUsageSummary["daily"];
+};
+
+type AllAgentUsageSummary = CostUsageSummary & {
+  agents: AgentUsageSummary[];
+};
+
 function emptyTotals(): CostUsageTotals {
   return {
     input: 0,
@@ -44,28 +59,28 @@ async function loadAllAgentUsageSummary(params: {
   startMs: number;
   endMs: number;
   config: OpenClawConfig;
-}): Promise<CostUsageSummary> {
-  const agentIds = listAgentsForGateway(params.config).agents.map((agent) =>
-    normalizeAgentId(agent.id),
-  );
+}): Promise<AllAgentUsageSummary> {
+  const agents = listAgentsForGateway(params.config).agents;
   const summaries = await Promise.all(
-    agentIds.map((agentId) =>
-      loadCostUsageSummaryFromCache({
+    agents.map(async (agent) => {
+      const agentId = normalizeAgentId(agent.id);
+      const summary = await loadCostUsageSummaryFromCache({
         startMs: params.startMs,
         endMs: params.endMs,
         config: params.config,
         agentId,
         requestRefresh: true,
         refreshMode: "sync-when-empty",
-      }),
-    ),
+      });
+      return { agent, agentId, summary };
+    }),
   );
   const dailyByDate = new Map<string, CostUsageTotals & { date: string }>();
   const totals = emptyTotals();
   let updatedAt = 0;
   let days = 0;
 
-  for (const summary of summaries) {
+  for (const { summary } of summaries) {
     updatedAt = Math.max(updatedAt, summary.updatedAt);
     days = Math.max(days, summary.days);
     addTotals(totals, summary.totals);
@@ -81,6 +96,14 @@ async function loadAllAgentUsageSummary(params: {
     days,
     daily: Array.from(dailyByDate.values()).toSorted((a, b) => a.date.localeCompare(b.date)),
     totals,
+    agents: summaries.map(({ agent, agentId, summary }) => ({
+      id: agentId,
+      ...(agent.name ? { name: agent.name } : {}),
+      ...(agent.identity ? { identity: agent.identity } : {}),
+      ...(agent.model ? { model: agent.model } : {}),
+      totals: summary.totals,
+      daily: summary.daily,
+    })),
   };
 }
 
@@ -129,6 +152,7 @@ export async function handleUsageHttpRequest(
     ok: true,
     period: { start: startOfMonth.toISOString(), end: new Date(now).toISOString() },
     totals: summary.totals,
+    agents: summary.agents,
   });
   return true;
 }
