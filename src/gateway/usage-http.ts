@@ -67,6 +67,23 @@ function addTotals(target: CostUsageTotals, source: CostUsageTotals): void {
   target.missingCostEntries += source.missingCostEntries;
 }
 
+function mergeCacheStatus(
+  current: CostUsageSummary["cacheStatus"],
+  next: CostUsageSummary["cacheStatus"],
+): CostUsageSummary["cacheStatus"] {
+  if (!next) return current;
+  if (!current) return next;
+  const rank = { fresh: 0, partial: 1, refreshing: 2, stale: 3 } as const;
+  const status = rank[next.status] > rank[current.status] ? next.status : current.status;
+  return {
+    status,
+    cachedFiles: current.cachedFiles + next.cachedFiles,
+    pendingFiles: current.pendingFiles + next.pendingFiles,
+    staleFiles: current.staleFiles + next.staleFiles,
+    refreshedAt: Math.max(current.refreshedAt ?? 0, next.refreshedAt ?? 0) || undefined,
+  };
+}
+
 function parseUsageBoundary(raw: string | null, boundary: "start" | "end"): number | undefined {
   if (!raw) return undefined;
   const value = raw.trim();
@@ -128,7 +145,7 @@ async function loadAllAgentUsageSummary(params: {
         config: params.config,
         agentId,
         requestRefresh: true,
-        refreshMode: "sync-when-empty",
+        refreshMode: "background",
       });
       return { agent, agentId, summary };
     }),
@@ -137,10 +154,12 @@ async function loadAllAgentUsageSummary(params: {
   const totals = emptyTotals();
   let updatedAt = 0;
   let days = 0;
+  let cacheStatus: CostUsageSummary["cacheStatus"];
 
   for (const { summary } of summaries) {
     updatedAt = Math.max(updatedAt, summary.updatedAt);
     days = Math.max(days, summary.days);
+    cacheStatus = mergeCacheStatus(cacheStatus, summary.cacheStatus);
     addTotals(totals, summary.totals);
     for (const day of summary.daily) {
       const entry = dailyByDate.get(day.date) ?? { date: day.date, ...emptyTotals() };
@@ -154,6 +173,7 @@ async function loadAllAgentUsageSummary(params: {
     days,
     daily: Array.from(dailyByDate.values()).toSorted((a, b) => a.date.localeCompare(b.date)),
     totals,
+    ...(cacheStatus ? { cacheStatus } : {}),
     agents: summaries.map(({ agent, agentId, summary }) => ({
       id: agentId,
       ...(agent.name ? { name: agent.name } : {}),
@@ -210,6 +230,7 @@ export async function handleUsageHttpRequest(
   sendJson(res, 200, {
     ok: true,
     period: { start: period.start.toISOString(), end: period.end.toISOString() },
+    cacheStatus: summary.cacheStatus,
     totals: summary.totals,
     agents: summary.agents,
   });
