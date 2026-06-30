@@ -6,7 +6,12 @@ import { loadCostUsageSummaryFromCache } from "../infra/session-cost-usage.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import type { AuthRateLimiter } from "./auth-rate-limit.js";
 import { authorizeHttpGatewayConnect, type ResolvedGatewayAuth } from "./auth.js";
-import { sendGatewayAuthFailure, sendJson, sendMethodNotAllowed } from "./http-common.js";
+import {
+  sendGatewayAuthFailure,
+  sendJson,
+  sendMethodNotAllowed,
+  sendText,
+} from "./http-common.js";
 import { getBearerToken } from "./http-utils.js";
 import { listAgentsForGateway } from "./session-utils.js";
 
@@ -23,6 +28,13 @@ type AgentUsageSummary = {
 
 type AllAgentUsageSummary = CostUsageSummary & {
   agents: AgentUsageSummary[];
+};
+
+type UsagePeriod = {
+  startMs: number;
+  endMs: number;
+  start: Date;
+  end: Date;
 };
 
 function emptyTotals(): CostUsageTotals {
@@ -53,6 +65,52 @@ function addTotals(target: CostUsageTotals, source: CostUsageTotals): void {
   target.cacheReadCost += source.cacheReadCost;
   target.cacheWriteCost += source.cacheWriteCost;
   target.missingCostEntries += source.missingCostEntries;
+}
+
+function parseUsageBoundary(raw: string | null, boundary: "start" | "end"): number | undefined {
+  if (!raw) return undefined;
+  const value = raw.trim();
+  if (!value) return undefined;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    const suffix = boundary === "start" ? "T00:00:00.000Z" : "T23:59:59.999Z";
+    const parsed = Date.parse(`${value}${suffix}`);
+    return Number.isFinite(parsed) ? parsed : Number.NaN;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : Number.NaN;
+}
+
+export function resolveUsagePeriodFromQuery(
+  searchParams: URLSearchParams,
+  nowMs = Date.now(),
+): UsagePeriod | { error: string } {
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const startOfMonth = new Date(now);
+  startOfMonth.setUTCDate(1);
+  startOfMonth.setUTCHours(0, 0, 0, 0);
+
+  const requestedStart = parseUsageBoundary(
+    searchParams.get("from") ?? searchParams.get("start"),
+    "start",
+  );
+  const requestedEnd = parseUsageBoundary(searchParams.get("to") ?? searchParams.get("end"), "end");
+
+  if (Number.isNaN(requestedStart) || Number.isNaN(requestedEnd)) {
+    return { error: "Invalid usage period. Use ISO timestamps or YYYY-MM-DD for from/to." };
+  }
+
+  const startMs = requestedStart ?? startOfMonth.getTime();
+  const endMs = requestedEnd ?? now;
+  if (startMs > endMs) {
+    return { error: "Invalid usage period. from must be before to." };
+  }
+
+  return {
+    startMs,
+    endMs,
+    start: new Date(startMs),
+    end: new Date(endMs),
+  };
 }
 
 async function loadAllAgentUsageSummary(params: {
@@ -135,14 +193,15 @@ export async function handleUsageHttpRequest(
   }
 
   const config = loadConfig();
-  const now = Date.now();
-  const startOfMonth = new Date();
-  startOfMonth.setUTCDate(1);
-  startOfMonth.setUTCHours(0, 0, 0, 0);
+  const period = resolveUsagePeriodFromQuery(url.searchParams);
+  if ("error" in period) {
+    sendText(res, 400, period.error);
+    return true;
+  }
 
   const summary = await loadAllAgentUsageSummary({
-    startMs: startOfMonth.getTime(),
-    endMs: now,
+    startMs: period.startMs,
+    endMs: period.endMs,
     config,
   });
 
@@ -150,7 +209,7 @@ export async function handleUsageHttpRequest(
   //   totalCost, inputCost, outputCost, cacheReadCost, cacheWriteCost, missingCostEntries }
   sendJson(res, 200, {
     ok: true,
-    period: { start: startOfMonth.toISOString(), end: new Date(now).toISOString() },
+    period: { start: period.start.toISOString(), end: period.end.toISOString() },
     totals: summary.totals,
     agents: summary.agents,
   });
