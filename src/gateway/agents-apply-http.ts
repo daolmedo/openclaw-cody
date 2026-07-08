@@ -140,26 +140,14 @@ export async function handleAgentsApplyHttpRequest(
       config.channels = { ...channels, slack: { ...slack, channels: slackChannels } };
     }
 
-    // Merge MS Teams per-channel configs (requireMention etc.) into the deeper
-    // channels.msteams.teams.<teamId>.channels.<conversationId> path. Teams nests one
-    // level deeper than Slack (channels.slack.channels.<id>) because Teams channels live
-    // under a team. Shape: { [teamId]: { [conversationId]: { ...chCfg } } }.
-    const msteamsChannelConfigs =
-      (body.msteamsChannelConfigs as Record<string, Record<string, Record<string, unknown>>>) ?? {};
-    if (Object.keys(msteamsChannelConfigs).length > 0) {
-      const channels = config.channels as Record<string, unknown> | undefined ?? {};
-      const msteams = channels.msteams as Record<string, unknown> | undefined ?? {};
-      const teams = msteams.teams as Record<string, Record<string, unknown>> | undefined ?? {};
-      for (const [teamId, convConfigs] of Object.entries(msteamsChannelConfigs)) {
-        const team = (teams[teamId] as Record<string, unknown> | undefined) ?? {};
-        const teamChannels = (team.channels as Record<string, unknown> | undefined) ?? {};
-        for (const [convId, chCfg] of Object.entries(convConfigs)) {
-          teamChannels[convId] = { ...(teamChannels[convId] as object ?? {}), ...chCfg };
-        }
-        teams[teamId] = { ...team, channels: teamChannels };
-      }
-      config.channels = { ...channels, msteams: { ...msteams, teams } };
-    }
+    // NOTE: MS Teams intentionally has no per-channel merge equivalent to Slack's
+    // channelConfigs above. Cody routes each Teams conversation to its agent via bindings
+    // (match.peer.id = conversation id) and governs group access with groupPolicy:"open",
+    // so no channels.msteams.teams allowlist is written. An allowlist keyed by the Graph
+    // aadGroupId (the only team id available at deploy time) can't be matched against the
+    // Bot Framework team thread id ("19:...@thread.tacv2") without Graph permissions, so
+    // the msteams plugin leaves it unresolved and silently drops every group message. Any
+    // stale allowlist from older deploys is cleared in the msteams credentials block below.
 
     // Update Slack credentials — sets up channels.slack if not present yet.
     // Accepts { botToken, appToken, signingSecret }. On first deploy for accounts
@@ -191,14 +179,14 @@ export async function handleAgentsApplyHttpRequest(
     // Update MS Teams credentials — sets up channels.msteams if not present yet.
     // Accepts { appId, appPassword, tenantId }. On first deploy for accounts provisioned
     // without Teams (e.g. Slack-first), this writes the full channel config; on re-deploys
-    // it only updates credentials, preserving other settings (e.g. teams.* per-channel config).
+    // it only updates credentials, preserving other settings.
     // OpenClaw msteams runs its own webhook server on port 3978; requireMention:false so a
     // bound channel's agent answers every message ("each agent owns its channel").
     const msteamsAccount = body.msteamsAccount as { appId?: string; appPassword?: string; tenantId?: string } | undefined;
     if (msteamsAccount?.appId && msteamsAccount?.appPassword && msteamsAccount?.tenantId) {
       const channels = config.channels as Record<string, unknown> | undefined ?? {};
       const existingMsteams = channels.msteams as Record<string, unknown> | undefined ?? {};
-      channels.msteams = {
+      const nextMsteams: Record<string, unknown> = {
         enabled: true,
         webhook: { port: 3978, path: "/api/messages" },
         dmPolicy: "open",
@@ -210,6 +198,12 @@ export async function handleAgentsApplyHttpRequest(
         appPassword: msteamsAccount.appPassword,
         tenantId: msteamsAccount.tenantId,
       };
+      // Self-heal: strip any stale team/channel allowlist carried over from older deploys.
+      // It's keyed by the Graph aadGroupId, which the msteams plugin can't resolve to the
+      // Bot Framework team thread id, so its mere presence drops every group message.
+      // Routing is handled by bindings; group access by groupPolicy:"open".
+      delete nextMsteams.teams;
+      channels.msteams = nextMsteams;
       config.channels = channels;
     }
 
