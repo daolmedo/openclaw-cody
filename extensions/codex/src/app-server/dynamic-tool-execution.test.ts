@@ -1,3 +1,4 @@
+// Codex tests cover dynamic tool execution plugin behavior.
 import { embeddedAgentLog } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -8,6 +9,7 @@ import {
   handleDynamicToolCallWithTimeout,
   resolveDynamicToolCallTimeoutMs,
   resolveTerminalDynamicToolBatchAction,
+  shouldBlockTerminalReleaseForNonTerminalDynamicToolResult,
   shouldReleaseTurnAfterTerminalDynamicTool,
   toCodexDynamicToolProgressResponse,
   toCodexDynamicToolProtocolResponse,
@@ -16,8 +18,8 @@ import type { CodexDynamicToolCallResponse } from "./protocol.js";
 
 describe("dynamic tool execution helpers", () => {
   afterEach(() => {
-    vi.useRealTimers();
     vi.restoreAllMocks();
+    vi.useRealTimers();
   });
 
   it("keeps explicit dynamic tool timeouts above the default bridge deadline", () => {
@@ -48,6 +50,70 @@ describe("dynamic tool execution helpers", () => {
           namespace: null,
           tool: "session_status",
           arguments: { timeoutMs: "1abc" },
+        },
+        config: undefined,
+      }),
+    ).toBe(CODEX_DYNAMIC_TOOL_TIMEOUT_MS);
+  });
+
+  it("honors timeoutSeconds when timeoutMs is absent", () => {
+    expect(
+      resolveDynamicToolCallTimeoutMs({
+        call: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          callId: "call-seconds",
+          namespace: null,
+          tool: "session_status",
+          arguments: { timeoutSeconds: 30 },
+        },
+        config: undefined,
+      }),
+    ).toBe(60_000);
+  });
+
+  it("prefers timeoutMs over timeoutSeconds", () => {
+    expect(
+      resolveDynamicToolCallTimeoutMs({
+        call: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          callId: "call-both",
+          namespace: null,
+          tool: "session_status",
+          arguments: { timeoutMs: 5_000, timeoutSeconds: 30 },
+        },
+        config: undefined,
+      }),
+    ).toBe(5_000);
+  });
+
+  it("ignores non-positive timeoutSeconds", () => {
+    expect(
+      resolveDynamicToolCallTimeoutMs({
+        call: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          callId: "call-bad-seconds",
+          namespace: null,
+          tool: "session_status",
+          arguments: { timeoutSeconds: -1 },
+        },
+        config: undefined,
+      }),
+    ).toBe(CODEX_DYNAMIC_TOOL_TIMEOUT_MS);
+  });
+
+  it("rejects fractional timeoutSeconds and falls back to the default", () => {
+    expect(
+      resolveDynamicToolCallTimeoutMs({
+        call: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          callId: "call-fractional-seconds",
+          namespace: null,
+          tool: "session_status",
+          arguments: { timeoutSeconds: 1.5 },
         },
         config: undefined,
       }),
@@ -119,6 +185,23 @@ describe("dynamic tool execution helpers", () => {
         config: undefined,
       }),
     ).toBe(CODEX_DYNAMIC_MESSAGE_TOOL_TIMEOUT_MS);
+    expect(
+      resolveDynamicToolCallTimeoutMs({
+        call: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          callId: "call-message-transport-timeout",
+          namespace: null,
+          tool: "message",
+          arguments: {
+            action: "send",
+            message: "long outbound update",
+            timeoutMs: 30_000,
+          },
+        },
+        config: undefined,
+      }),
+    ).toBe(CODEX_DYNAMIC_MESSAGE_TOOL_TIMEOUT_MS);
   });
 
   it("uses media image config and caps excessive dynamic tool timeouts", () => {
@@ -181,6 +264,8 @@ describe("dynamic tool execution helpers", () => {
     vi.useFakeTimers();
     let capturedSignal: AbortSignal | undefined;
     const onTimeout = vi.fn();
+    const onFallbackSelected = vi.fn();
+    const onAgentToolResult = vi.fn();
     const response = handleDynamicToolCallWithTimeout({
       call: {
         threadId: "thread-1",
@@ -193,11 +278,13 @@ describe("dynamic tool execution helpers", () => {
       toolBridge: {
         handleToolCall: vi.fn((_call, options) => {
           capturedSignal = options?.signal;
-          return new Promise<never>(() => undefined);
+          return new Promise<never>(() => {});
         }),
       },
       signal: new AbortController().signal,
       timeoutMs: 1,
+      onAgentToolResult,
+      onFallbackSelected,
       onTimeout,
     });
 
@@ -213,7 +300,110 @@ describe("dynamic tool execution helpers", () => {
       ],
     });
     expect(capturedSignal?.aborted).toBe(true);
+    expect(onFallbackSelected).toHaveBeenCalledOnce();
     expect(onTimeout).toHaveBeenCalledTimes(1);
+    expect(onAgentToolResult).toHaveBeenCalledWith({
+      toolName: "message",
+      result: {
+        content: [
+          {
+            type: "text",
+            text: "OpenClaw dynamic tool call timed out after 1ms while running tool message.",
+          },
+        ],
+        details: {
+          status: "failed",
+          error: "OpenClaw dynamic tool call timed out after 1ms while running tool message.",
+        },
+      },
+      isError: true,
+    });
+  });
+
+  it("lets a structured sessions_send timeout win after setup work", async () => {
+    vi.useFakeTimers();
+    const call = {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      callId: "call-session-send-timeout",
+      namespace: null,
+      tool: "sessions_send",
+      arguments: { sessionKey: "agent:child", message: "ping", timeoutSeconds: 1 },
+    };
+    const structuredTimeout: CodexDynamicToolCallResponse = {
+      success: true,
+      contentItems: [
+        {
+          type: "inputText" as const,
+          text: JSON.stringify({
+            runId: "run-child",
+            status: "timeout",
+            sentBeforeError: true,
+          }),
+        },
+      ],
+    };
+    const response = handleDynamicToolCallWithTimeout({
+      call,
+      toolBridge: {
+        handleToolCall: vi.fn(
+          () =>
+            new Promise<CodexDynamicToolCallResponse>((resolve) => {
+              // sessions_send can spend time resolving/snapshotting the target
+              // before its own timeoutSeconds wait starts.
+              setTimeout(() => resolve(structuredTimeout), 6_000);
+            }),
+        ),
+      },
+      signal: new AbortController().signal,
+      timeoutMs: resolveDynamicToolCallTimeoutMs({ call, config: undefined }),
+    });
+
+    await vi.advanceTimersByTimeAsync(6_000);
+
+    await expect(response).resolves.toEqual(structuredTimeout);
+  });
+
+  it("reports pre-execution cancellations to the private result observer", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("run cancelled"));
+    const onAgentToolResult = vi.fn();
+    const handleToolCall = vi.fn();
+
+    const result = await handleDynamicToolCallWithTimeout({
+      call: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "call-aborted",
+        namespace: null,
+        tool: "memory_search",
+        arguments: {},
+      },
+      toolBridge: { handleToolCall },
+      signal: controller.signal,
+      timeoutMs: 1_000,
+      onAgentToolResult,
+    });
+
+    expect(result).toEqual({
+      success: false,
+      contentItems: [
+        { type: "inputText", text: "OpenClaw dynamic tool call aborted before execution." },
+      ],
+    });
+    expect(handleToolCall).not.toHaveBeenCalled();
+    expect(onAgentToolResult).toHaveBeenCalledOnce();
+    expect(onAgentToolResult).toHaveBeenCalledWith({
+      toolName: "memory_search",
+      result: {
+        content: [{ type: "text", text: "OpenClaw dynamic tool call aborted before execution." }],
+        details: {
+          status: "failed",
+          error: "OpenClaw dynamic tool call aborted before execution.",
+        },
+      },
+      isError: true,
+    });
   });
 
   it("logs process poll timeout context separately from session idle", async () => {
@@ -229,7 +419,7 @@ describe("dynamic tool execution helpers", () => {
         arguments: { action: "poll", sessionId: "process-session", timeout: 30_000 },
       },
       toolBridge: {
-        handleToolCall: vi.fn(() => new Promise<never>(() => undefined)),
+        handleToolCall: vi.fn(() => new Promise<never>(() => {})),
       },
       signal: new AbortController().signal,
       timeoutMs: 1,
@@ -362,5 +552,27 @@ describe("dynamic tool execution helpers", () => {
         hasPendingTerminalDynamicToolRelease: true,
       }),
     ).toBe("release-pending-terminal");
+  });
+
+  it("does not let async-start tool results block terminal side-effect batches", () => {
+    const asyncStartedResponse = {
+      contentItems: [{ type: "inputText" as const, text: "Background task started." }],
+      success: true,
+    };
+    Object.defineProperty(asyncStartedResponse, "asyncStarted", {
+      configurable: true,
+      enumerable: false,
+      value: true,
+    });
+
+    expect(shouldBlockTerminalReleaseForNonTerminalDynamicToolResult(asyncStartedResponse)).toBe(
+      false,
+    );
+    expect(
+      shouldBlockTerminalReleaseForNonTerminalDynamicToolResult({
+        contentItems: [{ type: "inputText", text: "regular output" }],
+        success: true,
+      }),
+    ).toBe(true);
   });
 });

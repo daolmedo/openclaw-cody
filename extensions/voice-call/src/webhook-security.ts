@@ -1,6 +1,11 @@
+// Voice Call plugin module implements webhook security behavior.
 import crypto from "node:crypto";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { isLoopbackHost } from "openclaw/plugin-sdk/gateway-runtime";
+import {
+  isFutureDateTimestampMs,
+  resolveExpiresAtMsFromDurationMs,
+} from "openclaw/plugin-sdk/number-runtime";
 import { safeEqualSecret } from "openclaw/plugin-sdk/security-runtime";
 import {
   normalizeLowercaseStringOrEmpty,
@@ -43,7 +48,7 @@ function createSkippedVerificationReplayKey(provider: string, ctx: WebhookContex
 
 function pruneReplayCache(cache: ReplayCache, now: number): void {
   for (const [key, expiresAt] of cache.seenUntil) {
-    if (expiresAt <= now) {
+    if (!isFutureDateTimestampMs(expiresAt, { nowMs: now })) {
       cache.seenUntil.delete(key);
     }
   }
@@ -64,11 +69,14 @@ function markReplay(cache: ReplayCache, replayKey: string): boolean {
   }
 
   const existing = cache.seenUntil.get(replayKey);
-  if (existing && existing > now) {
+  if (existing !== undefined && isFutureDateTimestampMs(existing, { nowMs: now })) {
     return true;
   }
 
-  cache.seenUntil.set(replayKey, now + REPLAY_WINDOW_MS);
+  const expiresAt = resolveExpiresAtMsFromDurationMs(REPLAY_WINDOW_MS, { nowMs: now });
+  if (expiresAt !== undefined) {
+    cache.seenUntil.set(replayKey, expiresAt);
+  }
   if (cache.seenUntil.size > REPLAY_CACHE_MAX_ENTRIES) {
     pruneReplayCache(cache, now);
   }
@@ -364,6 +372,21 @@ function buildTwilioVerificationUrl(
   }
 }
 
+function redactTwilioVerificationUrlForDiagnostics(url: string): string {
+  try {
+    const parsed = new URL(url);
+    parsed.username = parsed.username ? "***" : "";
+    parsed.password = parsed.password ? "***" : "";
+    parsed.hash = parsed.hash ? "#***" : "";
+    for (const key of Array.from(parsed.searchParams.keys())) {
+      parsed.searchParams.set(key, "***");
+    }
+    return parsed.toString();
+  } catch {
+    return "<invalid verification URL>";
+  }
+}
+
 function stripPortFromUrl(url: string): string {
   try {
     const parsed = new URL(url);
@@ -405,7 +428,7 @@ function extractPortFromHostHeader(hostHeader?: string): string | undefined {
 interface TwilioVerificationResult {
   ok: boolean;
   reason?: string;
-  /** The URL that was used for verification (for debugging) */
+  /** The original URL that passed signature verification; never set on failures. */
   verificationUrl?: string;
   /** Whether we're running behind ngrok free tier */
   isNgrokFreeTier?: boolean;
@@ -673,11 +696,11 @@ export function verifyTwilioWebhook(
   // Check if this is ngrok free tier - the URL might have different format
   const isNgrokFreeTier =
     verificationUrl.includes(".ngrok-free.app") || verificationUrl.includes(".ngrok.io");
+  const diagnosticVerificationUrl = redactTwilioVerificationUrlForDiagnostics(verificationUrl);
 
   return {
     ok: false,
-    reason: `Invalid signature for URL: ${verificationUrl}`,
-    verificationUrl,
+    reason: `Invalid signature for URL: ${diagnosticVerificationUrl}`,
     isNgrokFreeTier,
   };
 }

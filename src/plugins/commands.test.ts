@@ -1,3 +1,4 @@
+// Covers plugin CLI command behavior and output paths.
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
@@ -12,9 +13,10 @@ import {
   matchPluginCommand,
   registerPluginCommand,
 } from "./commands.js";
-import { createPluginRegistry, type PluginRecord } from "./registry.js";
+import { createPluginRegistry } from "./registry.js";
 import { setActivePluginRegistry } from "./runtime.js";
 import type { PluginRuntime } from "./runtime/types.js";
+import { createBundledPluginRecord } from "./status.test-helpers.js";
 
 const completionMocks = vi.hoisted(() => ({
   prepareSimpleCompletionModelForAgent: vi.fn(),
@@ -45,44 +47,6 @@ function createVoiceCommand(overrides: Partial<Parameters<typeof registerPluginC
     handler: async () => ({ text: "ok" }),
     ...overrides,
   };
-}
-
-function createBundledPluginRecord(id: string): PluginRecord {
-  return {
-    id,
-    name: id,
-    source: `bundled:${id}`,
-    rootDir: `/bundled/${id}`,
-    origin: "bundled",
-    enabled: true,
-    status: "loaded",
-    toolNames: [],
-    hookNames: [],
-    channelIds: [],
-    cliBackendIds: [],
-    providerIds: [],
-    embeddingProviderIds: [],
-    speechProviderIds: [],
-    realtimeTranscriptionProviderIds: [],
-    realtimeVoiceProviderIds: [],
-    mediaUnderstandingProviderIds: [],
-    transcriptSourceProviderIds: [],
-    imageGenerationProviderIds: [],
-    videoGenerationProviderIds: [],
-    musicGenerationProviderIds: [],
-    webFetchProviderIds: [],
-    webSearchProviderIds: [],
-    migrationProviderIds: [],
-    memoryEmbeddingProviderIds: [],
-    agentHarnessIds: [],
-    cliCommands: [],
-    services: [],
-    gatewayDiscoveryServiceIds: [],
-    commands: [],
-    httpRoutes: 0,
-    hookCount: 0,
-    configSchema: false,
-  } as PluginRecord;
 }
 
 function registerHostTrustedReservedCommandForTest(
@@ -516,6 +480,21 @@ describe("registerPluginCommand", () => {
     });
   });
 
+  it("matches plugin slash commands when users insert whitespace after the slash", () => {
+    registerPluginCommand("device-pair", {
+      name: "pair",
+      description: "Pair command",
+      acceptsArgs: true,
+      handler: async () => ({ text: "ok" }),
+    });
+
+    expectCommandMatch("/ pair qr", {
+      name: "pair",
+      pluginId: "device-pair",
+      args: "qr",
+    });
+  });
+
   it("supports provider-specific native command aliases", () => {
     const result = registerVoiceCommandForTest({
       nativeNames: {
@@ -735,6 +714,29 @@ describe("registerPluginCommand", () => {
     });
 
     expect(observedOwnerStatus).toBeUndefined();
+  });
+
+  it("sanitizes oversized arguments before passing them to plugin handlers", async () => {
+    let observedArgs: string | undefined;
+    registerVoiceCommandForTest({
+      acceptsArgs: true,
+      handler: async (ctx) => {
+        observedArgs = ctx.args;
+        return { text: "ok" };
+      },
+    });
+    const match = requirePluginCommandMatch(`/voice \0${"a".repeat(4094)}😀tail`);
+
+    await executePluginCommand({
+      command: match.command,
+      args: match.args,
+      channel: "telegram",
+      isAuthorizedSender: true,
+      commandBody: "/voice",
+      config: {},
+    });
+
+    expect(observedArgs).toBe("a".repeat(4094));
   });
 
   it("ignores owner status opt-in from direct plugin command registration", async () => {
@@ -1291,7 +1293,7 @@ describe("registerPluginCommand", () => {
       senderId: "U123",
       isAuthorizedSender: true,
       sessionKey: "agent:main:telegram:direct:runtimecheck",
-      authProfileId: "openai-codex:claude@example.com",
+      authProfileId: "openai:claude@example.com",
       commandBody: "/runtimecheck",
       config: {} as never,
     });
@@ -1378,7 +1380,7 @@ describe("registerPluginCommand", () => {
       isAuthorizedSender: true,
       agentId: "codex",
       sessionKey: "plugin-binding:openclaw-codex-app-server:dm",
-      authProfileId: "openai-codex:owner@example.com",
+      authProfileId: "openai:owner@example.com",
       commandBody: "/runtimecheck",
       config: {} as never,
     });
@@ -1386,7 +1388,7 @@ describe("registerPluginCommand", () => {
     expect(completionMocks.prepareSimpleCompletionModelForAgent).toHaveBeenCalledWith(
       expect.objectContaining({
         agentId: "codex",
-        preferredProfile: "openai-codex:owner@example.com",
+        preferredProfile: "openai:owner@example.com",
       }),
     );
   });

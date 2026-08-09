@@ -1,3 +1,4 @@
+// Wraps external content with source tags and random boundary tokens.
 import { randomBytes } from "node:crypto";
 export {
   isExternalHookSession,
@@ -246,14 +247,16 @@ function replaceMarkers(content: string): string {
     return content;
   }
   const replacements: Array<{ start: number; end: number; value: string }> = [];
-  // Match markers with or without id attribute (handles both legacy and spoofed markers)
+  // Match markers with or without id attribute (handles both legacy and spoofed
+  // markers). The id body is deliberately unbounded: any finite cap lets a
+  // forged marker with a longer id bypass sanitization.
   const patterns: Array<{ regex: RegExp; value: string }> = [
     {
-      regex: /<<<\s*EXTERNAL[\s_]+UNTRUSTED[\s_]+CONTENT(?:\s+id="[^"]{1,128}")?\s*>>>/gi,
+      regex: /<<<\s*EXTERNAL[\s_]+UNTRUSTED[\s_]+CONTENT(?:\s+id="[^"]*")?\s*>>>/gi,
       value: "[[MARKER_SANITIZED]]",
     },
     {
-      regex: /<<<\s*END[\s_]+EXTERNAL[\s_]+UNTRUSTED[\s_]+CONTENT(?:\s+id="[^"]{1,128}")?\s*>>>/gi,
+      regex: /<<<\s*END[\s_]+EXTERNAL[\s_]+UNTRUSTED[\s_]+CONTENT(?:\s+id="[^"]*")?\s*>>>/gi,
       value: "[[END_MARKER_SANITIZED]]",
     },
   ];
@@ -294,7 +297,7 @@ function replaceMarkers(content: string): string {
   return output;
 }
 
-function replaceLlmSpecialTokenLiterals(content: string): string {
+export function sanitizeModelSpecialTokens(content: string): string {
   let output = content;
   for (const literal of LLM_SPECIAL_TOKEN_LITERALS) {
     output = output.split(literal).join(SPECIAL_TOKEN_REPLACEMENT);
@@ -306,7 +309,7 @@ function replaceLlmSpecialTokenLiterals(content: string): string {
 }
 
 function sanitizeExternalContentText(content: string): string {
-  return replaceLlmSpecialTokenLiterals(replaceMarkers(content));
+  return sanitizeModelSpecialTokens(replaceMarkers(content));
 }
 
 export type WrapExternalContentOptions = {

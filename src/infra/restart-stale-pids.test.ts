@@ -1,3 +1,4 @@
+// Covers stale gateway process detection and cleanup.
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // This file primarily tests lsof-based Unix port polling. On Windows,
@@ -308,7 +309,7 @@ describe.skipIf(isWindows)("restart-stale-pids", () => {
         (call) => call[0] === "ps" && Array.isArray(call[1]) && (call[1] as unknown[])[0] === "-ww",
       );
       expect(psCall?.[1]).toEqual(["-ww", "-p", String(stalePid), "-o", "command="]);
-      expect(psCall?.[2]).toEqual({ timeout: 2000, encoding: "utf8" });
+      expect(psCall?.[2]).toEqual({ timeout: 2000, encoding: "utf8", killSignal: "SIGKILL" });
     });
 
     it("excludes ancestor pids so a sidecar cannot kill its parent gateway — regression for #68451", () => {
@@ -530,7 +531,11 @@ describe.skipIf(isWindows)("restart-stale-pids", () => {
           (call) =>
             call[0] === "ps" && Array.isArray(call[1]) && (call[1] as unknown[])[0] === "-o",
         );
-        expect(ancestorPsCall?.[2]).toEqual({ timeout: 400, encoding: "utf8" });
+        expect(ancestorPsCall?.[2]).toEqual({
+          encoding: "utf8",
+          killSignal: "SIGKILL",
+          timeout: 400,
+        });
       } finally {
         if (origDescriptor) {
           Object.defineProperty(process, "platform", origDescriptor);
@@ -795,6 +800,32 @@ describe.skipIf(isWindows)("restart-stale-pids", () => {
 
       expect(result).toContain(stalePid);
       expect(killSpy).toHaveBeenCalledWith(stalePid, "SIGTERM");
+    });
+
+    it("does not kill a protected gateway pid after reparenting", () => {
+      const protectedPid = process.pid + 4001;
+      const stalePid = process.pid + 4002;
+      let lsofCall = 0;
+      mockSpawnSync.mockImplementation(() => {
+        lsofCall += 1;
+        return lsofCall === 1
+          ? createLsofResult({
+              stdout: lsofOutput([
+                { pid: protectedPid, cmd: "openclaw-gateway" },
+                { pid: stalePid, cmd: "openclaw-gateway" },
+              ]),
+            })
+          : createLsofResult({ status: 1 });
+      });
+      const killSpy = vi.spyOn(process, "kill").mockReturnValue(true);
+
+      const result = withStubbedPpid(1, () =>
+        cleanStaleGatewayProcessesSync(18789, { protectedPid }),
+      );
+
+      expect(result).toEqual([stalePid]);
+      expect(killSpy).toHaveBeenCalledWith(stalePid, "SIGTERM");
+      expect(killSpy).not.toHaveBeenCalledWith(protectedPid, expect.anything());
     });
 
     it("escalates to SIGKILL when process survives the SIGTERM window", () => {

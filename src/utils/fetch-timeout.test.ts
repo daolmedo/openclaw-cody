@@ -1,3 +1,4 @@
+// Fetch timeout tests cover abort handling and streamed response timeouts.
 import { Stream } from "openai/streaming";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -11,6 +12,17 @@ vi.mock("../logging/subsystem.js", () => ({
 
 import { buildTimeoutAbortSignal, fetchWithTimeout } from "./fetch-timeout.js";
 import { MAX_SAFE_TIMEOUT_DELAY_MS } from "./timer-delay.js";
+
+function captureTimeoutLogUrl(url: string): Promise<Record<string, unknown>> {
+  const { cleanup } = buildTimeoutAbortSignal({ timeoutMs: 25, operation: "unit-test", url });
+  return vi.advanceTimersByTimeAsync(25).then(() => {
+    const record = requireWarnRecord(0);
+    cleanup();
+    return record;
+  });
+}
+
+const SYNTHETIC_TELEGRAM_BOT_TOKEN = "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcd";
 
 function requireWarnCall(callIndex: number): [string, Record<string, unknown>] {
   const call = warn.mock.calls[callIndex];
@@ -143,6 +155,52 @@ describe("buildTimeoutAbortSignal", () => {
     cleanup();
   });
 
+  it("redacts Telegram bot tokens from parseable timeout URLs", async () => {
+    const record = await captureTimeoutLogUrl(
+      `https://api.telegram.org/bot${SYNTHETIC_TELEGRAM_BOT_TOKEN}/sendMessage?chat_id=1`,
+    );
+
+    expect(record.url).toBe("https://api.telegram.org/bot***/sendMessage");
+    expect(JSON.stringify(record)).not.toContain(SYNTHETIC_TELEGRAM_BOT_TOKEN);
+  });
+
+  it("redacts Telegram bot tokens from custom self-hosted API root timeout URLs", async () => {
+    const record = await captureTimeoutLogUrl(
+      `https://telegram.internal/bot${SYNTHETIC_TELEGRAM_BOT_TOKEN}/getMe?chat_id=1`,
+    );
+
+    expect(record.url).toBe("https://telegram.internal/bot***/getMe");
+    expect(JSON.stringify(record)).not.toContain(SYNTHETIC_TELEGRAM_BOT_TOKEN);
+  });
+
+  it("redacts Telegram bot tokens from proxy API root timeout URLs", async () => {
+    const record = await captureTimeoutLogUrl(
+      `https://tg-proxy.example.com/bot${SYNTHETIC_TELEGRAM_BOT_TOKEN}/sendMessage?foo=bar`,
+    );
+
+    expect(record.url).toBe("https://tg-proxy.example.com/bot***/sendMessage");
+    expect(JSON.stringify(record)).not.toContain(SYNTHETIC_TELEGRAM_BOT_TOKEN);
+  });
+
+  it("redacts Telegram bot tokens from unparseable (fallback) timeout URL strings", async () => {
+    const record = await captureTimeoutLogUrl(
+      `/bot${SYNTHETIC_TELEGRAM_BOT_TOKEN}/sendMessage?chat_id=1`,
+    );
+
+    expect(record.url).toBe("/bot***/sendMessage");
+    expect(JSON.stringify(record)).not.toContain(SYNTHETIC_TELEGRAM_BOT_TOKEN);
+  });
+
+  it.each([
+    ["https://example.com/bot/settings?safe=1", "https://example.com/bot/settings"],
+    ["https://example.com/bots/chat?safe=1", "https://example.com/bots/chat"],
+    ["https://example.com/robot/test?safe=1", "https://example.com/robot/test"],
+    ["/bot123:status?safe=1", "/bot123:status"],
+    ["/bot123456:short/status?safe=1", "/bot123456:short/status"],
+  ])("keeps ordinary bot-like timeout path %s visible", async (input, expected) => {
+    expect((await captureTimeoutLogUrl(input)).url).toBe(expected);
+  });
+
   it("tags fetch timeout aborts so callers can distinguish them from parent aborts", async () => {
     const fetchFn = vi.fn<typeof fetch>(
       async (_input, init) =>
@@ -152,7 +210,11 @@ describe("buildTimeoutAbortSignal", () => {
             reject(new Error("missing signal"));
             return;
           }
-          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+          signal.addEventListener(
+            "abort",
+            () => reject(toLintErrorObject(signal.reason, "Non-Error rejection")),
+            { once: true },
+          );
         }),
     );
 
@@ -264,3 +326,17 @@ describe("buildTimeoutAbortSignal", () => {
     }
   });
 });
+
+function toLintErrorObject(value: unknown, fallbackMessage: string): Error {
+  if (value instanceof Error) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return new Error(value);
+  }
+  const error = new Error(fallbackMessage, { cause: value });
+  if ((typeof value === "object" && value !== null) || typeof value === "function") {
+    Object.assign(error, value);
+  }
+  return error;
+}

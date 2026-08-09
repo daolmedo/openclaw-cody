@@ -1,3 +1,5 @@
+// End-to-end proxy smoke tests run child OpenClaw modules through a local
+// HTTP/HTTPS forward proxy, including Discord-style HTTP, TLS, and WebSocket paths.
 import { execFileSync, spawn } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { createServer, request as httpRequest, type Server } from "node:http";
@@ -498,8 +500,10 @@ describe("SSRF external proxy routing", () => {
     expect(child.stdout).toContain('"body":"from loopback target"');
     expect(seenConnectTargets).toContain(`127.0.0.1:${wsTargetPort}`);
     expect(seenConnectTargets).toContain(`127.0.0.1:${httpsLikeTargetPort}`);
-    expect(seenConnectTargets).toContain(`127.0.0.1:${targetPort}`);
-    expect(seenConnectTargets).toContain(`127.0.0.1:${globalFetchTargetPort}`);
+    expect(seenConnectTargets).toContain(`http://127.0.0.1:${targetPort}/private-metadata`);
+    expect(seenConnectTargets).toContain(
+      `http://127.0.0.1:${globalFetchTargetPort}/global-fetch-metadata`,
+    );
     expect(seenConnectTargets).toContain(`http://127.0.0.1:${targetPort}/node-http-metadata`);
     expect(seenConnectTargets).toContain(`http://127.0.0.1:${targetPort}/explicit-agent`);
     expect(seenConnectTargets).not.toContain(`127.0.0.1:${gatewayBypassWsTargetPort}`);

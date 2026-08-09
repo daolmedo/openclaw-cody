@@ -1,3 +1,5 @@
+// Verifies MCP transport config normalization and startup-safety filtering.
+import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { logWarn } from "../logger.js";
 import { resolveMcpTransportConfig } from "./mcp-transport-config.js";
@@ -25,10 +27,58 @@ describe("resolveMcpTransportConfig", () => {
       cwd: undefined,
       description: "node ./server.mjs",
       connectionTimeoutMs: 12_345,
+      requestTimeoutMs: 60_000,
+      supportsParallelToolCalls: false,
     });
   });
 
+  it("resolves operator timeout aliases and parallel capability", () => {
+    const resolved = resolveMcpTransportConfig("probe", {
+      command: "node",
+      timeout: 7,
+      connectTimeout: 2,
+      supportsParallelToolCalls: true,
+    });
+
+    expect(resolved).toEqual(
+      expect.objectContaining({
+        connectionTimeoutMs: 2_000,
+        requestTimeoutMs: 7_000,
+        supportsParallelToolCalls: true,
+      }),
+    );
+  });
+
+  it("clamps oversized MCP request timeout aliases to the Node timer maximum", () => {
+    const seconds = resolveMcpTransportConfig("probe", {
+      command: "node",
+      connectTimeout: 1e306,
+      timeout: 1e306,
+    });
+    const milliseconds = resolveMcpTransportConfig("probe", {
+      command: "node",
+      connectionTimeoutMs: 1e306,
+      requestTimeoutMs: 1e306,
+    });
+
+    expect(seconds).toEqual(
+      expect.objectContaining({
+        connectionTimeoutMs: MAX_TIMER_TIMEOUT_MS,
+        requestTimeoutMs: MAX_TIMER_TIMEOUT_MS,
+      }),
+    );
+    expect(milliseconds).toEqual(
+      expect.objectContaining({
+        connectionTimeoutMs: MAX_TIMER_TIMEOUT_MS,
+        requestTimeoutMs: MAX_TIMER_TIMEOUT_MS,
+      }),
+    );
+  });
+
   it("drops dangerous env overrides from stdio config", () => {
+    // Stdio env is inherited executable process input. Block loader/shell hook
+    // variables and child-process config pivots while preserving explicit MCP
+    // credentials and ordinary scalar env values.
     const resolved = resolveMcpTransportConfig("probe", {
       command: "node",
       env: {
@@ -40,6 +90,8 @@ describe("resolveMcpTransportConfig", () => {
         NODE_OPTIONS: "--require=./evil.js",
         LD_PRELOAD: "/tmp/pwn.so",
         BASH_ENV: "/tmp/pwn.sh",
+        ANSIBLE_CONFIG: "/tmp/evil-ansible.cfg",
+        TF_CLI_CONFIG_FILE: "/tmp/evil-terraform.rc",
       },
     });
 
@@ -58,6 +110,8 @@ describe("resolveMcpTransportConfig", () => {
       cwd: undefined,
       description: "node",
       connectionTimeoutMs: 30_000,
+      requestTimeoutMs: 60_000,
+      supportsParallelToolCalls: false,
     });
     expect(logWarn).toHaveBeenCalledWith(
       'bundle-mcp: server "probe": env "NODE_OPTIONS" is blocked for stdio startup safety and was ignored.',
@@ -67,6 +121,12 @@ describe("resolveMcpTransportConfig", () => {
     );
     expect(logWarn).toHaveBeenCalledWith(
       'bundle-mcp: server "probe": env "BASH_ENV" is blocked for stdio startup safety and was ignored.',
+    );
+    expect(logWarn).toHaveBeenCalledWith(
+      'bundle-mcp: server "probe": env "ANSIBLE_CONFIG" is blocked for stdio startup safety and was ignored.',
+    );
+    expect(logWarn).toHaveBeenCalledWith(
+      'bundle-mcp: server "probe": env "TF_CLI_CONFIG_FILE" is blocked for stdio startup safety and was ignored.',
     );
   });
 
@@ -88,6 +148,8 @@ describe("resolveMcpTransportConfig", () => {
       cwd: undefined,
       description: "node",
       connectionTimeoutMs: 30_000,
+      requestTimeoutMs: 60_000,
+      supportsParallelToolCalls: false,
     });
   });
 
@@ -123,10 +185,14 @@ describe("resolveMcpTransportConfig", () => {
       },
       description: "https://mcp.example.com/sse",
       connectionTimeoutMs: 30_000,
+      requestTimeoutMs: 60_000,
+      supportsParallelToolCalls: false,
     });
   });
 
   it("keeps HTTP header parsing unchanged for env-like names", () => {
+    // Header names are not process environment keys, so env safety filtering
+    // must not rewrite or drop them.
     const resolved = resolveMcpTransportConfig("probe", {
       url: "https://mcp.example.com/sse",
       headers: {
@@ -143,6 +209,8 @@ describe("resolveMcpTransportConfig", () => {
       },
       description: "https://mcp.example.com/sse",
       connectionTimeoutMs: 30_000,
+      requestTimeoutMs: 60_000,
+      supportsParallelToolCalls: false,
     });
   });
 
@@ -159,6 +227,8 @@ describe("resolveMcpTransportConfig", () => {
       headers: undefined,
       description: "https://mcp.example.com/http",
       connectionTimeoutMs: 30_000,
+      requestTimeoutMs: 60_000,
+      supportsParallelToolCalls: false,
     });
   });
 
@@ -175,6 +245,8 @@ describe("resolveMcpTransportConfig", () => {
       headers: undefined,
       description: "https://mcp.example.com/http",
       connectionTimeoutMs: 30_000,
+      requestTimeoutMs: 60_000,
+      supportsParallelToolCalls: false,
     });
   });
 });

@@ -1,3 +1,4 @@
+// Verifies model-specific OpenAI reasoning-effort normalization and disablement.
 import { describe, expect, it } from "vitest";
 import {
   resolveOpenAIReasoningEffortForModel,
@@ -5,9 +6,19 @@ import {
 } from "./openai-reasoning-effort.js";
 
 describe("OpenAI reasoning effort support", () => {
+  it("preserves max for the GPT-5.6 series", () => {
+    const sol = { provider: "openai", id: "gpt-5.6-sol" };
+    const terra = { provider: "openai", id: "gpt-5.6-terra" };
+    const luna = { provider: "openai", id: "gpt-5.6-luna" };
+
+    expect(resolveOpenAIReasoningEffortForModel({ model: sol, effort: "max" })).toBe("max");
+    expect(resolveOpenAIReasoningEffortForModel({ model: terra, effort: "max" })).toBe("max");
+    expect(resolveOpenAIReasoningEffortForModel({ model: luna, effort: "max" })).toBe("max");
+  });
+
   it.each([
     { provider: "openai", id: "gpt-5.5" },
-    { provider: "openai-codex", id: "gpt-5.5" },
+    { provider: "openai", id: "gpt-5.5" },
   ])("preserves xhigh for $provider/$id", (model) => {
     expect(resolveOpenAISupportedReasoningEfforts(model)).toContain("xhigh");
     expect(resolveOpenAIReasoningEffortForModel({ model, effort: "xhigh" })).toBe("xhigh");
@@ -27,7 +38,7 @@ describe("OpenAI reasoning effort support", () => {
 
   it("does not downgrade xhigh when model compat metadata declares it explicitly", () => {
     const model = {
-      provider: "openai-codex",
+      provider: "openai",
       id: "gpt-5.5",
       compat: {
         supportedReasoningEfforts: ["low", "medium", "high", "xhigh"],
@@ -38,6 +49,7 @@ describe("OpenAI reasoning effort support", () => {
   });
 
   it("allows provider-native compat values when explicitly declared", () => {
+    // Some OpenAI-compatible providers expose their own reasoning effort labels.
     const model = {
       provider: "groq",
       id: "qwen/qwen3-32b",

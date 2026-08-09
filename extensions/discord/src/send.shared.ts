@@ -1,3 +1,4 @@
+// Discord plugin module implements send.shared behavior.
 import { PollLayoutType } from "discord-api-types/payloads/v10";
 import type { RESTAPIPoll } from "discord-api-types/rest/v10";
 import type { APIChannel } from "discord-api-types/v10";
@@ -13,7 +14,6 @@ import {
 import { requireRuntimeConfig } from "openclaw/plugin-sdk/plugin-config-runtime";
 import type { ChunkMode } from "openclaw/plugin-sdk/reply-chunking";
 import { resolveTextChunksWithFallback } from "openclaw/plugin-sdk/reply-payload";
-import type { RetryRunner } from "openclaw/plugin-sdk/retry-runtime";
 import { normalizeStringEntries } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { loadWebMedia } from "openclaw/plugin-sdk/web-media";
 import { chunkDiscordTextWithMode } from "./chunk.js";
@@ -25,6 +25,7 @@ import {
   RequestClient,
 } from "./internal/discord.js";
 import { parseAndResolveRecipient } from "./recipient-resolution.js";
+import type { DiscordRetryRunner } from "./retry.js";
 import { fetchChannelPermissionsDiscord, isThreadChannelType } from "./send.permissions.js";
 import { DiscordSendError } from "./send.types.js";
 
@@ -35,11 +36,12 @@ const DISCORD_POLL_MAX_DURATION_HOURS = 32 * 24;
 const DISCORD_MISSING_PERMISSIONS = 50013;
 const DISCORD_CANNOT_DM = 50007;
 
-type DiscordRequest = RetryRunner;
+type DiscordRequest = DiscordRetryRunner;
 
 export {
   buildDiscordMessagePayload,
   buildDiscordMessageRequest,
+  createDiscordMessageNonce,
   resolveDiscordMessageFlags,
   resolveDiscordSendComponents,
   resolveDiscordSendEmbeds,
@@ -323,6 +325,7 @@ async function sendDiscordText(
       suppressEmbeds: suppressEmbeds && !chunkEmbeds?.length,
     });
     const body = buildDiscordMessageRequest({
+      endpoint: "create-message",
       text: chunk,
       components: chunkComponents,
       embeds: chunkEmbeds,
@@ -332,6 +335,7 @@ async function sendDiscordText(
     return (await request(
       () => createChannelMessage<{ id: string; channel_id: string }>(rest, channelId, { body }),
       "text",
+      { safety: "nonce-protected-create" },
     )) as { id: string; channel_id: string };
   };
   if (chunks.length === 1) {
@@ -398,6 +402,7 @@ async function sendDiscordMedia(
     suppressEmbeds: suppressEmbeds && !captionEmbeds?.length,
   });
   const body = buildDiscordMessageRequest({
+    endpoint: "create-message",
     text: caption,
     components: captionComponents,
     embeds: captionEmbeds,
@@ -413,6 +418,7 @@ async function sendDiscordMedia(
   const res = (await request(
     () => createChannelMessage<{ id: string; channel_id: string }>(rest, channelId, { body }),
     "media",
+    { safety: "nonce-protected-create" },
   )) as { id: string; channel_id: string };
   const platformMessageIds = res.id ? [res.id] : [];
   for (const chunk of chunks.slice(1)) {

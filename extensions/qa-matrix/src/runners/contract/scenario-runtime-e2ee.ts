@@ -1,3 +1,4 @@
+// Qa Matrix plugin module implements scenario runtime e2ee behavior.
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -1239,7 +1240,7 @@ async function withMatrixQaIsolatedE2eeDriverRoom<T>(
     );
   };
 
-  let patchedGateway = false;
+  let patchedGateway;
   let client: MatrixQaE2eeScenarioClient | undefined;
   try {
     await applyPatch({
@@ -1378,42 +1379,24 @@ export async function runMatrixQaE2eeStateAfterMissingEncryptionScenario(
   if (!context.restartGatewayAfterStateMutation) {
     throw new Error("Matrix E2EE state_after QA scenario requires hard gateway restart support");
   }
-  const accountId = context.sutAccountId ?? "sut";
-  const configPath = requireMatrixQaGatewayConfigPath(context);
-  const originalAccountConfig = await readMatrixQaGatewayMatrixAccount({
-    accountId,
-    configPath,
-  });
-  const proxy = await startMatrixQaFaultProxy({
-    targetBaseUrl: context.baseUrl,
-    rules: [buildSyncStateAfterMissingEncryptionFaultRule(context.sutAccessToken)],
-  });
-  let gatewayPatched = false;
-  try {
-    await context.restartGatewayAfterStateMutation(
-      async () => {
-        await patchMatrixQaGatewayMatrixAccount({
-          accountId,
-          accountPatch: {
-            homeserver: proxy.baseUrl,
-            network: {
-              dangerouslyAllowPrivateNetwork: true,
-            },
-          },
-          configPath,
-        });
-        gatewayPatched = true;
-      },
-      {
-        timeoutMs: context.timeoutMs,
-        waitAccountId: accountId,
-      },
+  if (!context.faultProxy) {
+    throw new Error(
+      "Matrix E2EE state_after QA scenario requires the stable homeserver fault proxy",
     );
+  }
+  const accountId = context.sutAccountId ?? "sut";
+  const faultRule = buildSyncStateAfterMissingEncryptionFaultRule(context.sutAccessToken);
+  context.faultProxy.installRule(faultRule);
+  try {
+    await context.restartGatewayAfterStateMutation(async () => undefined, {
+      timeoutMs: context.timeoutMs,
+      waitAccountId: accountId,
+    });
     const result = await runMatrixQaE2eeTopLevelScenario(context, {
       scenarioId: "matrix-e2ee-state-after-missing-encryption",
       tokenPrefix: "MATRIX_QA_E2EE_STATE_AFTER",
     });
-    const stateAfterHits = proxy
+    const stateAfterHits = context.faultProxy
       .hits()
       .filter((hit) => hit.ruleId === MATRIX_QA_SYNC_STATE_AFTER_FAULT_RULE_ID);
     if (stateAfterHits.length > 0) {
@@ -1424,7 +1407,6 @@ export async function runMatrixQaE2eeStateAfterMissingEncryptionScenario(
     return {
       artifacts: {
         driverEventId: result.driverEventId,
-        faultProxyBaseUrl: proxy.baseUrl,
         reply: result.reply,
         roomKey: result.roomKey,
         roomId: result.roomId,
@@ -1436,30 +1418,12 @@ export async function runMatrixQaE2eeStateAfterMissingEncryptionScenario(
         `encrypted room key: ${result.roomKey}`,
         `encrypted room id: ${result.roomId}`,
         `driver event: ${result.driverEventId}`,
-        `fault proxy: ${proxy.baseUrl}`,
         `state_after sync opt-in hits: ${stateAfterHits.length}`,
         ...buildMatrixReplyDetails("E2EE state_after reply", result.reply),
       ].join("\n"),
     };
   } finally {
-    if (gatewayPatched) {
-      await context
-        .restartGatewayAfterStateMutation(
-          async () => {
-            await replaceMatrixQaGatewayMatrixAccount({
-              accountConfig: originalAccountConfig,
-              accountId,
-              configPath,
-            });
-          },
-          {
-            timeoutMs: context.timeoutMs,
-            waitAccountId: accountId,
-          },
-        )
-        .catch(() => undefined);
-    }
-    await proxy.stop().catch(() => undefined);
+    context.faultProxy.removeRule(faultRule.id);
   }
 }
 
@@ -1535,6 +1499,8 @@ export async function runMatrixQaE2eeBootstrapSuccessScenario(
 ): Promise<MatrixQaScenarioExecution> {
   requireMatrixQaPassword(context, "driver");
   return await withMatrixQaE2eeDriver(context, "matrix-e2ee-bootstrap-success", async (client) => {
+    const initial = await client.bootstrapOwnDeviceVerification();
+    assertMatrixQaBootstrapSucceeded("driver initial", initial);
     const result = await client.bootstrapOwnDeviceVerification({
       forceResetCrossSigning: true,
     });
@@ -1549,7 +1515,7 @@ export async function runMatrixQaE2eeBootstrapSuccessScenario(
         recoveryKeyStored: result.verification.recoveryKeyStored,
       },
       details: [
-        "driver bootstrap succeeded through real Matrix crypto bootstrap",
+        "driver bootstrap and guarded cross-signing reset succeeded through real Matrix crypto bootstrap",
         `device verified: ${result.verification.verified ? "yes" : "no"}`,
         `cross-signing verified: ${result.verification.crossSigningVerified ? "yes" : "no"}`,
         `signed by owner: ${result.verification.signedByOwner ? "yes" : "no"}`,

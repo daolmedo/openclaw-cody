@@ -1,15 +1,15 @@
+// Tests ACP dispatch wiring, command bypass, and runtime event handling.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { MediaUnderstandingSkipError } from "../../../packages/media-understanding-common/src/errors.js";
 import { AcpRuntimeError } from "../../acp/runtime/errors.js";
 import type { AcpSessionStoreEntry } from "../../acp/runtime/session-meta.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import type { SessionBindingRecord } from "../../infra/outbound/session-binding-service.js";
-import type { MediaUnderstandingSkipError } from "../../media-understanding/errors.js";
 import { withFetchPreconnect } from "../../test-utils/fetch-mock.js";
 import {
-  resolveAgentAttachments,
   resolveAgentTurnAttachments,
   resolveInlineAgentImageAttachments,
 } from "./agent-turn-attachments.js";
@@ -40,8 +40,13 @@ const policyMocks = vi.hoisted(() => ({
 
 const routeMocks = vi.hoisted(() => ({
   routeReply: vi.fn<
-    (_params: unknown) => Promise<{ ok: true; messageId: string } | { ok: false; error: string }>
-  >(async () => ({ ok: true, messageId: "mock" })),
+    (
+      _params: unknown,
+    ) => Promise<
+      | { ok: true; delivered: true; messageId: string }
+      | { ok: false; error: string; delivered?: boolean; partialFailure?: boolean }
+    >
+  >(async () => ({ ok: true, delivered: true, messageId: "mock" })),
 }));
 
 const channelPluginMocks = vi.hoisted(() => ({
@@ -50,6 +55,10 @@ const channelPluginMocks = vi.hoisted(() => ({
       return undefined;
     }
     return {
+      config: {
+        listAccountIds: () => [],
+        resolveAccount: () => ({}),
+      },
       outbound: {
         shouldTreatDeliveredTextAsVisible: ({
           kind,
@@ -169,13 +178,13 @@ vi.mock("./dispatch-acp-media.runtime.js", () => ({
     constructor(private readonly attachments: Array<{ path?: string; index: number }>) {}
     async getBuffer({ attachmentIndex }: { attachmentIndex: number }) {
       const attachment = this.attachments.find((item) => item.index === attachmentIndex);
-      const path = attachment?.path;
-      const buffer = path ? acpAttachmentBuffers.get(path) : undefined;
+      const pathLocal = attachment?.path;
+      const buffer = pathLocal ? acpAttachmentBuffers.get(pathLocal) : undefined;
       if (buffer) {
         return {
           buffer,
           mime: "image/png",
-          fileName: path,
+          fileName: pathLocal,
           size: buffer.length,
         };
       }
@@ -193,6 +202,11 @@ vi.mock("./dispatch-acp-session.runtime.js", () => ({
 
 vi.mock("../../logging/diagnostic.js", () => ({
   markDiagnosticSessionProgress: diagnosticMocks.markDiagnosticSessionProgress,
+  isStuckSessionRecoveryEnabled: (config?: { diagnostics?: { enabled?: boolean } }) =>
+    config?.diagnostics?.enabled !== false,
+  requestStuckDiagnosticSessionRecovery: vi.fn(),
+  resolveStuckSessionWarnMs: () => 120_000,
+  resolveStuckSessionAbortMs: () => 360_000,
 }));
 
 vi.mock("./dispatch-acp-transcript.runtime.js", () => ({
@@ -212,7 +226,7 @@ function requireRecord(value: unknown, label: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function mockArg(source: MockCallSource, callIndex: number, argIndex: number, label: string) {
+function mockArg(source: MockCallSource, callIndex: number, argIndex: number, _label: string) {
   return source.mock.calls[callIndex]?.[argIndex];
 }
 
@@ -304,6 +318,7 @@ async function runDispatch(params: {
   suppressUserDelivery?: boolean;
   suppressReplyLifecycle?: boolean;
   sourceReplyDeliveryMode?: "automatic" | "message_tool_only";
+  toolsAllow?: string[];
 }) {
   const targetSessionKey = params.sessionKeyOverride ?? sessionKey;
   return tryDispatchAcpReply({
@@ -331,6 +346,7 @@ async function runDispatch(params: {
       : {}),
     shouldSendToolSummaries: true,
     bypassForCommand: false,
+    toolsAllow: params.toolsAllow,
     ...(params.onReplyStart ? { onReplyStart: params.onReplyStart } : {}),
     recordProcessed: vi.fn(),
     markIdle: vi.fn(),
@@ -437,7 +453,7 @@ describe("tryDispatchAcpReply", () => {
     policyMocks.resolveAcpAgentPolicyError.mockReset();
     policyMocks.resolveAcpAgentPolicyError.mockReturnValue(null);
     routeMocks.routeReply.mockReset();
-    routeMocks.routeReply.mockResolvedValue({ ok: true, messageId: "mock" });
+    routeMocks.routeReply.mockResolvedValue({ ok: true, delivered: true, messageId: "mock" });
     channelPluginMocks.getChannelPlugin.mockClear();
     messageActionMocks.runMessageAction.mockReset();
     messageActionMocks.runMessageAction.mockResolvedValue({ ok: true as const });
@@ -567,7 +583,11 @@ describe("tryDispatchAcpReply", () => {
   it("edits ACP tool lifecycle updates in place when supported", async () => {
     setReadyAcpResolution();
     mockToolLifecycleTurn("call-1");
-    routeMocks.routeReply.mockResolvedValueOnce({ ok: true, messageId: "tool-msg-1" });
+    routeMocks.routeReply.mockResolvedValueOnce({
+      ok: true,
+      delivered: true,
+      messageId: "tool-msg-1",
+    });
 
     const { dispatcher } = createDispatcher();
     await runDispatch({
@@ -588,8 +608,12 @@ describe("tryDispatchAcpReply", () => {
     setReadyAcpResolution();
     mockToolLifecycleTurn("call-2");
     routeMocks.routeReply
-      .mockResolvedValueOnce({ ok: true, messageId: "tool-msg-2" })
-      .mockResolvedValueOnce({ ok: true, messageId: "tool-msg-2-fallback" });
+      .mockResolvedValueOnce({ ok: true, delivered: true, messageId: "tool-msg-2" })
+      .mockResolvedValueOnce({
+        ok: true,
+        delivered: true,
+        messageId: "tool-msg-2-fallback",
+      });
     messageActionMocks.runMessageAction.mockRejectedValueOnce(new Error("edit unsupported"));
 
     const { dispatcher } = createDispatcher();
@@ -681,6 +705,34 @@ describe("tryDispatchAcpReply", () => {
     expect(mediaUnderstandingMocks.applyMediaUnderstanding).not.toHaveBeenCalled();
   });
 
+  it("skips media understanding for cached stickers while preserving their attachment", async () => {
+    setReadyAcpResolution();
+    mockVisibleTextTurn("cached sticker");
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "dispatch-acp-"));
+    const stickerPath = path.join(tempDir, "sticker.webp");
+    try {
+      await fs.writeFile(stickerPath, "image-bytes");
+
+      await runDispatch({
+        bodyForAgent: "[Sticker] Cached description",
+        ctxOverrides: {
+          MediaPath: stickerPath,
+          MediaPaths: [stickerPath],
+          MediaType: "image/webp",
+          MediaTypes: ["image/webp"],
+          Sticker: { cachedDescription: "Cached description" },
+          StickerMediaIncluded: true,
+          SkipStickerMediaUnderstanding: true,
+        },
+      });
+
+      expect(mediaUnderstandingMocks.applyMediaUnderstanding).not.toHaveBeenCalled();
+      expect(managerMocks.runTurn).toHaveBeenCalled();
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("passes the ACP agent directory to media understanding", async () => {
     setReadyAcpResolution();
     mockVisibleTextTurn("image turn");
@@ -717,60 +769,6 @@ describe("tryDispatchAcpReply", () => {
           "media understanding",
         ).agentDir,
       ).toBe(agentDir);
-    } finally {
-      await fs.rm(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it("forwards normalized image attachments into agent runtime turns", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "dispatch-acp-"));
-    const imagePath = path.join(tempDir, "inbound.png");
-    try {
-      await fs.writeFile(imagePath, "image-bytes");
-      const attachments = await resolveAgentAttachments({
-        cfg: createAcpTestConfig({
-          channels: {
-            imessage: {
-              attachmentRoots: [tempDir],
-            },
-          },
-        }),
-        ctx: buildTestCtx({
-          Provider: "imessage",
-          Surface: "imessage",
-          MediaPath: imagePath,
-          MediaType: "image/png",
-        }),
-        runtime: {
-          MediaAttachmentCache: class {
-            async getBuffer() {
-              return {
-                buffer: Buffer.from("image-bytes"),
-                mime: "image/png",
-                fileName: "inbound.png",
-                size: "image-bytes".length,
-              };
-            }
-          } as unknown as typeof import("./dispatch-acp-media.runtime.js").MediaAttachmentCache,
-          isMediaUnderstandingSkipError: (_error: unknown): _error is MediaUnderstandingSkipError =>
-            false,
-          normalizeAttachments: (ctx) => [
-            {
-              path: ctx.MediaPath,
-              mime: ctx.MediaType,
-              index: 0,
-            },
-          ],
-          resolveMediaAttachmentLocalRoots: () => [tempDir],
-        },
-      });
-
-      expect(attachments).toEqual([
-        {
-          mediaType: "image/png",
-          data: Buffer.from("image-bytes").toString("base64"),
-        },
-      ]);
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
@@ -1387,6 +1385,35 @@ describe("tryDispatchAcpReply", () => {
     expect(bindingServiceMocks.unbind).not.toHaveBeenCalled();
   });
 
+  it("fails closed when ACP dispatch cannot enforce restrictive runtime toolsAllow", async () => {
+    setReadyAcpResolution();
+    const { dispatcher } = createDispatcher();
+
+    await runDispatch({
+      bodyForAgent: "test",
+      dispatcher,
+      toolsAllow: ["message"],
+    });
+
+    expect(managerMocks.runTurn).not.toHaveBeenCalled();
+    expect(dispatcherCall(dispatcher.sendFinalReply).isError).toBe(true);
+    expect(dispatcherCall(dispatcher.sendFinalReply).text).toContain("runtime toolsAllow");
+  });
+
+  it("allows wildcard runtime toolsAllow through ACP dispatch", async () => {
+    setReadyAcpResolution();
+    const { dispatcher } = createDispatcher();
+
+    await runDispatch({
+      bodyForAgent: "test",
+      dispatcher,
+      toolsAllow: ["*"],
+    });
+
+    expect(managerMocks.runTurn).toHaveBeenCalledOnce();
+    expect(runTurnCall().text).toBe("test");
+  });
+
   it("does not unbind stale bindings when ACP dispatch is disabled by policy", async () => {
     managerMocks.resolveSession.mockReturnValue({
       kind: "stale",
@@ -1671,6 +1698,28 @@ describe("tryDispatchAcpReply", () => {
     expect(result?.counts.block).toBe(0);
     expect(result?.counts.final).toBe(1);
     expect(routeMocks.routeReply).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not replay a routed ACP block after partial visible delivery", async () => {
+    setReadyAcpResolution();
+    ttsMocks.resolveTtsConfig.mockReturnValue({ mode: "final" });
+    routeMocks.routeReply.mockResolvedValue({
+      ok: false,
+      delivered: true,
+      partialFailure: true,
+      error: "second chunk failed",
+    });
+    mockRoutedTextTurn("partially visible block");
+    const { dispatcher } = createDispatcher();
+
+    await runDispatch({
+      bodyForAgent: "run acp",
+      dispatcher,
+      shouldRouteToOriginating: true,
+    });
+
+    expect(routeMocks.routeReply).toHaveBeenCalledTimes(1);
+    expect(routePayload().text).toBe("partially visible block");
   });
 
   it("routes default ACP text as one final reply to Discord", async () => {

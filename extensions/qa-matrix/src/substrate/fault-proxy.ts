@@ -1,3 +1,4 @@
+// Qa Matrix plugin module implements fault proxy behavior.
 import {
   createServer,
   type IncomingHttpHeaders,
@@ -72,6 +73,8 @@ export type MatrixQaFaultProxyHit = {
 export type MatrixQaFaultProxy = {
   baseUrl: string;
   hits(): MatrixQaFaultProxyHit[];
+  installRule(rule: MatrixQaFaultProxyRule): void;
+  removeRule(ruleId: string): void;
   stop(): Promise<void>;
 };
 
@@ -299,65 +302,68 @@ export async function startMatrixQaFaultProxy(params: {
   const maxRequestBytes = params.maxRequestBytes ?? DEFAULT_FAULT_PROXY_REQUEST_MAX_BYTES;
   const maxResponseBytes = params.maxResponseBytes ?? DEFAULT_FAULT_PROXY_RESPONSE_MAX_BYTES;
   const hits: MatrixQaFaultProxyHit[] = [];
-  const server = createServer(async (req, res) => {
-    try {
-      const requestUrl = new URL(req.url ?? "/", targetBaseUrl);
-      const path = requestUrl.pathname;
-      const bearerToken = extractBearerToken(req.headers);
-      const request: MatrixQaFaultProxyRequest = {
-        ...(bearerToken ? { bearerToken } : {}),
-        headers: req.headers,
-        method: req.method ?? "GET",
-        path,
-        search: requestUrl.search,
-      };
-      const body = await readRequestBody(req, maxRequestBytes);
-      const rule = params.rules.find((candidate) => candidate.match(request));
-      if (rule) {
-        hits.push({
-          method: request.method,
-          path: request.path,
-          ruleId: rule.id,
+  const rules = new Map(params.rules.map((rule) => [rule.id, rule]));
+  const server = createServer((req, res) => {
+    void (async () => {
+      try {
+        const requestUrl = new URL(req.url ?? "/", targetBaseUrl);
+        const path = requestUrl.pathname;
+        const bearerToken = extractBearerToken(req.headers);
+        const request: MatrixQaFaultProxyRequest = {
+          ...(bearerToken ? { bearerToken } : {}),
+          headers: req.headers,
+          method: req.method ?? "GET",
+          path,
+          search: requestUrl.search,
+        };
+        const body = await readRequestBody(req, maxRequestBytes);
+        const rule = [...rules.values()].find((candidate) => candidate.match(request));
+        if (rule) {
+          hits.push({
+            method: request.method,
+            path: request.path,
+            ruleId: rule.id,
+          });
+          if (rule.response) {
+            writeJsonResponse(res, rule.response(request));
+            return;
+          }
+        }
+        const forwarded = await forwardMatrixQaFaultProxyRequest({
+          body,
+          maxResponseBytes,
+          req,
+          targetUrl: requestUrl,
         });
-        if (rule.response) {
-          writeJsonResponse(res, rule.response(request));
+        const response =
+          rule?.mutateResponse !== undefined
+            ? await rule.mutateResponse({
+                request,
+                response: forwarded,
+              })
+            : forwarded;
+        writeForwardedResponse(res, response);
+      } catch (error) {
+        if (error instanceof MatrixQaFaultProxyHttpError) {
+          writeJsonResponse(res, {
+            body: {
+              errcode: error.code,
+              error: error.message,
+            },
+            ...(error.status === 413 ? { headers: { connection: "close" } } : {}),
+            status: error.status,
+          });
           return;
         }
-      }
-      const forwarded = await forwardMatrixQaFaultProxyRequest({
-        body,
-        maxResponseBytes,
-        req,
-        targetUrl: requestUrl,
-      });
-      const response =
-        rule?.mutateResponse !== undefined
-          ? await rule.mutateResponse({
-              request,
-              response: forwarded,
-            })
-          : forwarded;
-      writeForwardedResponse(res, response);
-    } catch (error) {
-      if (error instanceof MatrixQaFaultProxyHttpError) {
         writeJsonResponse(res, {
           body: {
-            errcode: error.code,
-            error: error.message,
+            errcode: "MATRIX_QA_FAULT_PROXY_ERROR",
+            error: error instanceof Error ? error.message : String(error),
           },
-          ...(error.status === 413 ? { headers: { connection: "close" } } : {}),
-          status: error.status,
+          status: 502,
         });
-        return;
       }
-      writeJsonResponse(res, {
-        body: {
-          errcode: "MATRIX_QA_FAULT_PROXY_ERROR",
-          error: error instanceof Error ? error.message : String(error),
-        },
-        status: 502,
-      });
-    }
+    })();
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -377,6 +383,12 @@ export async function startMatrixQaFaultProxy(params: {
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
     hits: () => [...hits],
+    installRule: (rule) => {
+      rules.set(rule.id, rule);
+    },
+    removeRule: (ruleId) => {
+      rules.delete(ruleId);
+    },
     stop: async () => {
       await new Promise<void>((resolve, reject) => {
         server.close((error) => {

@@ -1,3 +1,7 @@
+/**
+ * Bridges Codex app-server approval requests into OpenClaw policy hooks and
+ * plugin approval UX.
+ */
 import {
   type AgentApprovalEventData,
   buildAgentHookContextChannelFields,
@@ -15,6 +19,7 @@ import { formatCodexDisplayText } from "../command-formatters.js";
 import {
   approvalRequestExplicitlyUnavailable,
   mapExecDecisionToOutcome,
+  readFinalApprovalDecision,
   requestPluginApproval,
   type AppServerApprovalOutcome,
   waitForPluginApprovalDecision,
@@ -54,6 +59,10 @@ type SanitizedApprovalPreview = {
   omitted: boolean;
 };
 
+/**
+ * Handles one app-server approval request for the active thread/turn, returning
+ * the app-server response payload when the request belongs to this run.
+ */
 export async function handleCodexAppServerApprovalRequest(params: {
   method: string;
   requestParams: JsonValue | undefined;
@@ -129,13 +138,40 @@ export async function handleCodexAppServerApprovalRequest(params: {
       });
       return buildApprovalResponse(params.method, context.requestParams, "approved-session");
     }
+    // Codex app-server approval requests do not expose an enforceable resolved
+    // executable, so unresolved requests must stay on the human approval route.
+    let emittedApprovalRequestId: string | undefined;
+    const emitRequestedApproval = (approvalId: string): void => {
+      if (emittedApprovalRequestId === approvalId) {
+        return;
+      }
+      emittedApprovalRequestId = approvalId;
+      emitApprovalEvent(params.paramsForRun, {
+        phase: "requested",
+        kind: context.kind,
+        status: "pending",
+        title: context.title,
+        approvalId,
+        approvalSlug: approvalId,
+        ...context.eventDetails,
+        message: "Codex app-server approval requested.",
+      });
+    };
     const requestResult = await requestPluginApproval({
       paramsForRun: params.paramsForRun,
       title: context.title,
       description: context.description,
       severity: context.severity,
       toolName: context.toolName,
-      toolCallId: context.itemId,
+      toolCallId: context.approvalId,
+      finalResponse: {
+        signal: params.signal,
+        onAccepted: (accepted) => {
+          if (accepted.id) {
+            emitRequestedApproval(accepted.id);
+          }
+        },
+      },
     });
 
     const approvalId = requestResult?.id;
@@ -152,20 +188,13 @@ export async function handleCodexAppServerApprovalRequest(params: {
       return buildApprovalResponse(params.method, context.requestParams, "denied");
     }
 
-    emitApprovalEvent(params.paramsForRun, {
-      phase: "requested",
-      kind: context.kind,
-      status: "pending",
-      title: context.title,
-      approvalId,
-      approvalSlug: approvalId,
-      ...context.eventDetails,
-      message: "Codex app-server approval requested.",
-    });
+    emitRequestedApproval(approvalId);
 
+    const finalDecision = readFinalApprovalDecision(requestResult);
     const decision = approvalRequestExplicitlyUnavailable(requestResult)
       ? null
-      : await waitForPluginApprovalDecision({ approvalId, signal: params.signal });
+      : (finalDecision ??
+        (await waitForPluginApprovalDecision({ approvalId, signal: params.signal })));
     const outcome = mapExecDecisionToOutcome(decision);
 
     emitApprovalEvent(params.paramsForRun, {
@@ -210,6 +239,7 @@ export async function handleCodexAppServerApprovalRequest(params: {
   }
 }
 
+/** Converts an OpenClaw approval outcome into the app-server method response. */
 export function buildApprovalResponse(
   method: string,
   requestParams: JsonObject | undefined,
@@ -256,6 +286,9 @@ function buildApprovalContext(params: {
     readString(params.requestParams, "itemId") ??
     readString(params.requestParams, "callId") ??
     readString(params.requestParams, "approvalId");
+  // Codex gives every execve callback its own approvalId while retaining the
+  // parent itemId. Policy and relay dedupe must use the callback identity.
+  const approvalId = readString(params.requestParams, "approvalId") ?? itemId;
   const commandDetailLines =
     params.method === "item/commandExecution/requestApproval"
       ? describeCommandApprovalDetails(params.requestParams)
@@ -316,6 +349,7 @@ function buildApprovalContext(params: {
           ? "codex_permission_approval"
           : "codex_file_approval",
     itemId,
+    approvalId,
     requestParams: params.requestParams,
     eventDetails: {
       ...(itemId ? { itemId } : {}),
@@ -380,7 +414,7 @@ async function runOpenClawToolPolicyForApprovalRequest(params: {
   const outcome = await runBeforeToolCallHook({
     toolName: policyRequest.toolName,
     params: policyRequest.params,
-    ...(params.context.itemId ? { toolCallId: params.context.itemId } : {}),
+    ...(params.context.approvalId ? { toolCallId: params.context.approvalId } : {}),
     approvalMode: "request",
     signal: params.signal,
     ctx: {
@@ -458,12 +492,12 @@ async function runNativeRelayToolPolicyForApprovalRequest(params: {
     hasNativeHookRelayInvocation({
       relayId: params.nativeHookRelay.relayId,
       event: "pre_tool_use",
-      toolUseId: params.context.itemId,
+      toolUseId: params.context.approvalId,
     })
   ) {
     const approvalOutcome = await resolveNativeHookRelayDeferredToolApproval({
       relayId: params.nativeHookRelay.relayId,
-      toolUseId: params.context.itemId,
+      toolUseId: params.context.approvalId,
       signal: params.signal,
     });
     if (approvalOutcome?.outcome === "denied") {
@@ -489,7 +523,7 @@ async function runNativeRelayToolPolicyForApprovalRequest(params: {
     }
     const approvalOutcome = await resolveNativeHookRelayDeferredToolApproval({
       relayId: params.nativeHookRelay.relayId,
-      toolUseId: params.context.itemId,
+      toolUseId: params.context.approvalId,
       signal: params.signal,
     });
     if (approvalOutcome?.outcome === "denied") {
@@ -525,7 +559,7 @@ function buildNativeRelayPreToolUsePayload(params: {
     hook_event_name: "PreToolUse",
     openclaw_approval_mode: "report",
     tool_name: "exec_command",
-    ...(params.context.itemId ? { tool_use_id: params.context.itemId } : {}),
+    ...(params.context.approvalId ? { tool_use_id: params.context.approvalId } : {}),
     ...(params.cwd ? { cwd: params.cwd } : {}),
     ...(turnId ? { turn_id: turnId } : {}),
     tool_input: {

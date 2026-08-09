@@ -139,8 +139,8 @@ Allowlists and policies:
 - `channels.line.dmPolicy`: `pairing | allowlist | open | disabled`
 - `channels.line.allowFrom`: allowlisted LINE user IDs for DMs; `dmPolicy: "open"` requires `["*"]`
 - `channels.line.groupPolicy`: `allowlist | open | disabled`
-- `channels.line.groupAllowFrom`: allowlisted LINE user IDs for groups
-- Per-group overrides: `channels.line.groups.<groupId>.allowFrom`
+- `channels.line.groupAllowFrom`: allowlisted LINE user IDs for groups; DM `allowFrom` entries do not admit group senders
+- Per-group overrides: `channels.line.groups.<groupId>.allowFrom`. With `groupPolicy: "allowlist"`, set `groupAllowFrom` or the per-group `allowFrom`; an empty group allowlist blocks group messages even when DMs are open.
 - Static sender access groups can be referenced from `allowFrom`, `groupAllowFrom`, and per-group `allowFrom` with `accessGroup:<name>`.
 - Runtime note: if `channels.line` is completely missing, runtime falls back to `groupPolicy="allowlist"` for group checks (even if `channels.defaults.groupPolicy` is set).
 

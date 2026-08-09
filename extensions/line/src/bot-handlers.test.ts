@@ -1,3 +1,4 @@
+// Line tests cover bot handlers plugin behavior.
 import type { webhook } from "@line/bot-sdk";
 import type { HistoryEntry } from "openclaw/plugin-sdk/reply-history";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -517,6 +518,28 @@ describe("handleLineWebhookEvents", () => {
 
     expect(processMessage).not.toHaveBeenCalled();
     expect(buildLineMessageContextMock).not.toHaveBeenCalled();
+    expect(readAllowFromStoreMock).not.toHaveBeenCalled();
+  });
+
+  it("does not use the DM allowlist when group allowlist policy has no group entries", async () => {
+    const processMessage = vi.fn();
+    await expectGroupMessageBlocked({
+      processMessage,
+      event: createReplayMessageEvent({
+        messageId: "m5c",
+        groupId: "group-1",
+        userId: "user-open-dm",
+        webhookEventId: "evt-5c",
+        isRedelivery: false,
+      }),
+      context: createLineWebhookTestContext({
+        processMessage,
+        dmPolicy: "open",
+        allowFrom: ["*"],
+        groupPolicy: "allowlist",
+        requireMention: false,
+      }),
+    });
     expect(readAllowFromStoreMock).not.toHaveBeenCalled();
   });
 

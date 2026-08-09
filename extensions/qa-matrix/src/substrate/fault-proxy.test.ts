@@ -1,3 +1,4 @@
+// Qa Matrix tests cover fault proxy plugin behavior.
 import { createServer } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import { startMatrixQaFaultProxy, type MatrixQaFaultProxy } from "./fault-proxy.js";
@@ -11,19 +12,21 @@ async function startTargetServer(params?: { responseBody?: string }) {
     method: string;
     url: string;
   }> = [];
-  const server = createServer(async (req, res) => {
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) {
-      chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
-    }
-    requests.push({
-      ...(req.headers.authorization ? { authorization: req.headers.authorization } : {}),
-      body: Buffer.concat(chunks).toString("utf8"),
-      method: req.method ?? "GET",
-      url: req.url ?? "/",
-    });
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(params?.responseBody ?? JSON.stringify({ forwarded: true }));
+  const server = createServer((req, res) => {
+    void (async () => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) {
+        chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+      }
+      requests.push({
+        ...(req.headers.authorization ? { authorization: req.headers.authorization } : {}),
+        body: Buffer.concat(chunks).toString("utf8"),
+        method: req.method ?? "GET",
+        url: req.url ?? "/",
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(params?.responseBody ?? JSON.stringify({ forwarded: true }));
+    })();
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -166,6 +169,37 @@ describe("Matrix QA fault proxy", () => {
         body: "",
         method: "GET",
         url: "/_matrix/client/v3/sync?timeout=0&org.matrix.msc4222.use_state_after=true",
+      },
+    ]);
+  });
+
+  it("installs and removes a fault rule without changing the proxy endpoint", async () => {
+    const target = await startTargetServer();
+    proxy = await startMatrixQaFaultProxy({
+      targetBaseUrl: target.baseUrl,
+      rules: [],
+    });
+    const baseUrl = proxy.baseUrl;
+    proxy.installRule({
+      id: "temporary-sync-fault",
+      match: (request) => request.method === "GET" && request.path === "/_matrix/client/v3/sync",
+      response: () => ({ body: { faulted: true }, status: 418 }),
+    });
+
+    const faulted = await fetch(`${baseUrl}/_matrix/client/v3/sync`);
+    expect(faulted.status).toBe(418);
+    await expect(faulted.json()).resolves.toEqual({ faulted: true });
+
+    proxy.removeRule("temporary-sync-fault");
+    expect(proxy.baseUrl).toBe(baseUrl);
+    const forwarded = await fetch(`${baseUrl}/_matrix/client/v3/sync`);
+    expect(forwarded.status).toBe(200);
+    await expect(forwarded.json()).resolves.toEqual({ forwarded: true });
+    expect(proxy.hits()).toEqual([
+      {
+        method: "GET",
+        path: "/_matrix/client/v3/sync",
+        ruleId: "temporary-sync-fault",
       },
     ]);
   });

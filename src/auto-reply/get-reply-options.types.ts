@@ -1,6 +1,9 @@
+import type { FastMode } from "@openclaw/normalization-core/string-coerce";
+import type { ReplyToMode } from "../config/types.js";
+/** Public option types for reply generation callbacks, streaming, and delivery policy. */
 import type { ImageContent } from "../llm/types.js";
 import type { PromptImageOrderEntry } from "../media/prompt-image-order.js";
-import type { UserTurnTranscriptRecorder } from "../sessions/user-turn-transcript.js";
+import type { UserTurnTranscriptRecorder } from "../sessions/user-turn-transcript.types.js";
 import type { ReplyPayload } from "./reply-payload.js";
 import type { TypingController } from "./reply/typing.js";
 
@@ -18,6 +21,7 @@ export type ModelSelectedContext = {
   thinkLevel: string | undefined;
 };
 
+/** Typing indicator class for channel-owned UX policy. */
 export type TypingPolicy =
   | "auto"
   | "user_message"
@@ -25,6 +29,7 @@ export type TypingPolicy =
   | "internal_webchat"
   | "heartbeat";
 
+/** Per-turn policy for source-message reply threading. */
 export type ReplyThreadingPolicy = {
   /** Override implicit reply-to-current behavior for the current turn. */
   implicitCurrentMessage?: "default" | "allow" | "deny";
@@ -32,23 +37,29 @@ export type ReplyThreadingPolicy = {
 
 export type SourceReplyDeliveryMode = "automatic" | "message_tool_only";
 
+/** Correlates queued reply ownership transfer with later delivery drains. */
 export type QueuedReplyDeliveryCorrelation = {
   begin: () => (() => void) | void;
 };
 
+/** Lifecycle hooks for queued follow-up replies. */
 export type QueuedReplyLifecycle = {
   onEnqueued?: () => void;
   onComplete?: () => void;
 };
 
+/** Partial assistant payload emitted during streaming or replacement updates. */
 export type PartialReplyPayload = Pick<ReplyPayload, "text" | "mediaUrls"> & {
   delta?: string;
   replace?: true;
 };
 
+/** Reply generation options shared by auto-reply, webchat, channels, and tests. */
 export type GetReplyOptions = {
   /** Override run id for agent events (defaults to random UUID). */
   runId?: string;
+  /** Stable provider prompt-cache affinity key; distinct from run id/idempotency. */
+  promptCacheKey?: string;
   /** Abort signal for the underlying agent run. */
   abortSignal?: AbortSignal;
   /** Optional inbound images (used for webchat attachments). */
@@ -57,6 +68,8 @@ export type GetReplyOptions = {
   imageOrder?: PromptImageOrderEntry[];
   /** Notifies when an agent run actually starts (useful for webchat command handling). */
   onAgentRunStart?: (runId: string) => void;
+  /** Called once restart-recovery delivery context has been persisted for the adopted turn. */
+  onTurnAdopted?: () => void | Promise<void>;
   /** Shared lifecycle owner for the current user-turn transcript append. */
   userTurnTranscriptRecorder?: UserTurnTranscriptRecorder;
   onReplyStart?: () => Promise<void> | void;
@@ -73,7 +86,9 @@ export type GetReplyOptions = {
   /** One-shot thinking level override for this run; does not persist to the session. */
   thinkingLevelOverride?: string;
   /** One-shot fast-mode override for this run; does not persist to the session. */
-  fastModeOverride?: boolean;
+  fastModeOverride?: FastMode;
+  /** One-shot auto fast-mode cutoff override in seconds; does not persist to the session. */
+  fastModeAutoOnSecondsOverride?: number;
   /** Controls bootstrap workspace context injection (default: full). */
   bootstrapContextMode?: "full" | "lightweight";
   /** If true, suppress tool error warning payloads for this run. */
@@ -82,6 +97,8 @@ export type GetReplyOptions = {
   shouldSuppressToolErrorWarnings?: () => boolean | undefined;
   /** If true, run the model without OpenClaw tools for this turn. */
   disableTools?: boolean;
+  /** Runtime tool allow-list for this turn. Empty means no tools. */
+  toolsAllow?: string[];
   /** If true, include the heartbeat response tool for structured heartbeat outcomes. */
   enableHeartbeatTool?: boolean;
   /** If true, keep the heartbeat response tool available even under narrow tool profiles. */
@@ -91,6 +108,16 @@ export type GetReplyOptions = {
    * channel to surface progress via its own streaming/edit UX.
    */
   suppressDefaultToolProgressMessages?: boolean;
+  /** Allow channel-owned tool lifecycle feedback while text progress remains hidden. */
+  allowToolLifecycleWhenProgressHidden?: boolean;
+  /**
+   * Called before dispatch with a live getter for whether verbose standalone
+   * progress messages are active for this run. Channels that render tool or
+   * commentary progress inside an ephemeral streaming draft should yield those
+   * draft lines while the getter returns true, so progress is not rendered in
+   * both lanes at once.
+   */
+  onVerboseProgressVisibility?: (isActive: () => boolean) => void;
   onPartialReply?: (payload: PartialReplyPayload) => Promise<void> | void;
   onReasoningStream?: (payload: ReplyPayload) => Promise<void> | void;
   /** Called when a thinking/reasoning block ends. */
@@ -115,6 +142,7 @@ export type GetReplyOptions = {
   /** Called when a concrete work item starts, updates, or completes. */
   onItemEvent?: (payload: {
     itemId?: string;
+    toolCallId?: string;
     kind?: string;
     title?: string;
     name?: string;
@@ -126,6 +154,8 @@ export type GetReplyOptions = {
     approvalId?: string;
     approvalSlug?: string;
   }) => Promise<void> | void;
+  /** In progress mode, classify Claude pre-tool text; true also renders it as commentary. */
+  commentaryProgressEnabled?: boolean;
   /** Called when the agent emits a structured plan update. */
   onPlanUpdate?: (payload: {
     phase?: string;
@@ -193,8 +223,20 @@ export type GetReplyOptions = {
   queuedDeliveryCorrelations?: QueuedReplyDeliveryCorrelation[];
   /** Tracks ownership transfer when this turn later drains as a queued followup. */
   queuedFollowupLifecycle?: QueuedReplyLifecycle;
+  /** Applies source-channel delivery metadata when a queued follow-up later drains. */
+  queuedDeliveryPayloadTransform?: (payload: ReplyPayload) => ReplyPayload;
+  /** Preserves source-channel reply fan-out policy for queued delivery. */
+  queuedDeliveryReplyToMode?: ReplyToMode;
+  /** Commits source-channel delivery state after a queued payload is visibly routed. */
+  queuedDeliveryPayloadDidDeliver?: (payload: ReplyPayload) => void;
+  /** Re-establishes source-owned async context while a queued follow-up drains. */
+  queuedExecutionContext?: <T>(run: () => Promise<T>) => Promise<T>;
   /** Allow channel-owned progress UI while final/source reply delivery remains message-tool-only. */
   allowProgressCallbacksWhenSourceDeliverySuppressed?: boolean;
+  /** Called when a suppressed source reply mode observes visible delivery through another path. */
+  onObservedReplyDelivery?: () => Promise<void> | void;
+  /** Emit tool result summaries for channel-owned progress UI even when verbose is off. */
+  forceToolResultProgress?: boolean;
   disableBlockStreaming?: boolean;
   /** Timeout for block reply delivery (ms). */
   blockReplyTimeoutMs?: number;

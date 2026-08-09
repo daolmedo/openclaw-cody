@@ -1,3 +1,4 @@
+// Qa Lab tests cover live gateway plugin behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -17,6 +18,7 @@ vi.mock("../../providers/server-runtime.js", () => ({
 import { startQaLiveLaneGateway } from "./live-gateway.runtime.js";
 
 type GatewayOptions = {
+  enabledPluginIds?: string[];
   providerBaseUrl?: string;
   providerMode?: string;
   transportBaseUrl?: string;
@@ -89,6 +91,7 @@ describe("startQaLiveLaneGateway", () => {
       providerMode: "mock-openai",
       primaryModel: "mock-openai/gpt-5.5",
       alternateModel: "mock-openai/gpt-5.5-alt",
+      enabledPluginIds: ["openai"],
       controlUiEnabled: false,
     });
 
@@ -97,6 +100,7 @@ describe("startQaLiveLaneGateway", () => {
     expect(gatewayOptions?.transportBaseUrl).toBe("http://127.0.0.1:43123");
     expect(gatewayOptions?.providerBaseUrl).toBe("http://127.0.0.1:44080/v1");
     expect(gatewayOptions?.providerMode).toBe("mock-openai");
+    expect(gatewayOptions?.enabledPluginIds).toEqual(["openai"]);
 
     await harness.stop();
     expect(gatewayStop).toHaveBeenCalledTimes(1);
@@ -190,6 +194,45 @@ describe("startQaLiveLaneGateway", () => {
 
     await harness.stop();
     expect(gatewayStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops the mock server when gateway startup fails", async () => {
+    startQaGatewayChild.mockRejectedValueOnce(new Error("gateway failed"));
+
+    await expect(
+      startQaLiveLaneGateway({
+        repoRoot: "/tmp/openclaw-repo",
+        transport: createStubTransport(),
+        transportBaseUrl: "http://127.0.0.1:43123",
+        providerMode: "mock-openai",
+        primaryModel: "mock-openai/gpt-5.5",
+        alternateModel: "mock-openai/gpt-5.5-alt",
+        controlUiEnabled: false,
+      }),
+    ).rejects.toThrow("gateway failed");
+
+    expect(mockStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports mock cleanup failures after gateway startup failures", async () => {
+    startQaGatewayChild.mockRejectedValueOnce(new Error("gateway failed"));
+    mockStop.mockRejectedValueOnce(new Error("mock stuck"));
+
+    await expect(
+      startQaLiveLaneGateway({
+        repoRoot: "/tmp/openclaw-repo",
+        transport: createStubTransport(),
+        transportBaseUrl: "http://127.0.0.1:43123",
+        providerMode: "mock-openai",
+        primaryModel: "mock-openai/gpt-5.5",
+        alternateModel: "mock-openai/gpt-5.5-alt",
+        controlUiEnabled: false,
+      }),
+    ).rejects.toThrow(
+      "failed to start QA live lane gateway:\ngateway startup failed: gateway failed\nmock provider stop failed: mock stuck",
+    );
+
+    expect(mockStop).toHaveBeenCalledTimes(1);
   });
 
   it("still stops the mock server when gateway shutdown fails", async () => {

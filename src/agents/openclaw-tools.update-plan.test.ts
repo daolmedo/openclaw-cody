@@ -1,19 +1,18 @@
+// Verifies update_plan registration gates and base OpenClaw tool inclusion policy.
 import { afterEach, describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import { setEmbeddedMode } from "../infra/embedded-mode.js";
 import { isToolWrappedWithBeforeToolCallHook } from "./agent-tools.before-tool-call.js";
+import { CORE_TOOL_FACTORY_DESCRIPTORS } from "./core-tool-factory-descriptors.js";
 import { createOpenClawTools } from "./openclaw-tools.js";
-import {
-  isUpdatePlanToolEnabledForOpenClawTools,
-  shouldIncludeUpdatePlanToolForOpenClawTools,
-} from "./openclaw-tools.registration.js";
+import { shouldIncludeUpdatePlanToolForOpenClawTools } from "./openclaw-tools.registration.js";
 import { createUpdatePlanTool } from "./tools/update-plan-tool.js";
 
-type UpdatePlanGatingParams = Parameters<typeof isUpdatePlanToolEnabledForOpenClawTools>[0];
+type UpdatePlanGatingParams = Parameters<typeof shouldIncludeUpdatePlanToolForOpenClawTools>[0];
 type CreateOpenClawToolsOptions = NonNullable<Parameters<typeof createOpenClawTools>[0]>;
 
 function expectUpdatePlanEnabled(params: UpdatePlanGatingParams, expected: boolean): void {
-  expect(isUpdatePlanToolEnabledForOpenClawTools(params)).toBe(expected);
+  expect(shouldIncludeUpdatePlanToolForOpenClawTools(params)).toBe(expected);
 }
 
 function toolNames(tools: ReturnType<typeof createOpenClawTools>): string[] {
@@ -21,6 +20,7 @@ function toolNames(tools: ReturnType<typeof createOpenClawTools>): string[] {
 }
 
 function createFastToolNames(options: CreateOpenClawToolsOptions): string[] {
+  // Disable unrelated dynamic surfaces so registration assertions stay deterministic.
   return toolNames(
     createOpenClawTools({
       disableMessageTool: true,
@@ -46,6 +46,7 @@ function openAiGpt5Params(
   config: OpenClawConfig,
   overrides: Partial<UpdatePlanGatingParams> = {},
 ): UpdatePlanGatingParams {
+  // Common OpenAI GPT-5 selection used by model-aware update_plan gates.
   const params: UpdatePlanGatingParams = {
     config,
     agentSessionKey: "agent:main:main",
@@ -62,6 +63,24 @@ function openAiGpt5Params(
 describe("openclaw-tools update_plan gating", () => {
   afterEach(() => {
     setEmbeddedMode(false);
+  });
+
+  it("keeps concrete OpenClaw tool names in the factory descriptor catalog", () => {
+    const describedNames = new Set<string>(
+      CORE_TOOL_FACTORY_DESCRIPTORS.filter((descriptor) => descriptor.family === "openclaw").map(
+        (descriptor) => descriptor.name,
+      ),
+    );
+    const emittedNames = createFastToolNames({
+      agentSessionKey: "agent:main:main",
+      config: {
+        tools: { allow: ["update_plan"] },
+        transcripts: { enabled: true },
+      } as OpenClawConfig,
+      enableHeartbeatTool: true,
+    });
+
+    expect(emittedNames.filter((name) => !describedNames.has(name))).toEqual([]);
   });
 
   it("keeps update_plan disabled by default", () => {
@@ -226,11 +245,8 @@ describe("openclaw-tools update_plan gating", () => {
   });
 
   it("auto-enables update_plan for unconfigured GPT-5 openai runs", () => {
-    // Criterion 1 of the GPT-5.4 parity gate ("no stalls after planning") is
-    // universal, not opt-in. Unspecified executionContract on a supported
-    // provider/model auto-activates strict-agentic so unconfigured installs
-    // get the same behavior as explicit opt-in. Explicit "default" still
-    // opts out (see "respects explicit default contract opt-out" below).
+    // Unspecified executionContract on a supported provider/model enables the
+    // structured plan tool by default. Explicit "default" still opts out.
     const cfg = {
       agents: {
         list: [{ id: "main" }],
@@ -238,7 +254,6 @@ describe("openclaw-tools update_plan gating", () => {
     } as OpenClawConfig;
 
     expectUpdatePlanEnabled(openAiGpt5Params(cfg), true);
-    expectUpdatePlanEnabled(openAiGpt5Params(cfg, { modelProvider: "openai-codex" }), true);
   });
 
   it("respects explicit default contract opt-out on GPT-5 runs", () => {

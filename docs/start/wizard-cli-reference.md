@@ -138,19 +138,26 @@ What you set:
   <Accordion title="OpenAI Code subscription (OAuth)">
     Browser flow; paste `code#state`.
 
-    Sets `agents.defaults.model` to `openai/gpt-5.5` through the Codex runtime when model is unset or already OpenAI-family.
+    On a fresh setup with no primary model, sets `agents.defaults.model` to
+    `openai/gpt-5.6-sol` through the Codex runtime.
 
   </Accordion>
   <Accordion title="OpenAI Code subscription (device pairing)">
     Browser pairing flow with a short-lived device code.
 
-    Sets `agents.defaults.model` to `openai/gpt-5.5` through the Codex runtime when model is unset or already OpenAI-family.
+    On a fresh setup with no primary model, sets `agents.defaults.model` to
+    `openai/gpt-5.6-sol` through the Codex runtime.
 
   </Accordion>
   <Accordion title="OpenAI API key">
     Uses `OPENAI_API_KEY` if present or prompts for a key, then stores the credential in auth profiles.
 
-    Sets `agents.defaults.model` to `openai/gpt-5.5` when model is unset, `openai/*`, or `openai-codex/*`.
+    On a fresh setup with no primary model, sets `agents.defaults.model` to
+    `openai/gpt-5.6`; the bare direct-API model id resolves to Sol.
+
+    Adding or reauthenticating OpenAI preserves an existing explicit primary
+    model, including `openai/gpt-5.5`. If the account does not expose GPT-5.6,
+    select `openai/gpt-5.5` explicitly; OpenClaw does not silently downgrade it.
 
   </Accordion>
   <Accordion title="xAI (Grok) OAuth">
@@ -182,7 +189,7 @@ What you set:
     More detail: [Cloudflare AI Gateway](/providers/cloudflare-ai-gateway).
   </Accordion>
   <Accordion title="MiniMax">
-    Config is auto-written. Hosted default is `MiniMax-M2.7`; API-key setup uses
+    Config is auto-written. Hosted default is `MiniMax-M3`; API-key setup uses
     `minimax/...`, and OAuth setup uses `minimax-portal/...`.
     More detail: [MiniMax](/providers/minimax).
   </Accordion>
@@ -219,7 +226,7 @@ What you set:
     - `--custom-model-id`
     - `--custom-api-key` (optional; falls back to `CUSTOM_API_KEY`)
     - `--custom-provider-id` (optional)
-    - `--custom-compatibility <openai|anthropic>` (optional; default `openai`)
+    - `--custom-compatibility <openai|openai-responses|anthropic>` (optional; default `openai`)
     - `--custom-image-input` / `--custom-text-input` (optional; override inferred model input capability)
 
   </Accordion>

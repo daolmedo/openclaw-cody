@@ -1,3 +1,5 @@
+// Gateway HTTP server routes control UI, OpenAI-compatible APIs, plugin HTTP
+// surfaces, hooks, readiness, auth, and WebSocket upgrades.
 import {
   createServer as createHttpServer,
   type Server as HttpServer,
@@ -39,13 +41,6 @@ import {
 import type { PreauthConnectionBudget } from "./server/preauth-connection-budget.js";
 import type { ReadinessChecker } from "./server/readiness.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
-import { handleAgentsApplyHttpRequest } from "./agents-apply-http.js";
-import { handleAgentBehaviorHttpRequest } from "./agent-behavior-http.js";
-import { handleAgentsHttpRequest } from "./agents-http.js";
-import { handleAgentSessionsHttpRequest } from "./agent-sessions-http.js";
-import { handleCronJobsHttpRequest } from "./cron-jobs-http.js";
-import { handleUsageHttpRequest } from "./usage-http.js";
-import { handleFilesHttpRequest } from "./files-http.js";
 
 type PluginHttpRequestHandler = (
   req: IncomingMessage,
@@ -198,7 +193,7 @@ function getCachedPluginGatewayAuthBypassPaths(
   if (cached) {
     return cached;
   }
-  const resolved = resolvePluginGatewayAuthBypassPaths(configSnapshot).catch((error) => {
+  const resolved = resolvePluginGatewayAuthBypassPaths(configSnapshot).catch((error: unknown) => {
     pluginGatewayAuthBypassPathsCache.delete(configSnapshot);
     throw error;
   });
@@ -252,6 +247,8 @@ async function canRevealReadinessDetails(params: {
   trustedProxies: string[];
   allowRealIpFallback: boolean;
 }): Promise<boolean> {
+  // Readiness details expose subsystem names; show them only to local direct callers or
+  // requests that prove gateway auth, while unauthenticated remote probes get a boolean.
   if (isLocalDirectRequest(params.req, params.trustedProxies, params.allowRealIpFallback)) {
     return true;
   }
@@ -272,6 +269,7 @@ async function canRevealReadinessDetails(params: {
   return authResult.ok;
 }
 
+/** Handles live/ready probe endpoints before normal gateway routing. */
 async function handleGatewayProbeRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -420,6 +418,8 @@ function buildPluginRequestStages(params: {
   let pluginGatewayAuthSatisfied = false;
   let pluginGatewayRequestAuth: AuthorizedGatewayHttpRequest | undefined;
   let pluginRequestOperatorScopes: string[] | undefined;
+  // Plugin auth and plugin dispatch are separate stages so route handlers receive the
+  // gateway-auth context while plugin failures can still fall through to core/Control UI routes.
   return [
     {
       name: "plugin-auth",
@@ -436,6 +436,8 @@ function buildPluginRequestStages(params: {
         if ((await params.getGatewayAuthBypassPaths()).has(params.requestPath)) {
           return false;
         }
+        // Bypass paths are limited to bundled channel callbacks; all other protected plugin
+        // routes must produce an AuthorizedGatewayHttpRequest before runtime scopes are derived.
         const { authorizeGatewayHttpRequestOrReply } = await getHttpAuthUtilsModule();
         const requestAuth = await authorizeGatewayHttpRequestOrReply({
           req: params.req,
@@ -477,6 +479,7 @@ function buildPluginRequestStages(params: {
   ];
 }
 
+/** Creates the gateway HTTP/HTTPS server and ordered request-stage router. */
 export function createGatewayHttpServer(opts: {
   clients: Set<GatewayWsClient>;
   controlUiEnabled: boolean;
@@ -573,13 +576,15 @@ export function createGatewayHttpServer(opts: {
         return;
       }
       if (scopedNodeCapability.rewrittenUrl) {
+        // Scoped capability URLs are normalized before auth/routing so built-in handlers,
+        // plugin route matching, and audit context all see the same canonical path.
         req.url = scopedNodeCapability.rewrittenUrl;
       }
       const scopedRequestPath = scopedNodeCapability.pathname;
       const pluginPathContext = handlePluginRequest
         ? resolvePluginRoutePathContext(scopedRequestPath)
         : null;
-      const resolvedAuth = getResolvedAuth();
+      const resolvedAuthValue = getResolvedAuth();
       const requestStages: GatewayHttpRequestStage[] = [
         {
           name: "gateway-probes",
@@ -588,7 +593,7 @@ export function createGatewayHttpServer(opts: {
               req,
               res,
               scopedRequestPath,
-              resolvedAuth,
+              resolvedAuthValue,
               trustedProxies,
               allowRealIpFallback,
               getReadiness,
@@ -604,7 +609,7 @@ export function createGatewayHttpServer(opts: {
           name: "models",
           run: async () =>
             (await getModelsHttpModule()).handleOpenAiModelsHttpRequest(req, res, {
-              auth: resolvedAuth,
+              auth: resolvedAuthValue,
               trustedProxies,
               allowRealIpFallback,
               rateLimiter,
@@ -616,7 +621,7 @@ export function createGatewayHttpServer(opts: {
           name: "embeddings",
           run: async () =>
             (await getEmbeddingsHttpModule()).handleOpenAiEmbeddingsHttpRequest(req, res, {
-              auth: resolvedAuth,
+              auth: resolvedAuthValue,
               trustedProxies,
               allowRealIpFallback,
               rateLimiter,
@@ -628,7 +633,7 @@ export function createGatewayHttpServer(opts: {
           name: "tools-invoke",
           run: async () =>
             (await getToolsInvokeHttpModule()).handleToolsInvokeHttpRequest(req, res, {
-              auth: resolvedAuth,
+              auth: resolvedAuthValue,
               trustedProxies,
               allowRealIpFallback,
               rateLimiter,
@@ -640,7 +645,7 @@ export function createGatewayHttpServer(opts: {
           name: "sessions-kill",
           run: async () =>
             (await getSessionKillHttpModule()).handleSessionKillHttpRequest(req, res, {
-              auth: resolvedAuth,
+              auth: resolvedAuthValue,
               trustedProxies,
               allowRealIpFallback,
               rateLimiter,
@@ -652,7 +657,7 @@ export function createGatewayHttpServer(opts: {
           name: "sessions-history",
           run: async () =>
             (await getSessionHistoryHttpModule()).handleSessionHistoryHttpRequest(req, res, {
-              auth: resolvedAuth,
+              auth: resolvedAuthValue,
               getResolvedAuth,
               trustedProxies,
               allowRealIpFallback,
@@ -660,40 +665,12 @@ export function createGatewayHttpServer(opts: {
             }),
         });
       }
-      requestStages.push({
-        name: "agents-apply",
-        run: () => handleAgentsApplyHttpRequest(req, res, { auth: resolvedAuth, rateLimiter }),
-      });
-      requestStages.push({
-        name: "cron-jobs",
-        run: () => handleCronJobsHttpRequest(req, res, { auth: resolvedAuth, rateLimiter }),
-      });
-      requestStages.push({
-        name: "agents",
-        run: () => handleAgentsHttpRequest(req, res, { auth: resolvedAuth, rateLimiter }),
-      });
-      requestStages.push({
-        name: "agent-behavior",
-        run: () => handleAgentBehaviorHttpRequest(req, res, { auth: resolvedAuth, rateLimiter }),
-      });
-      requestStages.push({
-        name: "agent-sessions",
-        run: () => handleAgentSessionsHttpRequest(req, res, { auth: resolvedAuth, rateLimiter }),
-      });
-      requestStages.push({
-        name: "usage",
-        run: () => handleUsageHttpRequest(req, res, { auth: resolvedAuth, rateLimiter }),
-      });
-      requestStages.push({
-        name: "files-write",
-        run: () => handleFilesHttpRequest(req, res, { auth: resolvedAuth, rateLimiter }),
-      });
       if (openResponsesEnabled && isOpenResponsesPath(scopedRequestPath)) {
         requestStages.push({
           name: "openresponses",
           run: async () =>
             (await getOpenResponsesHttpModule()).handleOpenResponsesHttpRequest(req, res, {
-              auth: resolvedAuth,
+              auth: resolvedAuthValue,
               config: openResponsesConfig,
               trustedProxies,
               allowRealIpFallback,
@@ -706,7 +683,7 @@ export function createGatewayHttpServer(opts: {
           name: "openai",
           run: async () =>
             (await getOpenAiHttpModule()).handleOpenAiHttpRequest(req, res, {
-              auth: resolvedAuth,
+              auth: resolvedAuthValue,
               config: openAiChatCompletionsConfig,
               trustedProxies,
               allowRealIpFallback,
@@ -730,7 +707,7 @@ export function createGatewayHttpServer(opts: {
               await getPluginNodeCapabilityAuthModule();
             const ok = await authorizePluginNodeCapabilityRequest({
               req,
-              auth: resolvedAuth,
+              auth: resolvedAuthValue,
               trustedProxies,
               allowRealIpFallback,
               clients,
@@ -759,7 +736,7 @@ export function createGatewayHttpServer(opts: {
           pluginPathContext,
           handlePluginRequest,
           shouldEnforcePluginGatewayAuth,
-          resolvedAuth,
+          resolvedAuth: resolvedAuthValue,
           trustedProxies,
           allowRealIpFallback,
           rateLimiter,
@@ -774,7 +751,7 @@ export function createGatewayHttpServer(opts: {
               req,
               res,
               {
-                auth: resolvedAuth,
+                auth: resolvedAuthValue,
                 trustedProxies,
                 allowRealIpFallback,
                 rateLimiter,
@@ -791,7 +768,7 @@ export function createGatewayHttpServer(opts: {
               basePath: controlUiBasePath,
               config: configSnapshot,
               agentId: resolveAssistantIdentity({ cfg: configSnapshot }).agentId,
-              auth: resolvedAuth,
+              auth: resolvedAuthValue,
               trustedProxies,
               allowRealIpFallback,
               rateLimiter,
@@ -804,7 +781,7 @@ export function createGatewayHttpServer(opts: {
             const { resolveAgentAvatar } = await getIdentityAvatarModule();
             return handleControlUiAvatarRequest(req, res, {
               basePath: controlUiBasePath,
-              auth: resolvedAuth,
+              auth: resolvedAuthValue,
               trustedProxies,
               allowRealIpFallback,
               rateLimiter,
@@ -821,7 +798,7 @@ export function createGatewayHttpServer(opts: {
               config: configSnapshot,
               agentId: resolveAssistantIdentity({ cfg: configSnapshot }).agentId,
               root: controlUiRoot,
-              auth: resolvedAuth,
+              auth: resolvedAuthValue,
               trustedProxies,
               allowRealIpFallback,
               rateLimiter,
@@ -847,6 +824,7 @@ export function createGatewayHttpServer(opts: {
   return httpServer;
 }
 
+/** Attaches WebSocket and plugin-upgrade routing to an already-created HTTP server. */
 export function attachGatewayUpgradeHandler(opts: {
   httpServer: HttpServer;
   wss: WebSocketServer;
@@ -889,15 +867,17 @@ export function attachGatewayUpgradeHandler(opts: {
       if (scopedNodeCapability.rewrittenUrl) {
         req.url = scopedNodeCapability.rewrittenUrl;
       }
-      const resolvedAuth = getResolvedAuth();
+      const resolvedAuthLocal = getResolvedAuth();
       const requestPath = scopedNodeCapability.pathname;
       const pathContext = resolvePluginRoutePathContext(requestPath);
       const nodeCapability = resolvePluginNodeCapabilityRoute?.(pathContext);
       if (nodeCapability) {
+        // Node-capability WebSocket upgrades authenticate before plugin upgrade dispatch so
+        // plugin handlers never receive unauthorized scoped capability sockets.
         const { authorizePluginNodeCapabilityRequest } = await getPluginNodeCapabilityAuthModule();
         const ok = await authorizePluginNodeCapabilityRequest({
           req,
-          auth: resolvedAuth,
+          auth: resolvedAuthLocal,
           trustedProxies,
           allowRealIpFallback,
           clients,
@@ -926,7 +906,7 @@ export function attachGatewayUpgradeHandler(opts: {
           const { checkGatewayHttpRequestAuth } = await getHttpAuthUtilsModule();
           const authCheck = await checkGatewayHttpRequestAuth({
             req,
-            auth: resolvedAuth,
+            auth: resolvedAuthLocal,
             trustedProxies,
             allowRealIpFallback,
             rateLimiter,
@@ -968,6 +948,8 @@ export function attachGatewayUpgradeHandler(opts: {
         return;
       }
       let budgetTransferred = false;
+      // The socket owns the preauth budget until the WebSocket connection handler claims it;
+      // close/error paths release here to avoid leaking unauthenticated connection slots.
       const releaseUpgradeBudget = () => {
         if (budgetTransferred) {
           return;
@@ -1002,7 +984,7 @@ export function attachGatewayUpgradeHandler(opts: {
         releaseUpgradeBudget();
         throw new Error("gateway websocket upgrade failed");
       }
-    }).catch((err) => {
+    }).catch((err: unknown) => {
       const remoteAddress = (socket as { remoteAddress?: string }).remoteAddress ?? "unknown";
       const errorMessage = err instanceof Error ? err.message : String(err);
       log?.warn(`ws upgrade error from ${remoteAddress}: ${errorMessage}`);

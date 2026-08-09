@@ -1,3 +1,4 @@
+// Plugin HTTP routing dispatches registered plugin routes, upgrades, auth policy, and runtime request scope.
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 import {
@@ -200,6 +201,8 @@ export function createGatewayPluginRequestHandler(params: {
           res.statusCode = 500;
           res.setHeader("Content-Type", "text/plain; charset=utf-8");
           res.end("Internal Server Error");
+        } else if (!res.writableEnded && !res.destroyed) {
+          res.end();
         }
         return true;
       }

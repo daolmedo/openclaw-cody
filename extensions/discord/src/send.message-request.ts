@@ -1,3 +1,5 @@
+// Discord plugin module implements send.message request behavior.
+import { randomBytes } from "node:crypto";
 import { MessageFlags, type APIEmbed } from "discord-api-types/v10";
 import {
   Embed,
@@ -13,6 +15,10 @@ export const SUPPRESS_NOTIFICATIONS_FLAG = MessageFlags.SuppressNotifications;
 export type DiscordSendComponentFactory = (text: string) => TopLevelComponents[];
 export type DiscordSendComponents = TopLevelComponents[] | DiscordSendComponentFactory;
 export type DiscordSendEmbeds = Array<APIEmbed | Embed>;
+
+export function createDiscordMessageNonce(): string {
+  return randomBytes(12).toString("hex");
+}
 
 export function resolveDiscordSendComponents(params: {
   components?: DiscordSendComponents;
@@ -86,20 +92,28 @@ export function resolveDiscordMessageFlags(params: {
   return flags || undefined;
 }
 
-export function buildDiscordMessageRequest(params: {
+type DiscordMessageRequestParams = {
   text: string;
   components?: TopLevelComponents[];
   embeds?: Embed[];
   files?: MessagePayloadFile[];
   flags?: number;
   replyTo?: string;
-}) {
+} & ({ endpoint: "create-message"; nonce?: string } | { endpoint: "forum-thread"; nonce?: never });
+
+export function buildDiscordMessageRequest(params: DiscordMessageRequestParams) {
   const payload = buildDiscordMessagePayload(params);
+  const nonce =
+    params.endpoint === "create-message"
+      ? (params.nonce ?? createDiscordMessageNonce())
+      : undefined;
   return stripUndefinedFields({
     ...serializePayload(payload),
     ...(params.replyTo
       ? { message_reference: { message_id: params.replyTo, fail_if_not_exists: false } }
       : {}),
+    nonce,
+    enforce_nonce: nonce ? true : undefined,
   });
 }
 

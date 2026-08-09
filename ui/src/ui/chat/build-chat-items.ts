@@ -1,4 +1,12 @@
+// Control UI chat module implements build chat items behavior.
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import {
+  isToolCallContentType,
+  isToolResultContentType,
+  resolveToolUseId,
+} from "../../../../src/chat/tool-content.js";
 import type { ChatItem, MessageGroup, NormalizedMessage, ToolCard } from "../types/chat-types.ts";
+import type { ChatQueueItem } from "../ui-types.ts";
 import {
   isAssistantHeartbeatAckForDisplay,
   stripHeartbeatTokenForDisplay,
@@ -8,7 +16,9 @@ import { extractTextCached } from "./message-extract.ts";
 import { normalizeMessage, stripMessageDisplayMetadataText } from "./message-normalizer.ts";
 import { normalizeRoleForGrouping } from "./role-normalizer.ts";
 import { messageMatchesSearchQuery } from "./search-match.ts";
-import { extractToolCards, extractToolPreview } from "./tool-cards.ts";
+import { trimAccumulatedStreamPrefix } from "./stream-text.ts";
+import { extractToolCardsCached, extractToolPreview } from "./tool-cards.ts";
+import { buildUserChatMessageContentBlocks } from "./user-message-content.ts";
 
 export type BuildChatItemsProps = {
   sessionKey: string;
@@ -17,9 +27,11 @@ export type BuildChatItemsProps = {
   streamSegments: Array<{ text: string; ts: number }>;
   stream: string | null;
   streamStartedAt: number | null;
+  queue?: ChatQueueItem[];
   showToolCalls: boolean;
   searchOpen?: boolean;
   searchQuery?: string;
+  historyRenderLimit?: number;
 };
 
 function appendCanvasBlockToAssistantMessage(
@@ -83,6 +95,319 @@ function safeNormalizeMessage(message: unknown): NormalizedMessage | null {
   }
 }
 
+function mergeToolCallResultPair(callItem: ChatItem, resultItem: ChatItem): ChatItem | null {
+  if (callItem.kind !== "message" || resultItem.kind !== "message") {
+    return null;
+  }
+  const callMessage = asRecord(callItem.message);
+  const resultMessage = asRecord(resultItem.message);
+  if (!callMessage || !resultMessage) {
+    return null;
+  }
+  const callRole = typeof callMessage.role === "string" ? callMessage.role.toLowerCase() : "";
+  const normalizedResult = safeNormalizeMessage(resultItem.message);
+  const resultRole = normalizedResult ? normalizeRoleForGrouping(normalizedResult.role) : "unknown";
+  if (callRole !== "assistant" || resultRole !== "tool" || !Array.isArray(callMessage.content)) {
+    return null;
+  }
+  if (!callMessage.content.some((block) => isToolCallContentType(asRecord(block)?.type))) {
+    return null;
+  }
+
+  const callCards = extractToolCardsCached(callItem.message, `${callItem.key}:activity-call`);
+  const resultCards = extractToolCardsCached(
+    resultItem.message,
+    `${resultItem.key}:activity-result`,
+  );
+  if (callCards.length === 0 || resultCards.length === 0) {
+    return null;
+  }
+  const rawResultContent = Array.isArray(resultMessage.content) ? resultMessage.content : [];
+  if (rawResultContent.some((block) => isToolCallContentType(asRecord(block)?.type))) {
+    return null;
+  }
+  const resultOnlyContent = rawResultContent.filter(
+    (block) => !isToolCallContentType(asRecord(block)?.type),
+  );
+  const hasToolResultBlock = resultOnlyContent.some((block) =>
+    isToolResultContentType(asRecord(block)?.type),
+  );
+  const hasToolResult =
+    hasToolResultBlock ||
+    resultCards.some((card) => card.outputText !== undefined || card.isError !== undefined);
+  if (!hasToolResult) {
+    return null;
+  }
+
+  const unresolvedCallIds = unresolvedToolCallIds(callItem);
+  const matchedResults = new Map<string, { resultCard: ToolCard; resultName: string }>();
+  for (const resultCard of resultCards) {
+    const callId = resultCard.callId;
+    if (!callId || !unresolvedCallIds.has(callId) || matchedResults.has(callId)) {
+      return null;
+    }
+    const callCard = callCards.find((card) => card.callId === callId);
+    if (!callCard) {
+      return null;
+    }
+    const resultName = resultCard.name === "tool" ? callCard.name : resultCard.name;
+    if (
+      normalizeLowercaseStringOrEmpty(callCard.name) !== normalizeLowercaseStringOrEmpty(resultName)
+    ) {
+      return null;
+    }
+    matchedResults.set(callId, { resultCard, resultName });
+  }
+
+  const preservedResultContent = resultOnlyContent.filter(
+    (block) => asRecord(block)?.type !== "text",
+  );
+  // Transcript result blocks often carry their call id and name on the message.
+  // Stamp them onto merged blocks so one call and its result render as one card.
+  const resultContent = hasToolResultBlock
+    ? resultOnlyContent.map((block) => {
+        const record = asRecord(block);
+        if (!record || !isToolResultContentType(record.type)) {
+          return block;
+        }
+        const callId = resolveToolBlockId(record, resultMessage);
+        const matched = callId ? matchedResults.get(callId) : undefined;
+        if (!matched) {
+          return block;
+        }
+        const stamped: Record<string, unknown> = Object.assign({}, record);
+        stamped.id = callId;
+        stamped.name =
+          typeof record.name === "string" && record.name.trim() ? record.name : matched.resultName;
+        if (
+          record.isError === undefined &&
+          record.is_error === undefined &&
+          matched.resultCard.isError !== undefined
+        ) {
+          stamped.isError = matched.resultCard.isError;
+        }
+        return stamped;
+      })
+    : (() => {
+        const [matched] = matchedResults.values();
+        if (!matched) {
+          return preservedResultContent;
+        }
+        return [
+          {
+            type: "tool_result",
+            id: matched.resultCard.callId,
+            name: matched.resultName,
+            text: matched.resultCard.outputText ?? "",
+            ...(matched.resultCard.isError !== undefined
+              ? { isError: matched.resultCard.isError }
+              : {}),
+          },
+          ...preservedResultContent,
+        ];
+      })();
+  return {
+    ...callItem,
+    message: {
+      ...callMessage,
+      content: [...callMessage.content, ...resultContent],
+    },
+  };
+}
+
+function resolveMessageToolUseId(message: Record<string, unknown>): string | undefined {
+  for (const field of ["tool_call_id", "toolCallId", "tool_use_id", "toolUseId"] as const) {
+    const value = message[field];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
+function resolveToolBlockId(
+  block: Record<string, unknown>,
+  message: Record<string, unknown>,
+): string | undefined {
+  return resolveToolUseId(block) ?? resolveMessageToolUseId(message);
+}
+
+function unresolvedToolCallIds(item: ChatItem): Set<string> {
+  const unresolved = new Set<string>();
+  if (item.kind !== "message") {
+    return unresolved;
+  }
+  const message = asRecord(item.message);
+  if (
+    !message ||
+    typeof message.role !== "string" ||
+    message.role.toLowerCase() !== "assistant" ||
+    !Array.isArray(message.content)
+  ) {
+    return unresolved;
+  }
+  for (const block of message.content) {
+    const record = asRecord(block);
+    if (!record) {
+      continue;
+    }
+    const callId = resolveToolBlockId(record, message);
+    if (!callId) {
+      continue;
+    }
+    if (isToolCallContentType(record.type)) {
+      unresolved.add(callId);
+    } else if (isToolResultContentType(record.type)) {
+      unresolved.delete(callId);
+    }
+  }
+  return unresolved;
+}
+
+function isToolTimelineItem(item: ChatItem): boolean {
+  if (item.kind !== "message") {
+    return false;
+  }
+  const normalized = safeNormalizeMessage(item.message);
+  return normalized ? normalizeRoleForGrouping(normalized.role) === "tool" : false;
+}
+
+function splitBundledToolResultItems(item: ChatItem): ChatItem[] {
+  if (item.kind !== "message") {
+    return [item];
+  }
+  const message = asRecord(item.message);
+  if (!message || !Array.isArray(message.content) || message.content.length < 2) {
+    return [item];
+  }
+  const blocksByCallId = new Map<string, unknown[]>();
+  for (const block of message.content) {
+    const record = asRecord(block);
+    if (!record || !isToolResultContentType(record.type)) {
+      return [item];
+    }
+    const callId = resolveToolBlockId(record, message);
+    if (!callId) {
+      return [item];
+    }
+    const blocks = blocksByCallId.get(callId) ?? [];
+    blocks.push(block);
+    blocksByCallId.set(callId, blocks);
+  }
+  if (blocksByCallId.size < 2) {
+    return [item];
+  }
+  return Array.from(blocksByCallId.values(), (content, index) => ({
+    ...item,
+    key: `${item.key}:result:${index}`,
+    message: { ...message, content },
+  }));
+}
+
+function resolveToolResultCallId(item: ChatItem): string | undefined {
+  if (item.kind !== "message") {
+    return undefined;
+  }
+  const message = asRecord(item.message);
+  if (!message) {
+    return undefined;
+  }
+  const content = Array.isArray(message.content) ? message.content : [];
+  if (content.some((block) => isToolCallContentType(asRecord(block)?.type))) {
+    return undefined;
+  }
+  const resultIds = new Set<string>();
+  for (const block of content) {
+    const record = asRecord(block);
+    if (record && isToolResultContentType(record.type)) {
+      const callId = resolveToolBlockId(record, message);
+      if (callId) {
+        resultIds.add(callId);
+      }
+    }
+  }
+  if (resultIds.size > 1) {
+    return undefined;
+  }
+  return resultIds.values().next().value ?? resolveMessageToolUseId(message);
+}
+
+function refreshOpenCallIds(
+  openCallIndexes: Map<string, number>,
+  coalesced: ChatItem[],
+  callIndex: number,
+) {
+  for (const [callId, index] of openCallIndexes) {
+    if (index === callIndex) {
+      openCallIndexes.delete(callId);
+    }
+  }
+  const item = coalesced[callIndex];
+  if (!item) {
+    return;
+  }
+  for (const callId of unresolvedToolCallIds(item)) {
+    openCallIndexes.set(callId, callIndex);
+  }
+}
+
+function coalesceToolActivityMessages(items: ChatItem[]): ChatItem[] {
+  const coalesced: ChatItem[] = [];
+  // Parallel calls can outnumber any fixed lookback window, so each unresolved
+  // call id owns its transcript item until a non-tool boundary closes the run.
+  const openCallIndexes = new Map<string, number>();
+  for (const item of items) {
+    const resultItems = splitBundledToolResultItems(item);
+    const unmatchedResultItems: ChatItem[] = [];
+    let mergedResult = false;
+    for (const resultItem of resultItems) {
+      const callId = resolveToolResultCallId(resultItem);
+      const callIndex = callId ? openCallIndexes.get(callId) : undefined;
+      const callItem = callIndex === undefined ? undefined : coalesced[callIndex];
+      const merged =
+        callIndex === undefined || !callItem ? null : mergeToolCallResultPair(callItem, resultItem);
+      if (!merged || callIndex === undefined) {
+        unmatchedResultItems.push(resultItem);
+        continue;
+      }
+      coalesced[callIndex] = merged;
+      refreshOpenCallIds(openCallIndexes, coalesced, callIndex);
+      mergedResult = true;
+    }
+    if (mergedResult) {
+      coalesced.push(...unmatchedResultItems);
+      continue;
+    }
+
+    const unresolvedCallIds = unresolvedToolCallIds(item);
+    if (unresolvedCallIds.size === 1) {
+      const callId = unresolvedCallIds.values().next().value;
+      const previousIndex = callId ? openCallIndexes.get(callId) : undefined;
+      const previous = previousIndex === undefined ? undefined : coalesced[previousIndex];
+      if (previousIndex !== undefined && previous && unresolvedToolCallIds(previous).size === 1) {
+        coalesced[previousIndex] = item;
+        refreshOpenCallIds(openCallIndexes, coalesced, previousIndex);
+        continue;
+      }
+    }
+
+    coalesced.push(item);
+    if (unresolvedCallIds.size > 0) {
+      const callIndex = coalesced.length - 1;
+      for (const callId of unresolvedCallIds) {
+        openCallIndexes.set(callId, callIndex);
+      }
+      continue;
+    }
+    if (isToolTimelineItem(item)) {
+      // Orphan results keep the window open for later sibling results.
+      continue;
+    }
+    openCallIndexes.clear();
+  }
+  return coalesced;
+}
+
 function extractChatMessagePreview(toolMessage: unknown): {
   preview: Extract<NonNullable<ToolCard["preview"]>, { kind: "canvas" }>;
   text: string | null;
@@ -92,7 +417,7 @@ function extractChatMessagePreview(toolMessage: unknown): {
   if (!normalized) {
     return null;
   }
-  const cards = extractToolCards(toolMessage, "preview");
+  const cards = extractToolCardsCached(toolMessage, "preview");
   for (let index = cards.length - 1; index >= 0; index--) {
     const card = cards[index];
     if (card?.preview?.kind === "canvas") {
@@ -187,13 +512,17 @@ function groupMessages(items: ChatItem[]): Array<ChatItem | MessageGroup> {
 
     const normalized = normalizeMessage(item.message);
     const role = normalizeRoleForGrouping(normalized.role);
-    const senderLabel = role.toLowerCase() === "user" ? (normalized.senderLabel ?? null) : null;
+    const senderLabel =
+      role.toLowerCase() === "user" || role.toLowerCase() === "assistant"
+        ? (normalized.senderLabel ?? null)
+        : null;
     const timestamp = normalized.timestamp || Date.now();
+    const shouldSplitBySender = role.toLowerCase() === "user" || role.toLowerCase() === "assistant";
 
     if (
       !currentGroup ||
       currentGroup.role !== role ||
-      (role.toLowerCase() === "user" && currentGroup.senderLabel !== senderLabel)
+      (shouldSplitBySender && currentGroup.senderLabel !== senderLabel)
     ) {
       if (currentGroup) {
         result.push(currentGroup);
@@ -222,7 +551,116 @@ function groupMessages(items: ChatItem[]): Array<ChatItem | MessageGroup> {
   return result;
 }
 
+function isPendingSendMessage(message: unknown): boolean {
+  return asRecord(asRecord(message)?.["__openclaw"])?.kind === "pending-send";
+}
+
+function sourceMessageId(message: unknown): string | null {
+  const record = asRecord(message);
+  if (!record) {
+    return null;
+  }
+  const openclawId = asRecord(record["__openclaw"])?.id;
+  if (typeof openclawId === "string" && openclawId.trim()) {
+    return openclawId.trim();
+  }
+  const messageId = typeof record.messageId === "string" ? record.messageId.trim() : "";
+  if (messageId) {
+    return messageId;
+  }
+  const id = typeof record.id === "string" ? record.id.trim() : "";
+  return id || null;
+}
+
+function collapseDuplicateSourceKey(message: unknown): string | null {
+  if (isPendingSendMessage(message)) {
+    return null;
+  }
+  const normalized = safeNormalizeMessage(message);
+  if (!normalized) {
+    return null;
+  }
+  const role = normalizeRoleForGrouping(normalized.role).toLowerCase();
+  if (role !== "assistant") {
+    return null;
+  }
+  const id = sourceMessageId(message);
+  return id ? `${role}:${id}` : null;
+}
+
+function prefersNativeChatSurface(message: unknown): boolean {
+  const normalized = safeNormalizeMessage(message);
+  if (!normalized) {
+    return false;
+  }
+  const role = normalizeRoleForGrouping(normalized.role).toLowerCase();
+  return (role === "user" || role === "assistant") && !(normalized.senderLabel ?? "").trim();
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function stripSenderLabelPrefix(text: string, senderLabel: string): string {
+  const label = senderLabel.trim();
+  if (!label) {
+    return text;
+  }
+  return text.replace(new RegExp(`^${escapeRegExp(label)}(?::|：|-|—)?[ \\t]+`), "");
+}
+
+function sourceDuplicateDisplayParts(message: unknown): {
+  role: string;
+  senderLabel: string;
+  text: string;
+} | null {
+  const normalized = safeNormalizeMessage(message);
+  if (!normalized) {
+    return null;
+  }
+  const role = normalizeRoleForGrouping(normalized.role).toLowerCase();
+  if (role !== "assistant") {
+    return null;
+  }
+  const textParts: string[] = [];
+  for (const block of normalized.content) {
+    if (block.type !== "text" || typeof block.text !== "string") {
+      return null;
+    }
+    textParts.push(block.text);
+  }
+  const text = textParts.join("\n");
+  if (!text.trim()) {
+    return null;
+  }
+  return {
+    role,
+    senderLabel: (normalized.senderLabel ?? "").trim(),
+    text,
+  };
+}
+
+function isSameSourceRelayNativeDuplicate(previousMessage: unknown, nextMessage: unknown): boolean {
+  const previous = sourceDuplicateDisplayParts(previousMessage);
+  const next = sourceDuplicateDisplayParts(nextMessage);
+  if (!previous || !next || previous.role !== next.role) {
+    return false;
+  }
+  if (Boolean(previous.senderLabel) === Boolean(next.senderLabel)) {
+    return false;
+  }
+  const labeled = previous.senderLabel ? previous : next;
+  const native = previous.senderLabel ? next : previous;
+  return (
+    labeled.text === native.text ||
+    stripSenderLabelPrefix(labeled.text, labeled.senderLabel) === native.text
+  );
+}
+
 function collapseDuplicateDisplaySignature(message: unknown): string | null {
+  if (isPendingSendMessage(message)) {
+    return null;
+  }
   const normalized = safeNormalizeMessage(message);
   if (!normalized) {
     return null;
@@ -245,28 +683,50 @@ function collapseDuplicateDisplaySignature(message: unknown): string | null {
   if (!text) {
     return null;
   }
-  const senderLabel = role === "user" ? (normalized.senderLabel ?? "").trim() : "";
+  const senderLabel =
+    role === "user" || role === "assistant" ? (normalized.senderLabel ?? "").trim() : "";
   return `${role}:${senderLabel}:${text}`;
 }
 
 function collapseSequentialDuplicateMessages(items: ChatItem[]): ChatItem[] {
   const collapsed: ChatItem[] = [];
   let previousSignature: string | null = null;
+  let previousSourceKey: string | null = null;
 
   for (const item of items) {
     if (item.kind !== "message") {
       collapsed.push(item);
       previousSignature = null;
+      previousSourceKey = null;
       continue;
     }
     const signature = collapseDuplicateDisplaySignature(item.message);
+    const sourceKey = collapseDuplicateSourceKey(item.message);
     const previous = collapsed[collapsed.length - 1];
-    if (signature && previousSignature === signature && previous?.kind === "message") {
+    if (
+      sourceKey &&
+      previousSourceKey === sourceKey &&
+      previous?.kind === "message" &&
+      isSameSourceRelayNativeDuplicate(previous.message, item.message)
+    ) {
+      if (!prefersNativeChatSurface(previous.message) && prefersNativeChatSurface(item.message)) {
+        collapsed[collapsed.length - 1] = item;
+        previousSignature = signature;
+      }
+      continue;
+    }
+    if (
+      signature &&
+      previousSignature === signature &&
+      previous?.kind === "message" &&
+      !(sourceKey && previousSourceKey && sourceKey !== previousSourceKey)
+    ) {
       previous.duplicateCount = (previous.duplicateCount ?? 1) + 1;
       continue;
     }
     collapsed.push(item);
     previousSignature = signature;
+    previousSourceKey = sourceKey;
   }
 
   return collapsed;
@@ -277,7 +737,9 @@ function hasRenderableNormalizedMessage(message: unknown): boolean {
   if (!normalized) {
     return false;
   }
-  return normalized.content.length > 0 || Boolean(normalized.replyTarget);
+  const role = normalizeRoleForGrouping(normalized.role);
+  const hasVisibleSenderLabel = role === "assistant" && Boolean(normalized.senderLabel?.trim());
+  return normalized.content.length > 0 || Boolean(normalized.replyTarget) || hasVisibleSenderLabel;
 }
 
 function sanitizeStreamText(text: string): string {
@@ -285,11 +747,32 @@ function sanitizeStreamText(text: string): string {
   return stripped.trim().length > 0 ? stripped : "";
 }
 
-function trimAccumulatedStreamPrefix(text: string, previousText: string | null): string {
-  if (!previousText || !text.startsWith(previousText)) {
-    return text;
+function shouldRenderQueuedSendInThread(item: ChatQueueItem): boolean {
+  if (typeof item.sendSubmittedAtMs !== "number" || item.sendState === "failed") {
+    return false;
   }
-  return text.slice(previousText.length).trimStart();
+  return (
+    item.sendState === "waiting-model" ||
+    item.sendState === "sending" ||
+    item.sendState === "waiting-reconnect"
+  );
+}
+
+function queuedSendThreadMessage(item: ChatQueueItem): Record<string, unknown> | null {
+  const content = buildUserChatMessageContentBlocks(item.text, item.attachments);
+  if (content.length === 0) {
+    return null;
+  }
+  return {
+    role: "user",
+    content,
+    timestamp: item.createdAt,
+    __openclaw: {
+      kind: "pending-send",
+      id: item.id,
+      state: item.sendState,
+    },
+  };
 }
 
 function rawMessageTimestamp(message: unknown): number | null {
@@ -311,6 +794,19 @@ function chatItemTimestamp(item: ChatItem): number | null {
       return null;
   }
   return null;
+}
+
+function timestampAfterVisibleItems(items: ChatItem[], desiredTimestamp: number): number {
+  const latestTimestamp = items.reduce<number | null>((latest, item) => {
+    const timestamp = chatItemTimestamp(item);
+    if (timestamp == null) {
+      return latest;
+    }
+    return latest == null || timestamp > latest ? timestamp : latest;
+  }, null);
+  return latestTimestamp != null && desiredTimestamp <= latestTimestamp
+    ? latestTimestamp + 1
+    : desiredTimestamp;
 }
 
 function sortChatItemsByVisibleTime(items: ChatItem[]): ChatItem[] {
@@ -433,7 +929,18 @@ function countVisibleHistoryMessages(messages: unknown[], showToolCalls: boolean
   return count;
 }
 
-function resolveHistoryStartIndex(messages: unknown[], showToolCalls: boolean): number {
+function resolveHistoryRenderLimit(limit: number | undefined): number {
+  if (typeof limit !== "number" || !Number.isFinite(limit)) {
+    return CHAT_HISTORY_RENDER_LIMIT;
+  }
+  return Math.max(1, Math.min(CHAT_HISTORY_RENDER_LIMIT, Math.floor(limit)));
+}
+
+function resolveHistoryStartIndex(
+  messages: unknown[],
+  showToolCalls: boolean,
+  renderLimit: number,
+): number {
   let visibleCount = 0;
   let renderChars = 0;
   let startIndex = messages.length;
@@ -442,7 +949,7 @@ function resolveHistoryStartIndex(messages: unknown[], showToolCalls: boolean): 
     if (isHiddenToolMessage(message, showToolCalls)) {
       continue;
     }
-    if (visibleCount >= CHAT_HISTORY_RENDER_LIMIT) {
+    if (visibleCount >= renderLimit) {
       break;
     }
     const remainingBudget = Math.max(1, CHAT_HISTORY_RENDER_CHAR_BUDGET - renderChars + 1);
@@ -459,6 +966,7 @@ function resolveHistoryStartIndex(messages: unknown[], showToolCalls: boolean): 
 
 export function buildChatItems(props: BuildChatItemsProps): Array<ChatItem | MessageGroup> {
   let items: ChatItem[] = [];
+  const historyRenderLimit = resolveHistoryRenderLimit(props.historyRenderLimit);
   const history = (Array.isArray(props.messages) ? props.messages : []).filter(
     (message) => !isAssistantHeartbeatAckForDisplay(message),
   );
@@ -470,7 +978,7 @@ export function buildChatItems(props: BuildChatItemsProps): Array<ChatItem | Mes
     text: string | null;
     timestamp: number | null;
   }>;
-  const historyStart = resolveHistoryStartIndex(history, props.showToolCalls);
+  const historyStart = resolveHistoryStartIndex(history, props.showToolCalls, historyRenderLimit);
   const hiddenHistoryCount = countVisibleHistoryMessages(
     history.slice(0, historyStart),
     props.showToolCalls,
@@ -535,6 +1043,29 @@ export function buildChatItems(props: BuildChatItemsProps): Array<ChatItem | Mes
       message: msg,
     });
   }
+  const queuedSends = Array.isArray(props.queue) ? props.queue : [];
+  for (const queued of queuedSends) {
+    if (!shouldRenderQueuedSendInThread(queued)) {
+      continue;
+    }
+    const message = queuedSendThreadMessage(queued);
+    if (!message) {
+      continue;
+    }
+    const searchQuery = props.searchQuery ?? "";
+    if (
+      props.searchOpen &&
+      searchQuery.trim() &&
+      !messageMatchesSearchQuery(message, searchQuery)
+    ) {
+      continue;
+    }
+    items.push({
+      kind: "message",
+      key: `pending-send:${queued.id}`,
+      message,
+    });
+  }
   for (const liftedCanvasSource of liftedCanvasSources) {
     const assistantIndex = findNearestAssistantMessageIndex(items, liftedCanvasSource.timestamp);
     if (assistantIndex == null) {
@@ -572,6 +1103,7 @@ export function buildChatItems(props: BuildChatItemsProps): Array<ChatItem | Mes
           key: `stream-seg:${props.sessionKey}:${i}`,
           text: visibleText,
           startedAt: segments[i].ts,
+          isStreaming: false,
         });
       }
     }
@@ -588,13 +1120,15 @@ export function buildChatItems(props: BuildChatItemsProps): Array<ChatItem | Mes
     const key = `stream:${props.sessionKey}:${props.streamStartedAt ?? "live"}`;
     const text = sanitizeStreamText(props.stream);
     const visibleText = trimAccumulatedStreamPrefix(text, previousAccumulatedStreamText);
+    const startedAt = timestampAfterVisibleItems(items, props.streamStartedAt ?? Date.now());
     if (visibleText.length > 0) {
       if (!stripHeartbeatTokenForDisplay(visibleText).shouldSkip) {
         items.push({
           kind: "stream",
           key,
           text: visibleText,
-          startedAt: props.streamStartedAt ?? Date.now(),
+          startedAt,
+          isStreaming: true,
         });
       }
     } else if (props.stream.trim().length === 0) {
@@ -602,7 +1136,11 @@ export function buildChatItems(props: BuildChatItemsProps): Array<ChatItem | Mes
     }
   }
 
-  return groupMessages(collapseSequentialDuplicateMessages(sortChatItemsByVisibleTime(items)));
+  return groupMessages(
+    collapseSequentialDuplicateMessages(
+      coalesceToolActivityMessages(sortChatItemsByVisibleTime(items)),
+    ),
+  );
 }
 
 function messageKey(message: unknown, index: number): string {

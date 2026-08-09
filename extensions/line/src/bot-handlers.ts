@@ -1,3 +1,4 @@
+// Line plugin module implements bot handlers behavior.
 import type { webhook } from "@line/bot-sdk";
 import { buildMentionRegexes, matchesMentionPatterns } from "openclaw/plugin-sdk/channel-inbound";
 import { resolveStableChannelMessageIngress } from "openclaw/plugin-sdk/channel-ingress-runtime";
@@ -248,12 +249,10 @@ async function shouldProcessLineEvent(
       : groupConfig?.allowFrom !== undefined
         ? "allowlist"
         : runtimeGroupPolicy;
+  // LINE group allowlists are scoped separately from DM allowFrom.
+  // The shared ingress policy below intentionally keeps fallback disabled.
   const groupAllowFrom = normalizeStringEntries(
-    firstDefined(
-      groupConfig?.allowFrom,
-      account.config.groupAllowFrom,
-      account.config.allowFrom?.length ? account.config.allowFrom : undefined,
-    ),
+    firstDefined(groupConfig?.allowFrom, account.config.groupAllowFrom),
   );
   const mentionFacts = (() => {
     if (!isGroup || event.type !== "message") {
@@ -615,6 +614,20 @@ export async function handleLineWebhookEvents(
     }
   }
   if (firstError) {
-    throw firstError;
+    throw toLintErrorObject(firstError, "Non-Error thrown");
   }
+}
+
+function toLintErrorObject(value: unknown, fallbackMessage: string): Error {
+  if (value instanceof Error) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return new Error(value);
+  }
+  const error = new Error(fallbackMessage, { cause: value });
+  if ((typeof value === "object" && value !== null) || typeof value === "function") {
+    Object.assign(error, value);
+  }
+  return error;
 }

@@ -1,3 +1,4 @@
+// Discord plugin module implements outbound send context behavior.
 import { createReplyToFanout, type ReplyToResolution } from "openclaw/plugin-sdk/channel-outbound";
 import {
   resolveOutboundSendDep,
@@ -5,7 +6,6 @@ import {
 } from "openclaw/plugin-sdk/channel-outbound";
 import type { OpenClawConfig, ReplyToMode } from "openclaw/plugin-sdk/config-contracts";
 import { normalizeOptionalStringifiedId } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { withDiscordDeliveryRetry } from "./delivery-retry.js";
 
 type DiscordSendRuntime = typeof import("./send.js");
 
@@ -67,7 +67,6 @@ export async function createDiscordPayloadSendContext(ctx: {
   resolveReplyTo: () => string | undefined;
   send: DiscordSendFn;
   sendVoice: DiscordVoiceSendFn;
-  withRetry: <T>(fn: () => Promise<T>) => Promise<T>;
 }> {
   const runtime = await loadDiscordSendRuntime();
   return {
@@ -82,11 +81,5 @@ export async function createDiscordPayloadSendContext(ctx: {
     sendVoice:
       resolveOutboundSendDep<DiscordVoiceSendFn>(ctx.deps, "discordVoice") ??
       runtime.sendVoiceMessageDiscord,
-    withRetry: async (fn) =>
-      await withDiscordDeliveryRetry({
-        cfg: ctx.cfg,
-        accountId: ctx.accountId,
-        fn,
-      }),
   };
 }

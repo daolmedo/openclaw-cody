@@ -1,3 +1,4 @@
+// Plugin runtime mock helpers build minimal runtime doubles for plugin SDK tests.
 import { vi } from "vitest";
 import {
   normalizeInboundTextNewlines,
@@ -16,7 +17,7 @@ import {
 import type { PluginRuntime } from "../testing.js";
 
 const DEFAULT_PROVIDER = "openai";
-const DEFAULT_MODEL = "gpt-5.5";
+const DEFAULT_MODEL = "gpt-5.6-sol";
 
 type DeepPartial<T> = {
   [K in keyof T]?: T[K] extends (...args: never[]) => unknown
@@ -58,6 +59,7 @@ function createTaskFlowSessionMock() {
   return {
     sessionKey: "agent:main:main",
     createManaged: vi.fn(),
+    tryCreateManaged: vi.fn(),
     get: vi.fn(),
     list: vi.fn(() => []),
     findLatest: vi.fn(),
@@ -188,6 +190,7 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
       onRecordError: record?.onRecordError ?? (() => undefined),
       trackSessionMetaTask: record?.trackSessionMetaTask,
     });
+    await (params.afterRecord as (() => void | Promise<void>) | undefined)?.();
     const dispatchResult = await dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
       cfg: params.cfg,
@@ -222,6 +225,7 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
           onRecordError: params.record?.onRecordError ?? (() => undefined),
           trackSessionMetaTask: params.record?.trackSessionMetaTask,
         });
+        await params.afterRecord?.();
       } catch (err) {
         try {
           await params.onPreDispatchFailure?.(err);
@@ -767,6 +771,9 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
       openSyncKeyedStore: vi.fn(() => {
         throw new Error("openSyncKeyedStore mock is not configured");
       }) as unknown as PluginRuntime["state"]["openSyncKeyedStore"],
+      openChannelIngressQueue: vi.fn(() => {
+        throw new Error("openChannelIngressQueue mock is not configured");
+      }) as unknown as PluginRuntime["state"]["openChannelIngressQueue"],
     },
     tasks: {
       runs: {

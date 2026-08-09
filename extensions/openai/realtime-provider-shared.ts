@@ -1,3 +1,5 @@
+// Openai provider module implements model/runtime integration.
+import { resolveExpiresAtMsFromEpochSeconds } from "openclaw/plugin-sdk/number-runtime";
 import {
   createProviderHttpError,
   resolveProviderRequestHeaders,
@@ -68,6 +70,7 @@ type OpenAIRealtimeSecretRequest = {
   url: string;
   body: unknown;
   errorMessage: string;
+  authRejectedMessage?: string;
   missingValueMessage: string;
 };
 
@@ -106,7 +109,11 @@ async function createOpenAIRealtimeSecret(
   const payload = await (async () => {
     try {
       if (!response.ok) {
-        throw await createProviderHttpError(response, params.errorMessage);
+        const error = await createProviderHttpError(response, params.errorMessage);
+        if (response.status === 401 && params.authRejectedMessage) {
+          error.message = params.authRejectedMessage;
+        }
+        throw error;
       }
       return (await response.json()) as unknown;
     } finally {
@@ -125,9 +132,10 @@ async function createOpenAIRealtimeSecret(
     payload && typeof payload === "object"
       ? (payload as Record<string, unknown>).expires_at
       : undefined;
+  const expiresAtMs = resolveExpiresAtMsFromEpochSeconds(expiresAt);
   return {
     value: clientSecret,
-    ...(typeof expiresAt === "number" ? { expiresAt } : {}),
+    ...(expiresAtMs === undefined ? {} : { expiresAt: expiresAtMs }),
   };
 }
 
@@ -150,12 +158,13 @@ export async function createOpenAIRealtimeTranscriptionClientSecret(params: {
   authToken: string;
   auditContext: string;
   session: Record<string, unknown>;
+  authRejectedMessage?: string;
 }): Promise<OpenAIRealtimeClientSecretResult> {
-  const url = "https://api.openai.com/v1/realtime/transcription_sessions";
+  const url = "https://api.openai.com/v1/realtime/client_secrets";
   return createOpenAIRealtimeSecret({
     ...params,
     url,
-    body: params.session,
+    body: { session: params.session },
     errorMessage: "OpenAI Realtime transcription client secret failed",
     missingValueMessage:
       "OpenAI Realtime transcription client secret response did not include a value",

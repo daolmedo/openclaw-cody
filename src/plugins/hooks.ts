@@ -5,6 +5,7 @@
  * error handling and priority ordering.
  */
 
+import { clampPositiveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
 import { copyReplyPayloadMetadata, type ReplyPayload } from "../auto-reply/reply-payload.js";
 import { formatHookErrorForLog } from "../hooks/fire-and-forget.js";
 import { formatErrorMessage } from "../infra/errors.js";
@@ -89,6 +90,8 @@ import type {
   PluginHookBeforeInstallContext,
   PluginHookBeforeInstallEvent,
   PluginHookBeforeInstallResult,
+  PluginHookResolveExecEnvContext,
+  PluginHookResolveExecEnvEvent,
 } from "./hook-types.js";
 
 // Re-export types for consumers
@@ -160,6 +163,8 @@ export type {
   PluginHookBeforeInstallContext,
   PluginHookBeforeInstallEvent,
   PluginHookBeforeInstallResult,
+  PluginHookResolveExecEnvContext,
+  PluginHookResolveExecEnvEvent,
 };
 
 export type HookRunnerLogger = {
@@ -223,7 +228,12 @@ const DEFAULT_MODIFYING_HOOK_TIMEOUT_MS_BY_HOOK: Partial<Record<PluginHookName, 
   // The runner is fail-open for this hook name, so a timed-out handler is
   // logged and the run proceeds without its modifications.
   before_agent_start: 15_000,
+  // Terminal finalization hooks sit on the runner's completion path. A hung
+  // handler must not freeze final delivery or keep compaction retry recovery
+  // unresolved; timeout fail-opens with the original final answer.
+  before_agent_finalize: 15_000,
   before_prompt_build: 15_000,
+  resolve_exec_env: 15_000,
 };
 
 type ModifyingHookPolicy<K extends PluginHookName, TResult> = {
@@ -535,10 +545,7 @@ export function createHookRunner(
   };
 
   const normalizePositiveTimeoutMs = (timeoutMs: number | undefined): number | undefined => {
-    if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-      return undefined;
-    }
-    return Math.floor(timeoutMs);
+    return clampPositiveTimerTimeoutMs(timeoutMs);
   };
 
   const getVoidHookTimeoutMs = (
@@ -565,14 +572,14 @@ export function createHookRunner(
   const withHookTimeout = async <T>(
     promise: Promise<T>,
     timeoutMs: number,
-    options: { unref?: boolean } = {},
+    optionsResult: { unref?: boolean } = {},
   ): Promise<T> => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         reject(new Error(`timed out after ${timeoutMs}ms`));
       }, timeoutMs);
-      if (options.unref) {
+      if (optionsResult.unref) {
         timer.unref?.();
       }
     });
@@ -603,7 +610,7 @@ export function createHookRunner(
     hookName: K,
     event: Parameters<NonNullable<PluginHookRegistration<K>["handler"]>>[0],
     ctx: Parameters<NonNullable<PluginHookRegistration<K>["handler"]>>[1],
-    options: VoidHookRunOptions = {},
+    optionsValue: VoidHookRunOptions = {},
   ): Promise<void> {
     const hooks = getHooksForName(registry, hookName);
     if (hooks.length === 0) {
@@ -619,7 +626,7 @@ export function createHookRunner(
         );
         const timeoutMs = getVoidHookTimeoutMs(hookName, hook);
         if (timeoutMs) {
-          await withHookTimeout(promise, timeoutMs, { unref: options.unrefTimeout ?? true });
+          await withHookTimeout(promise, timeoutMs, { unref: optionsValue.unrefTimeout ?? true });
         } else {
           await promise;
         }
@@ -933,9 +940,9 @@ export function createHookRunner(
   async function runAgentEnd(
     event: PluginHookAgentEndEvent,
     ctx: PluginHookAgentContext,
-    options?: VoidHookRunOptions,
+    optionsLocal?: VoidHookRunOptions,
   ): Promise<void> {
-    return runVoidHook("agent_end", withAgentRunId(event, ctx), ctx, options);
+    return runVoidHook("agent_end", withAgentRunId(event, ctx), ctx, optionsLocal);
   }
 
   /**
@@ -1453,8 +1460,9 @@ export function createHookRunner(
   }
 
   /**
-   * Run subagent_spawning hook.
-   * Runs sequentially so channel plugins can deterministically provision session bindings.
+   * @deprecated Core prepares thread-bound subagent bindings through channel
+   * session-binding adapters before subagent_spawned fires. This remains only
+   * for older plugins that call the hook runner directly.
    */
   async function runSubagentSpawning(
     event: PluginHookSubagentSpawningEvent,
@@ -1587,6 +1595,21 @@ export function createHookRunner(
     );
   }
 
+  async function runResolveExecEnv(
+    event: PluginHookResolveExecEnvEvent,
+    ctx: PluginHookResolveExecEnvContext,
+  ): Promise<Record<string, string>> {
+    const result = await runModifyingHook<"resolve_exec_env", Record<string, string>>(
+      "resolve_exec_env",
+      event,
+      ctx,
+      {
+        mergeResults: (acc, next) => (acc ? { ...acc, ...next } : next),
+      },
+    );
+    return result ?? {};
+  }
+
   // =========================================================================
   // Utility
   // =========================================================================
@@ -1650,6 +1673,7 @@ export function createHookRunner(
     runCronChanged,
     // Install hooks
     runBeforeInstall,
+    runResolveExecEnv,
     // Utility
     hasHooks,
     getHookCount,

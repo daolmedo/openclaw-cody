@@ -1,3 +1,4 @@
+// Browser tests cover pw session.connections plugin behavior.
 import { chromium } from "playwright-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as chromeModule from "./chrome.js";
@@ -6,6 +7,7 @@ import {
   createPageViaPlaywright,
   getPageForTargetId,
   listPagesViaPlaywright,
+  setCdpConnectRetryDelayMsForTests,
 } from "./pw-session.js";
 
 const connectOverCdpSpy = vi.spyOn(chromium, "connectOverCDP");
@@ -17,7 +19,6 @@ type BrowserMockBundle = {
 };
 
 function makeBrowser(targetId: string, url: string): BrowserMockBundle {
-  let context: import("playwright-core").BrowserContext;
   const browserClose = vi.fn(async () => {});
   const page = {
     on: vi.fn(),
@@ -26,7 +27,7 @@ function makeBrowser(targetId: string, url: string): BrowserMockBundle {
     url: vi.fn(() => url),
   } as unknown as import("playwright-core").Page;
 
-  context = {
+  const context: import("playwright-core").BrowserContext = {
     pages: () => [page],
     on: vi.fn(),
     newCDPSession: vi.fn(async () => ({
@@ -66,7 +67,6 @@ function makeEmptyBrowser(): BrowserMockBundle {
 }
 
 function makeDisconnectedReadBrowser(): BrowserMockBundle {
-  let context: import("playwright-core").BrowserContext;
   const browserClose = vi.fn(async () => {});
   const page = {
     on: vi.fn(),
@@ -79,7 +79,7 @@ function makeDisconnectedReadBrowser(): BrowserMockBundle {
     }),
   } as unknown as import("playwright-core").Page;
 
-  context = {
+  const context: import("playwright-core").BrowserContext = {
     pages: () => [page],
     on: vi.fn(),
     newCDPSession: vi.fn(async () => {
@@ -124,10 +124,55 @@ function makeMutatingDisconnectBrowser(): BrowserMockBundle & {
 afterEach(async () => {
   connectOverCdpSpy.mockReset();
   getChromeWebSocketUrlSpy.mockReset();
+  setCdpConnectRetryDelayMsForTests();
   await closePlaywrightBrowserConnection().catch(() => {});
 });
 
 describe("pw-session connection scoping", () => {
+  it("keeps URL credentials out of Playwright and escaped connection errors", async () => {
+    const username = "browser-user";
+    const password = "browser-password";
+    const token = "browser-token";
+    const cdpUrl = `wss://${username}:${password}@browserless.example/devtools/browser/id?token=${token}`;
+    setCdpConnectRetryDelayMsForTests(0);
+    connectOverCdpSpy.mockRejectedValue(new Error(`connect failed for ${cdpUrl}`));
+    getChromeWebSocketUrlSpy.mockResolvedValue(null);
+
+    let message = "";
+    try {
+      await listPagesViaPlaywright({ cdpUrl });
+    } catch (err) {
+      message = String(err);
+    }
+
+    expect(connectOverCdpSpy).toHaveBeenCalledTimes(3);
+    expect(connectOverCdpSpy).toHaveBeenCalledWith(
+      "wss://browserless.example/devtools/browser/id?token=browser-token",
+      {
+        timeout: expect.any(Number),
+        headers: {
+          Authorization: `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`,
+        },
+      },
+    );
+    expect(message).toContain("browserless.example/devtools/browser/id");
+    expect(message).not.toContain(username);
+    expect(message).not.toContain(password);
+    expect(message).not.toContain(token);
+  });
+
+  it("keeps credentialed HTTP discovery out of Playwright's redirect path", async () => {
+    const cdpUrl = "https://browser-user:browser-password@browserless.example/cdp";
+    setCdpConnectRetryDelayMsForTests(0);
+    getChromeWebSocketUrlSpy.mockResolvedValue(null);
+
+    await expect(listPagesViaPlaywright({ cdpUrl })).rejects.toThrow(
+      "Authenticated CDP HTTP endpoint did not expose a usable WebSocket URL.",
+    );
+
+    expect(connectOverCdpSpy).not.toHaveBeenCalled();
+  });
+
   it("does not share in-flight connectOverCDP promises across different cdpUrls", async () => {
     const browserA = makeBrowser("A", "https://a.example");
     const browserB = makeBrowser("B", "https://b.example");

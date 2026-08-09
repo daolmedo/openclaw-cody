@@ -1,3 +1,6 @@
+/**
+ * Node connect reconciliation tests.
+ */
 import { describe, expect, it, vi } from "vitest";
 import {
   GATEWAY_CLIENT_IDS,
@@ -32,13 +35,38 @@ function makePairedNode(overrides?: Partial<NodePairingPairedNode>): NodePairing
   };
 }
 
+function makePendingPairingRequest(requestId: string) {
+  return vi.fn(async (input: NodePairingRequestInput) => ({
+    status: "pending" as const,
+    request: { ...input, requestId, ts: 1 },
+    created: true,
+  }));
+}
+
+function expectNodePairingRequest(
+  requestPairing: ReturnType<typeof makePendingPairingRequest>,
+  expected: Partial<NodePairingRequestInput>,
+) {
+  expect(requestPairing).toHaveBeenCalledWith({
+    nodeId: "openclaw-ios",
+    clientId: undefined,
+    clientMode: undefined,
+    displayName: undefined,
+    platform: "ios",
+    version: "test",
+    deviceFamily: undefined,
+    modelIdentifier: undefined,
+    caps: [],
+    commands: [],
+    permissions: undefined,
+    remoteIp: undefined,
+    ...expected,
+  });
+}
+
 describe("reconcileNodePairingOnConnect", () => {
   it("includes declared permissions in pending node pairing requests", async () => {
-    const requestPairing = vi.fn(async (input: NodePairingRequestInput) => ({
-      status: "pending" as const,
-      request: { ...input, requestId: "req-1", ts: 1 },
-      created: true,
-    }));
+    const requestPairing = makePendingPairingRequest("req-1");
 
     await reconcileNodePairingOnConnect({
       cfg: {} as never,
@@ -49,28 +77,13 @@ describe("reconcileNodePairingOnConnect", () => {
       requestPairing,
     });
 
-    expect(requestPairing).toHaveBeenCalledWith({
-      nodeId: "openclaw-ios",
-      clientId: undefined,
-      clientMode: undefined,
-      displayName: undefined,
-      platform: "ios",
-      version: "test",
-      deviceFamily: undefined,
-      modelIdentifier: undefined,
-      caps: [],
-      commands: [],
+    expectNodePairingRequest(requestPairing, {
       permissions: { camera: true, notifications: false },
-      remoteIp: undefined,
     });
   });
 
   it("keeps first-time pending node surfaces declared but not effective", async () => {
-    const requestPairing = vi.fn(async (input: NodePairingRequestInput) => ({
-      status: "pending" as const,
-      request: { ...input, requestId: "req-pending", ts: 1 },
-      created: true,
-    }));
+    const requestPairing = makePendingPairingRequest("req-pending");
 
     const result = await reconcileNodePairingOnConnect({
       cfg: {} as never,
@@ -109,11 +122,7 @@ describe("reconcileNodePairingOnConnect", () => {
     ["conflicts with device family", { deviceFamily: "iPhone" }],
     ["omits device family", {}],
   ])("filters host commands when canonical platform %s", async (_label, clientExtra) => {
-    const requestPairing = vi.fn(async (input: NodePairingRequestInput) => ({
-      status: "pending" as const,
-      request: { ...input, requestId: "req-mismatch", ts: 1 },
-      created: true,
-    }));
+    const requestPairing = makePendingPairingRequest("req-mismatch");
 
     const result = await reconcileNodePairingOnConnect({
       cfg: {} as never,
@@ -140,11 +149,7 @@ describe("reconcileNodePairingOnConnect", () => {
   });
 
   it("requires a fresh pairing request when paired node capabilities change", async () => {
-    const requestPairing = vi.fn(async (input: NodePairingRequestInput) => ({
-      status: "pending" as const,
-      request: { ...input, requestId: "req-caps", ts: 1 },
-      created: true,
-    }));
+    const requestPairing = makePendingPairingRequest("req-caps");
 
     const result = await reconcileNodePairingOnConnect({
       cfg: {} as never,
@@ -159,19 +164,9 @@ describe("reconcileNodePairingOnConnect", () => {
       requestPairing,
     });
 
-    expect(requestPairing).toHaveBeenCalledWith({
-      nodeId: "openclaw-ios",
-      clientId: undefined,
-      clientMode: undefined,
-      displayName: undefined,
-      platform: "ios",
-      version: "test",
-      deviceFamily: undefined,
-      modelIdentifier: undefined,
+    expectNodePairingRequest(requestPairing, {
       caps: ["camera", "screen"],
       commands: [],
-      permissions: undefined,
-      remoteIp: undefined,
     });
     expect(result.effectiveCaps).toEqual(["camera"]);
     expect(result.effectiveCommands).toEqual([]);
@@ -179,18 +174,83 @@ describe("reconcileNodePairingOnConnect", () => {
     expect(result.pendingPairing?.request.requestId).toBe("req-caps");
   });
 
-  it("requires a fresh pairing request when paired node permissions change", async () => {
-    const requestPairing = vi.fn(async (input: NodePairingRequestInput) => ({
-      status: "pending" as const,
-      request: { ...input, requestId: "req-permissions", ts: 1 },
-      created: true,
-    }));
+  it("keeps the approved surface when paired-node reapproval is throttled", async () => {
+    const requestPairing = vi.fn(async () => null);
+
+    const result = await reconcileNodePairingOnConnect({
+      cfg: {} as never,
+      connectParams: makeNodeConnectParams({
+        caps: ["camera", "screen"],
+        commands: [],
+      }),
+      pairedNode: makePairedNode({
+        caps: ["camera"],
+        commands: [],
+      }),
+      requestPairing,
+    });
+
+    expect(requestPairing).toHaveBeenCalledOnce();
+    expect(result.effectiveCaps).toEqual(["camera"]);
+    expect(result.effectiveCommands).toEqual([]);
+    expect(result.declaredCaps).toEqual(["camera", "screen"]);
+    expect(result.pendingPairing).toBeUndefined();
+    expect(result.shouldClearPendingPairings).toBeUndefined();
+  });
+
+  it("defers stale pending reapproval cleanup when the node returns to its approved surface", async () => {
+    const requestPairing = makePendingPairingRequest("req-unused");
+
+    const result = await reconcileNodePairingOnConnect({
+      cfg: {} as never,
+      connectParams: makeNodeConnectParams({
+        caps: ["camera"],
+        commands: ["canvas.snapshot"],
+      }),
+      pairedNode: makePairedNode({
+        caps: ["camera"],
+        commands: ["canvas.snapshot"],
+      }),
+      requestPairing,
+    });
+
+    expect(requestPairing).not.toHaveBeenCalled();
+    expect(result.shouldClearPendingPairings).toBe(true);
+  });
+
+  it("requires a fresh pairing request when paired node permissions widen", async () => {
+    const requestPairing = makePendingPairingRequest("req-permissions");
 
     const result = await reconcileNodePairingOnConnect({
       cfg: {} as never,
       connectParams: makeNodeConnectParams({
         commands: [],
+        permissions: { camera: true, notifications: true },
+      }),
+      pairedNode: makePairedNode({
+        commands: [],
         permissions: { camera: true, notifications: false },
+      }),
+      requestPairing,
+    });
+
+    expectNodePairingRequest(requestPairing, {
+      commands: [],
+      permissions: { camera: true, notifications: true },
+    });
+    expect(result.effectiveCommands).toEqual([]);
+    expect(result.effectivePermissions).toEqual({ camera: true, notifications: false });
+    expect(result.pendingPairing?.request.requestId).toBe("req-permissions");
+  });
+
+  it("accepts false-only permission metadata without reapproval", async () => {
+    const requestPairing = vi.fn();
+
+    const result = await reconcileNodePairingOnConnect({
+      cfg: {} as never,
+      connectParams: makeNodeConnectParams({
+        commands: [],
+        permissions: { camera: true, notifications: false, watchReachable: false },
       }),
       pairedNode: makePairedNode({
         commands: [],
@@ -199,31 +259,17 @@ describe("reconcileNodePairingOnConnect", () => {
       requestPairing,
     });
 
-    expect(requestPairing).toHaveBeenCalledWith({
-      nodeId: "openclaw-ios",
-      clientId: undefined,
-      clientMode: undefined,
-      displayName: undefined,
-      platform: "ios",
-      version: "test",
-      deviceFamily: undefined,
-      modelIdentifier: undefined,
-      caps: [],
-      commands: [],
-      permissions: { camera: true, notifications: false },
-      remoteIp: undefined,
+    expect(requestPairing).not.toHaveBeenCalled();
+    expect(result.effectivePermissions).toEqual({
+      camera: true,
+      notifications: false,
+      watchReachable: false,
     });
-    expect(result.effectiveCommands).toEqual([]);
-    expect(result.effectivePermissions).toEqual({ camera: true, notifications: false });
-    expect(result.pendingPairing?.request.requestId).toBe("req-permissions");
+    expect(result.shouldClearPendingPairings).toBe(true);
   });
 
-  it("applies declared capability and permission downgrades to the live surface", async () => {
-    const requestPairing = vi.fn(async (input: NodePairingRequestInput) => ({
-      status: "pending" as const,
-      request: { ...input, requestId: "req-downgrade", ts: 1 },
-      created: true,
-    }));
+  it("applies declared capability and permission downgrades without reapproval", async () => {
+    const requestPairing = vi.fn();
 
     const result = await reconcileNodePairingOnConnect({
       cfg: {} as never,
@@ -240,23 +286,11 @@ describe("reconcileNodePairingOnConnect", () => {
       requestPairing,
     });
 
-    expect(requestPairing).toHaveBeenCalledWith({
-      nodeId: "openclaw-ios",
-      clientId: undefined,
-      clientMode: undefined,
-      displayName: undefined,
-      platform: "ios",
-      version: "test",
-      deviceFamily: undefined,
-      modelIdentifier: undefined,
-      caps: ["camera"],
-      commands: [],
-      permissions: { camera: false },
-      remoteIp: undefined,
-    });
+    expect(requestPairing).not.toHaveBeenCalled();
     expect(result.effectiveCaps).toEqual(["camera"]);
     expect(result.effectiveCommands).toEqual([]);
     expect(result.effectivePermissions).toEqual({ camera: false });
-    expect(result.pendingPairing?.request.requestId).toBe("req-downgrade");
+    expect(result.pendingPairing).toBeUndefined();
+    expect(result.shouldClearPendingPairings).toBe(true);
   });
 });

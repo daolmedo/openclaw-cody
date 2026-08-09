@@ -1,16 +1,24 @@
+// Tests active reply run registry add, lookup, and cleanup behavior.
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { setDiagnosticsEnabledForProcess } from "../../infra/diagnostic-events.js";
 import {
   getDiagnosticSessionActivitySnapshot,
+  markDiagnosticRunProgressForTest,
   resetDiagnosticRunActivityForTest,
 } from "../../logging/diagnostic-run-activity.js";
+import { MAX_TIMER_TIMEOUT_MS } from "../../shared/number-coercion.js";
 import {
   testing,
   abortActiveReplyRuns,
   createReplyOperation,
   forceClearReplyRunBySessionId,
+  isReplyRunEvidenceStaleBySessionId,
   isReplyRunActiveForSessionId,
+  isReplyRunAbortableForCompaction,
   queueReplyRunMessage,
+  REPLY_RUN_IDLE_SETTLE_TIMEOUT_MS,
   replyRunRegistry,
+  runAfterReplyOperationClear,
   resolveActiveReplyRunSessionId,
   waitForReplyRunEndBySessionId,
 } from "./reply-run-registry.js";
@@ -54,6 +62,21 @@ describe("reply run registry", () => {
       await vi.runOnlyPendingTimersAsync();
       vi.useRealTimers();
     }
+  });
+
+  it("treats queued reply operations as non-abortable for compaction", () => {
+    const operation = createReplyOperation({
+      sessionKey: "agent:main:main",
+      sessionId: "session-compact",
+      resetTriggered: false,
+    });
+
+    expect(isReplyRunActiveForSessionId("session-compact")).toBe(true);
+    expect(isReplyRunAbortableForCompaction("session-compact")).toBe(false);
+
+    operation.setPhase("running");
+
+    expect(isReplyRunAbortableForCompaction("session-compact")).toBe(true);
   });
 
   it("mirrors active reply operations into diagnostic work state", () => {
@@ -121,6 +144,287 @@ describe("reply run registry", () => {
     expect(afterClear).toHaveBeenCalledTimes(1);
   });
 
+  it("clears active state before a deferred after-clear barrier settles", async () => {
+    const operation = createReplyOperation({
+      sessionKey: "agent:main:main",
+      sessionId: "session-deferred",
+      resetTriggered: false,
+    });
+    let releaseBarrier: () => void = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+    });
+    const afterClear = vi.fn();
+    runAfterReplyOperationClear(operation, afterClear);
+
+    operation.completeWithAfterClearBarrier(barrier);
+
+    expect(operation.result).toEqual({ kind: "completed" });
+    expect(replyRunRegistry.isActive("agent:main:main")).toBe(false);
+    expect(afterClear).not.toHaveBeenCalled();
+
+    releaseBarrier();
+    await barrier;
+    await vi.waitFor(() => {
+      expect(afterClear).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("keeps later after-clear work behind earlier delivery barriers", async () => {
+    const first = createReplyOperation({
+      sessionKey: "agent:main:main",
+      sessionId: "first-session",
+      resetTriggered: false,
+    });
+    let releaseFirst: () => void = () => {};
+    const firstBarrier = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const firstAfterClear = vi.fn();
+    runAfterReplyOperationClear(first, firstAfterClear);
+    first.completeWithAfterClearBarrier(firstBarrier);
+
+    const second = createReplyOperation({
+      sessionKey: "agent:main:main",
+      sessionId: "second-session",
+      resetTriggered: false,
+    });
+    let releaseSecond: () => void = () => {};
+    const secondBarrier = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+    const secondAfterClear = vi.fn();
+    runAfterReplyOperationClear(second, secondAfterClear);
+    second.completeWithAfterClearBarrier(secondBarrier);
+
+    releaseSecond();
+    await secondBarrier;
+    expect(secondAfterClear).not.toHaveBeenCalled();
+
+    releaseFirst();
+    await firstBarrier;
+    await vi.waitFor(() => {
+      expect(firstAfterClear).toHaveBeenCalledWith("first-session");
+      expect(secondAfterClear).toHaveBeenCalledWith("second-session");
+    });
+  });
+
+  it("keeps follow-up admission blocked until slow delivery settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const operation = createReplyOperation({
+        sessionKey: "agent:main:main",
+        sessionId: "hung-session",
+        resetTriggered: false,
+      });
+      let releaseBarrier: () => void = () => {};
+      const barrier = new Promise<void>((resolve) => {
+        releaseBarrier = resolve;
+      });
+      const afterClear = vi.fn();
+      runAfterReplyOperationClear(operation, afterClear);
+      operation.completeWithAfterClearBarrier(barrier, 35 * 60_000);
+
+      await vi.advanceTimersByTimeAsync(REPLY_RUN_IDLE_SETTLE_TIMEOUT_MS);
+      expect(afterClear).not.toHaveBeenCalled();
+      expect(() =>
+        createReplyOperation({
+          sessionKey: "agent:main:main",
+          sessionId: "blocked-session",
+          resetTriggered: false,
+          respectFollowupAdmissionBarrier: true,
+        }),
+      ).toThrow("Reply follow-up admission is blocked");
+
+      releaseBarrier();
+      await barrier;
+      await vi.waitFor(() => {
+        expect(afterClear).toHaveBeenCalledWith("hung-session");
+      });
+      const next = createReplyOperation({
+        sessionKey: "agent:main:main",
+        sessionId: "next-session",
+        resetTriggered: false,
+        respectFollowupAdmissionBarrier: true,
+      });
+      next.complete();
+    } finally {
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
+    }
+  });
+
+  it("extends a hung delivery barrier only while bounded owner work remains active", async () => {
+    vi.useFakeTimers();
+    try {
+      const operation = createReplyOperation({
+        sessionKey: "agent:main:main",
+        sessionId: "active-owner-session",
+        resetTriggered: false,
+      });
+      let ownerActive = true;
+      const afterClear = vi.fn();
+      runAfterReplyOperationClear(operation, afterClear);
+      operation.completeWithAfterClearBarrier(new Promise<void>(() => {}), {
+        maxTimeoutMs: REPLY_RUN_IDLE_SETTLE_TIMEOUT_MS * 3,
+        shouldExtend: () => ownerActive,
+      });
+
+      await vi.advanceTimersByTimeAsync(REPLY_RUN_IDLE_SETTLE_TIMEOUT_MS);
+      expect(afterClear).not.toHaveBeenCalled();
+
+      ownerActive = false;
+      await vi.advanceTimersByTimeAsync(REPLY_RUN_IDLE_SETTLE_TIMEOUT_MS);
+      await vi.waitFor(() => {
+        expect(afterClear).toHaveBeenCalledWith("active-owner-session");
+      });
+    } finally {
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps follow-up admission blocked during an unsettled inter-block delay", async () => {
+    vi.useFakeTimers();
+    try {
+      const operation = createReplyOperation({
+        sessionKey: "agent:main:mattermost:direct:user-1",
+        sessionId: "mattermost-delivery-session",
+        resetTriggered: false,
+      });
+      let settledDeliveryCount = 1;
+      const queuedDeliveryCount = 2;
+      const afterClear = vi.fn();
+      runAfterReplyOperationClear(operation, afterClear);
+      operation.completeWithAfterClearBarrier(new Promise<void>(() => {}), {
+        maxTimeoutMs: REPLY_RUN_IDLE_SETTLE_TIMEOUT_MS * 3,
+        shouldExtend: () => settledDeliveryCount < queuedDeliveryCount,
+      });
+
+      await vi.advanceTimersByTimeAsync(REPLY_RUN_IDLE_SETTLE_TIMEOUT_MS);
+      expect(afterClear).not.toHaveBeenCalled();
+      expect(() =>
+        createReplyOperation({
+          sessionKey: "agent:main:mattermost:direct:user-1",
+          sessionId: "queued-followup",
+          resetTriggered: false,
+          respectFollowupAdmissionBarrier: true,
+        }),
+      ).toThrow();
+
+      settledDeliveryCount = 2;
+      await vi.advanceTimersByTimeAsync(REPLY_RUN_IDLE_SETTLE_TIMEOUT_MS);
+      await vi.waitFor(() => {
+        expect(afterClear).toHaveBeenCalledWith("mattermost-delivery-session");
+      });
+
+      const followup = createReplyOperation({
+        sessionKey: "agent:main:mattermost:direct:user-1",
+        sessionId: "admitted-followup",
+        resetTriggered: false,
+        respectFollowupAdmissionBarrier: true,
+      });
+      followup.complete();
+    } finally {
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
+    }
+  });
+
+  it("eventually releases a permanently hung delivery barrier at the default timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const operation = createReplyOperation({
+        sessionKey: "agent:main:main",
+        sessionId: "hung-session",
+        resetTriggered: false,
+      });
+      const afterClear = vi.fn();
+      runAfterReplyOperationClear(operation, afterClear);
+      operation.completeWithAfterClearBarrier(new Promise<void>(() => {}));
+
+      await vi.advanceTimersByTimeAsync(REPLY_RUN_IDLE_SETTLE_TIMEOUT_MS - 1);
+      expect(afterClear).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.waitFor(() => {
+        expect(afterClear).toHaveBeenCalledWith("hung-session");
+      });
+      const next = createReplyOperation({
+        sessionKey: "agent:main:main",
+        sessionId: "next-session",
+        resetTriggered: false,
+        respectFollowupAdmissionBarrier: true,
+      });
+      next.complete();
+    } finally {
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
+    }
+  });
+
+  it("retains failed operations until final delivery completes", () => {
+    const operation = createReplyOperation({
+      sessionKey: "agent:main:main",
+      sessionId: "session-failed",
+      resetTriggered: false,
+    });
+    const afterClear = vi.fn();
+    operation.retainFailureUntilComplete();
+    runAfterReplyOperationClear(operation, afterClear);
+
+    operation.fail("run_failed", new Error("provider failed"));
+
+    expect(operation.result).toMatchObject({ kind: "failed", code: "run_failed" });
+    expect(replyRunRegistry.get("agent:main:main")).toBe(operation);
+    expect(afterClear).not.toHaveBeenCalled();
+
+    operation.complete();
+
+    expect(replyRunRegistry.isActive("agent:main:main")).toBe(false);
+    expect(afterClear).toHaveBeenCalledTimes(1);
+  });
+
+  it("force-clears retained failed operations", () => {
+    const operation = createReplyOperation({
+      sessionKey: "agent:main:main",
+      sessionId: "session-retained",
+      resetTriggered: false,
+    });
+    operation.retainFailureUntilComplete();
+
+    expect(forceClearReplyRunBySessionId("session-retained", new Error("stuck"))).toBe(true);
+    expect(operation.result).toMatchObject({ kind: "failed", code: "run_failed" });
+    expect(replyRunRegistry.isActive("agent:main:main")).toBe(false);
+  });
+
+  it("rejects aborts while the attached backend is finalizing", () => {
+    let abortable = false;
+    const cancel = vi.fn();
+    const operation = createReplyOperation({
+      sessionKey: "agent:main:finalizing",
+      sessionId: "session-finalizing",
+      resetTriggered: false,
+    });
+    operation.attachBackend({
+      kind: "embedded",
+      cancel,
+      isStreaming: () => false,
+      isAbortable: () => abortable,
+    });
+    operation.setPhase("running");
+
+    expect(replyRunRegistry.abort("agent:main:finalizing")).toBe(false);
+    expect(abortActiveReplyRuns({ mode: "all" })).toBe(false);
+    expect(operation.result).toBeNull();
+    expect(cancel).not.toHaveBeenCalled();
+
+    abortable = true;
+    expect(replyRunRegistry.abort("agent:main:finalizing")).toBe(true);
+    expect(operation.result).toEqual({ kind: "aborted", code: "aborted_by_user" });
+    expect(cancel).toHaveBeenCalledWith("user_abort");
+  });
+
   it("force-clears a running operation after abort without backend cleanup", async () => {
     vi.useFakeTimers();
     try {
@@ -154,6 +458,30 @@ describe("reply run registry", () => {
     }
   });
 
+  it("clamps oversized wait timers instead of resolving idle waits immediately", async () => {
+    vi.useFakeTimers();
+    try {
+      const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+      const operation = createReplyOperation({
+        sessionKey: "agent:main:main",
+        sessionId: "session-running",
+        resetTriggered: false,
+      });
+
+      const waitPromise = waitForReplyRunEndBySessionId(
+        "session-running",
+        MAX_TIMER_TIMEOUT_MS + 1,
+      );
+
+      expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), MAX_TIMER_TIMEOUT_MS);
+      operation.complete();
+      await expect(waitPromise).resolves.toBe(true);
+    } finally {
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
+    }
+  });
+
   it("queues messages only through the active running backend", () => {
     const queueMessage = vi.fn(async () => {});
     const operation = createReplyOperation({
@@ -175,6 +503,57 @@ describe("reply run registry", () => {
 
     expect(queueReplyRunMessage("session-running", "hello")).toBe(true);
     expect(queueMessage).toHaveBeenCalledWith("hello");
+  });
+
+  it("uses reply-operation activity as stale evidence", () => {
+    vi.useFakeTimers();
+    try {
+      setDiagnosticsEnabledForProcess(true);
+      const operation = createReplyOperation({
+        sessionKey: "agent:main:cli-activity",
+        sessionId: "session-cli-activity",
+        resetTriggered: false,
+      });
+      operation.setPhase("running");
+
+      vi.advanceTimersByTime(9 * 60_000);
+      operation.recordActivity();
+      vi.advanceTimersByTime(2 * 60_000);
+      expect(isReplyRunEvidenceStaleBySessionId("session-cli-activity")).toBe(false);
+
+      vi.advanceTimersByTime(8 * 60_000 + 1);
+      expect(isReplyRunEvidenceStaleBySessionId("session-cli-activity")).toBe(true);
+    } finally {
+      setDiagnosticsEnabledForProcess(false);
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses fresh diagnostic progress as reply-run liveness evidence", () => {
+    vi.useFakeTimers();
+    try {
+      setDiagnosticsEnabledForProcess(true);
+      const operation = createReplyOperation({
+        sessionKey: "agent:main:cli-diagnostics",
+        sessionId: "session-cli-diagnostics",
+        resetTriggered: false,
+      });
+      operation.setPhase("running");
+
+      vi.advanceTimersByTime(9 * 60_000);
+      markDiagnosticRunProgressForTest({
+        sessionId: "session-cli-diagnostics",
+        reason: "cli_live:stream_progress",
+      });
+      vi.advanceTimersByTime(2 * 60_000);
+      expect(isReplyRunEvidenceStaleBySessionId("session-cli-diagnostics")).toBe(false);
+
+      vi.advanceTimersByTime(8 * 60_000 + 1);
+      expect(isReplyRunEvidenceStaleBySessionId("session-cli-diagnostics")).toBe(true);
+    } finally {
+      setDiagnosticsEnabledForProcess(false);
+      vi.useRealTimers();
+    }
   });
 
   it("aborts compacting runs through the registry compatibility helper", () => {

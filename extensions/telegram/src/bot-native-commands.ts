@@ -1,5 +1,5 @@
+// Telegram plugin module implements bot native commands behavior.
 import { randomUUID } from "node:crypto";
-import path from "node:path";
 import type { Bot, Context } from "grammy";
 import {
   loadModelCatalog,
@@ -7,16 +7,19 @@ import {
   resolveDefaultModelForAgent,
   resolveThinkingDefaultWithRuntimeCatalog,
 } from "openclaw/plugin-sdk/agent-runtime";
+import { recordChannelBotPairLoopAndCheckSuppression } from "openclaw/plugin-sdk/channel-inbound";
 import { resolveChannelStreamingBlockEnabled } from "openclaw/plugin-sdk/channel-outbound";
 import { resolveNativeCommandSessionTargets } from "openclaw/plugin-sdk/command-auth-native";
 import {
   buildCommandTextFromArgs,
   findCommandByNativeName,
+  formatFastModeCurrentStatus,
   formatCommandArgMenuTitle,
   listNativeCommandSpecs,
   listNativeCommandSpecsForConfig,
   parseCommandArgs,
   resolveCommandArgMenu,
+  resolveFastModeState,
   resolveStoredModelOverride,
   type CommandArgs,
 } from "openclaw/plugin-sdk/command-auth-native";
@@ -31,18 +34,20 @@ import type {
 } from "openclaw/plugin-sdk/config-contracts";
 import { resolveMarkdownTableMode } from "openclaw/plugin-sdk/markdown-table-runtime";
 import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-payload";
+import { isSingleUseReplyToMode } from "openclaw/plugin-sdk/reply-reference";
 import { resolveAgentRoute } from "openclaw/plugin-sdk/routing";
 import { getRuntimeConfigSnapshot } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { danger, logVerbose } from "openclaw/plugin-sdk/runtime-env";
 import { getChildLogger } from "openclaw/plugin-sdk/runtime-env";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import {
+  getSessionEntry,
   loadSessionStore,
-  resolveAndPersistSessionFile,
   resolveSessionStoreEntry,
-  resolveSessionTranscriptPathInDir,
   resolveStorePath,
+  type SessionEntry,
 } from "openclaw/plugin-sdk/session-store-runtime";
+import { resolveSessionTranscriptLegacyFileTarget } from "openclaw/plugin-sdk/session-transcript-runtime";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
@@ -64,6 +69,7 @@ import {
   syncTelegramMenuCommands as syncTelegramMenuCommandsRuntime,
   type TelegramMenuCommand,
 } from "./bot-native-command-menu.js";
+import type { TelegramMessageProcessingResult } from "./bot-processing-outcome.js";
 import type { TelegramUpdateKeyContext } from "./bot-updates.js";
 import type { TelegramBotOptions } from "./bot.types.js";
 import {
@@ -91,6 +97,7 @@ import {
   resolveTelegramConversationBaseSessionKey,
   resolveTelegramConversationRoute,
 } from "./conversation-route.js";
+import { isTelegramDeliveryErrorVisible } from "./delivery-error.js";
 import { shouldSuppressLocalTelegramExecApprovalPrompt } from "./exec-approvals.js";
 import type { TelegramTransport } from "./fetch.js";
 import {
@@ -100,11 +107,21 @@ import {
 import { resolveTelegramGroupPromptSettings } from "./group-config-helpers.js";
 import { resolveTelegramCommandIngressAuthorization } from "./ingress.js";
 import { buildInlineKeyboard } from "./inline-keyboard.js";
+import { buildTelegramNativeCommandCallbackData } from "./native-command-callback-data.js";
+import {
+  buildTelegramPeerBotAdmissionKey,
+  createTelegramPeerBotAdmissionCoordinator,
+  type TelegramPeerBotAdmissionCoordinator,
+} from "./peer-bot-admission.js";
+import { runWithTelegramPeerBotTurn } from "./peer-bot-turn.js";
 import { recordSentMessage } from "./sent-message-cache.js";
 import { getTopicName, resolveTopicNameCacheScope } from "./topic-name-cache.js";
+export {
+  buildTelegramNativeCommandCallbackData,
+  parseTelegramNativeCommandCallbackData,
+} from "./native-command-callback-data.js";
 
 const EMPTY_RESPONSE_FALLBACK = "No response generated. Please try again.";
-const TELEGRAM_NATIVE_COMMAND_CALLBACK_PREFIX = "tgcmd:";
 
 type TelegramNativeCommandContext = Context & { match?: string };
 type TelegramChunkMode = ReturnType<
@@ -115,6 +132,38 @@ type TelegramNativeReplyChannelData = {
   buttons?: TelegramInlineButtons;
   pin?: boolean;
 };
+type FastModeState = ReturnType<typeof resolveFastModeState>;
+
+function isTelegramPeerBotMessage(msg: TelegramNativeCommandContext["message"]): boolean {
+  return msg?.from?.is_bot === true && msg.sender_chat == null;
+}
+
+function shouldSuppressTelegramBotCommandLoop(params: {
+  msg: TelegramNativeCommandContext["message"];
+  botId?: number;
+  accountId: string;
+  cfg: OpenClawConfig;
+}): boolean {
+  const msg = params.msg;
+  const sender = msg?.from;
+  if (
+    !msg ||
+    !isTelegramPeerBotMessage(msg) ||
+    !sender ||
+    params.botId == null ||
+    sender.id === params.botId
+  ) {
+    return false;
+  }
+  return recordChannelBotPairLoopAndCheckSuppression({
+    scopeId: params.accountId,
+    conversationId: `${msg.chat.id}:${msg.message_thread_id ?? ""}`,
+    senderId: String(sender.id),
+    receiverId: String(params.botId),
+    defaultsConfig: params.cfg.channels?.defaults?.botLoopProtection,
+    defaultEnabled: true,
+  }).suppressed;
+}
 type TelegramResolvedGroupConfig = {
   groupConfig?: TelegramGroupConfig | TelegramDirectConfig;
   topicConfig?: TelegramTopicConfig;
@@ -125,6 +174,7 @@ type TelegramCommandAuthResult = {
   isGroup: boolean;
   isForum: boolean;
   resolvedThreadId?: number;
+  admissionThreadId?: number;
   senderId: string;
   senderUsername: string;
   groupConfig?: TelegramGroupConfig | TelegramDirectConfig;
@@ -141,6 +191,25 @@ type TelegramNativeCommandThreadContext = {
   threadSpec: ReturnType<typeof resolveTelegramThreadSpec>;
   threadParams: ReturnType<typeof buildTelegramThreadParams>;
 };
+
+function buildTelegramCommandMenuModelContext(params: {
+  provider: string;
+  model: string;
+  thinkingLevel?: string;
+  fastMode?: SessionEntry["fastMode"];
+}): {
+  provider: string;
+  model: string;
+  thinkingLevel?: string;
+  fastMode?: SessionEntry["fastMode"];
+} {
+  return {
+    provider: params.provider,
+    model: params.model,
+    ...(params.thinkingLevel ? { thinkingLevel: params.thinkingLevel } : {}),
+    ...(params.fastMode !== undefined ? { fastMode: params.fastMode } : {}),
+  };
+}
 
 let telegramNativeCommandDeliveryRuntimePromise:
   | Promise<typeof import("./bot-native-commands.delivery.runtime.js")>
@@ -172,7 +241,7 @@ function resolveTelegramProgressPlaceholder(command: {
   return text ? text : null;
 }
 
-async function resolveTelegramCommandSessionFile(params: {
+async function resolveTelegramCommandTranscriptContext(params: {
   cfg: OpenClawConfig;
   agentId: string;
   sessionKey: string;
@@ -184,29 +253,23 @@ async function resolveTelegramCommandSessionFile(params: {
   }
   try {
     const storePath = resolveStorePath(params.cfg.session?.store, { agentId: params.agentId });
-    const store = loadSessionStore(storePath);
-    const resolved = resolveSessionStoreEntry({ store, sessionKey });
-    const sessionId = resolved.existing?.sessionId?.trim() || randomUUID();
-    const authProfileId = normalizeOptionalString(resolved.existing?.authProfileOverride);
-    const sessionsDir = path.dirname(storePath);
-    const fallbackSessionFile = resolveSessionTranscriptPathInDir(
-      sessionId,
-      sessionsDir,
-      params.threadId,
-    );
-    const persisted = await resolveAndPersistSessionFile({
-      sessionId,
-      sessionKey: resolved.normalizedKey,
-      sessionStore: store,
-      storePath,
-      sessionEntry: resolved.existing,
+    const entry = getSessionEntry({
       agentId: params.agentId,
-      sessionsDir,
-      fallbackSessionFile,
+      sessionKey,
+      storePath,
+    });
+    const sessionId = entry?.sessionId?.trim() || randomUUID();
+    const authProfileId = normalizeOptionalString(entry?.authProfileOverride);
+    const target = await resolveSessionTranscriptLegacyFileTarget({
+      agentId: params.agentId,
+      sessionId,
+      sessionKey,
+      storePath,
+      ...(params.threadId !== undefined ? { threadId: params.threadId } : {}),
     });
     return {
       sessionId,
-      sessionFile: persisted.sessionFile,
+      sessionFile: target.sessionFile,
       ...(authProfileId ? { authProfileId } : {}),
     };
   } catch {
@@ -218,7 +281,12 @@ function resolveTelegramCommandMenuModelContext(params: {
   cfg: OpenClawConfig;
   agentId: string;
   sessionKey: string;
-}): { provider?: string; model?: string; thinkingLevel?: string } {
+}): {
+  provider?: string;
+  model?: string;
+  thinkingLevel?: string;
+  fastMode?: SessionEntry["fastMode"];
+} {
   if (!params.sessionKey.trim()) {
     return {};
   }
@@ -231,12 +299,14 @@ function resolveTelegramCommandMenuModelContext(params: {
     const store = loadSessionStore(storePath);
     const entry = resolveSessionStoreEntry({ store, sessionKey: params.sessionKey }).existing;
     const thinkingLevel = normalizeOptionalString(entry?.thinkingLevel);
+    const fastMode = entry?.fastMode;
     if (entry?.modelOverrideSource === "auto" && normalizeOptionalString(entry.modelOverride)) {
-      return {
+      return buildTelegramCommandMenuModelContext({
         provider: defaultModel.provider,
         model: defaultModel.model,
         ...(thinkingLevel ? { thinkingLevel } : {}),
-      };
+        ...(fastMode !== undefined ? { fastMode } : {}),
+      });
     }
     const override = resolveStoredModelOverride({
       sessionEntry: entry,
@@ -245,11 +315,12 @@ function resolveTelegramCommandMenuModelContext(params: {
       defaultProvider: defaultModel.provider,
     });
     if (override?.model) {
-      return {
+      return buildTelegramCommandMenuModelContext({
         provider: override.provider || defaultModel.provider,
         model: override.model,
         ...(thinkingLevel ? { thinkingLevel } : {}),
-      };
+        ...(fastMode !== undefined ? { fastMode } : {}),
+      });
     }
     const provider =
       normalizeOptionalString(entry?.providerOverride) ??
@@ -260,9 +331,92 @@ function resolveTelegramCommandMenuModelContext(params: {
       ...(provider ? { provider } : {}),
       ...(model ? { model } : {}),
       ...(thinkingLevel ? { thinkingLevel } : {}),
+      ...(fastMode !== undefined ? { fastMode } : {}),
     };
   } catch {
     return {};
+  }
+}
+
+function resolveTelegramFastCommandModelContext(params: {
+  cfg: OpenClawConfig;
+  agentId: string;
+  sessionKey: string;
+}): {
+  provider?: string;
+  model?: string;
+} {
+  const defaultModel = resolveDefaultModelForAgent({
+    cfg: params.cfg,
+    agentId: params.agentId,
+  });
+  const fallback = () => ({
+    provider: defaultModel.provider,
+    model: defaultModel.model,
+  });
+  if (!params.sessionKey.trim()) {
+    return fallback();
+  }
+  try {
+    const storePath = resolveStorePath(params.cfg.session?.store, { agentId: params.agentId });
+    const store = loadSessionStore(storePath);
+    const entry = resolveSessionStoreEntry({ store, sessionKey: params.sessionKey }).existing;
+    if (entry?.modelOverrideSource === "auto" && normalizeOptionalString(entry.modelOverride)) {
+      return fallback();
+    }
+    const override = resolveStoredModelOverride({
+      sessionEntry: entry,
+      sessionStore: store,
+      sessionKey: params.sessionKey,
+      defaultProvider: defaultModel.provider,
+    });
+    return {
+      provider: override?.provider ?? defaultModel.provider,
+      model: override?.model ?? defaultModel.model,
+    };
+  } catch {
+    return fallback();
+  }
+}
+
+function resolveTelegramFastCommandState(params: {
+  cfg: OpenClawConfig;
+  agentId: string;
+  sessionKey: string;
+}): FastModeState {
+  const defaultModel = resolveDefaultModelForAgent({
+    cfg: params.cfg,
+    agentId: params.agentId,
+  });
+  const fallback = () =>
+    resolveFastModeState({
+      cfg: params.cfg,
+      provider: defaultModel.provider,
+      model: defaultModel.model,
+      agentId: params.agentId,
+    });
+  if (!params.sessionKey.trim()) {
+    return fallback();
+  }
+  try {
+    const storePath = resolveStorePath(params.cfg.session?.store, { agentId: params.agentId });
+    const store = loadSessionStore(storePath);
+    const entry = resolveSessionStoreEntry({ store, sessionKey: params.sessionKey }).existing;
+    const modelContext = resolveTelegramFastCommandModelContext(params);
+    return resolveFastModeState({
+      cfg: params.cfg,
+      provider: modelContext.provider ?? defaultModel.provider,
+      model: modelContext.model ?? defaultModel.model,
+      agentId: params.agentId,
+      sessionEntry:
+        entry?.fastMode !== undefined
+          ? {
+              fastMode: entry.fastMode,
+            }
+          : undefined,
+    });
+  } catch {
+    return fallback();
   }
 }
 
@@ -311,12 +465,30 @@ function formatTelegramCommandArgMenuTitle(params: {
   command: NonNullable<ReturnType<typeof findCommandByNativeName>>;
   menu: NonNullable<ReturnType<typeof resolveCommandArgMenu>>;
   currentThinkingLevel?: string;
+  currentFastModeStatus?: string;
 }): string {
   const title = formatCommandArgMenuTitle({ command: params.command, menu: params.menu });
-  if (params.command.key !== "think" || !params.currentThinkingLevel) {
-    return title;
+  if (params.command.key === "think" && params.currentThinkingLevel) {
+    return `Current thinking level: ${params.currentThinkingLevel}.\n${title}`;
   }
-  return `Current thinking level: ${params.currentThinkingLevel}.\n${title}`;
+  if (params.command.key === "fast" && params.currentFastModeStatus) {
+    const options = params.menu.choices
+      .map((choice) => choice.label.trim())
+      .filter(Boolean)
+      .join(", ");
+    return options
+      ? `${params.currentFastModeStatus}\nOptions: ${options}.`
+      : params.currentFastModeStatus;
+  }
+  return title;
+}
+
+function resolveTelegramFastMenuCurrentStatus(params: { state: FastModeState }): string {
+  return formatFastModeCurrentStatus({
+    mode: params.state.mode,
+    source: params.state.source,
+    fastAutoOnSeconds: params.state.fastAutoOnSeconds,
+  });
 }
 
 function resolveTelegramNativeReplyChannelData(
@@ -439,25 +611,10 @@ export type RegisterTelegramHandlerParams = {
     replyChain?: import("./message-cache.js").TelegramReplyChainEntry[],
     promptContext?: import("./bot-message-context.types.js").TelegramPromptContextEntry[],
     lifecycle?: import("./bot-message.js").TelegramMessageProcessorLifecycle,
-  ) => Promise<boolean>;
+  ) => Promise<TelegramMessageProcessingResult>;
   logger: ReturnType<typeof getChildLogger>;
+  peerBotAdmission?: TelegramPeerBotAdmissionCoordinator;
 };
-
-export function buildTelegramNativeCommandCallbackData(commandText: string): string {
-  return `${TELEGRAM_NATIVE_COMMAND_CALLBACK_PREFIX}${commandText}`;
-}
-
-export function parseTelegramNativeCommandCallbackData(data?: string | null): string | null {
-  if (!data) {
-    return null;
-  }
-  const trimmed = data.trim();
-  if (!trimmed.startsWith(TELEGRAM_NATIVE_COMMAND_CALLBACK_PREFIX)) {
-    return null;
-  }
-  const commandText = trimmed.slice(TELEGRAM_NATIVE_COMMAND_CALLBACK_PREFIX.length).trim();
-  return commandText.startsWith("/") ? commandText : null;
-}
 
 export function resolveTelegramNativeCommandDisableBlockStreaming(
   telegramCfg: TelegramAccountConfig,
@@ -488,7 +645,8 @@ export type RegisterTelegramNativeCommandsParams = {
   ) => TelegramResolvedGroupConfig;
   shouldSkipUpdate: (ctx: TelegramUpdateKeyContext) => boolean;
   telegramDeps?: TelegramNativeCommandDeps;
-  opts: { token: string };
+  opts: Pick<TelegramBotOptions, "token" | "replyToMode">;
+  peerBotAdmission?: TelegramPeerBotAdmissionCoordinator;
 };
 
 async function resolveTelegramCommandAuth(params: {
@@ -497,6 +655,7 @@ async function resolveTelegramCommandAuth(params: {
   cfg: OpenClawConfig;
   accountId: string;
   telegramCfg: TelegramAccountConfig;
+  replyToMode: ReplyToMode;
   readChannelAllowFromStore: TelegramBotDeps["readChannelAllowFromStore"];
   allowFrom?: Array<string | number>;
   groupAllowFrom?: Array<string | number>;
@@ -507,6 +666,7 @@ async function resolveTelegramCommandAuth(params: {
     messageThreadId?: number,
   ) => TelegramResolvedGroupConfig;
   requireAuth: boolean;
+  shouldSuppressRejection?: () => boolean;
 }): Promise<TelegramCommandAuthResult | null> {
   const {
     msg,
@@ -514,6 +674,7 @@ async function resolveTelegramCommandAuth(params: {
     cfg,
     accountId,
     telegramCfg,
+    replyToMode,
     readChannelAllowFromStore,
     allowFrom,
     groupAllowFrom,
@@ -521,6 +682,7 @@ async function resolveTelegramCommandAuth(params: {
     resolveGroupPolicy,
     resolveTelegramGroupConfig,
     requireAuth,
+    shouldSuppressRejection,
   } = params;
   const { chatId, isGroup, isForum, messageThreadId, threadParams } =
     await resolveTelegramNativeCommandThreadContext({ msg, bot });
@@ -567,6 +729,7 @@ async function resolveTelegramCommandAuth(params: {
     effectiveGroupAllow,
     hasGroupAllowOverride,
   } = groupAllowContext;
+  const admissionThreadId = resolvedThreadId ?? dmThreadId;
   const effectiveDmPolicy = resolveTelegramEffectiveDmPolicy({
     isGroup,
     groupConfig,
@@ -601,9 +764,23 @@ async function resolveTelegramCommandAuth(params: {
   });
 
   const sendAuthMessage = async (text: string) => {
+    if (shouldSuppressRejection?.()) {
+      return null;
+    }
     await withTelegramApiErrorLogging({
       operation: "sendMessage",
-      fn: () => bot.api.sendMessage(chatId, text, threadParams ?? {}),
+      fn: () =>
+        bot.api.sendMessage(chatId, text, {
+          ...(isTelegramPeerBotMessage(msg) && replyToMode !== "off"
+            ? {
+                reply_parameters: {
+                  message_id: msg.message_id,
+                  allow_sending_without_reply: true,
+                },
+              }
+            : {}),
+          ...threadParams,
+        }),
     });
     return null;
   };
@@ -702,6 +879,7 @@ async function resolveTelegramCommandAuth(params: {
     isGroup,
     isForum,
     resolvedThreadId,
+    ...(admissionThreadId != null ? { admissionThreadId } : {}),
     senderId,
     senderUsername,
     groupConfig,
@@ -731,7 +909,65 @@ export const registerTelegramNativeCommands = ({
   shouldSkipUpdate,
   telegramDeps = defaultTelegramNativeCommandDeps,
   opts,
+  peerBotAdmission = createTelegramPeerBotAdmissionCoordinator(),
 }: RegisterTelegramNativeCommandsParams) => {
+  // Peer-bot replies default to explicit threading for Telegram visibility.
+  // Operators can still disable the exception with replyToMode: "off".
+  const peerBotReplyToMode = opts.replyToMode ?? telegramCfg.replyToMode ?? "all";
+  const shouldSuppressPeerBotCommandLoop = (params: {
+    msg: NonNullable<TelegramNativeCommandContext["message"]>;
+    botId?: number;
+    runtimeCfg: OpenClawConfig;
+  }): boolean =>
+    shouldSuppressTelegramBotCommandLoop({
+      msg: params.msg,
+      botId: params.botId,
+      accountId,
+      cfg: params.runtimeCfg,
+    });
+  const admitAuthorizedPeerBotCommand = async (params: {
+    msg: NonNullable<TelegramNativeCommandContext["message"]>;
+    botId?: number;
+    isAbortControl: boolean;
+    threadId?: number;
+    runtimeCfg: OpenClawConfig;
+  }): Promise<boolean> => {
+    if (!isTelegramPeerBotMessage(params.msg) || params.botId == null || !params.msg.from) {
+      return false;
+    }
+    const admissionKey = buildTelegramPeerBotAdmissionKey({
+      accountId,
+      chatId: params.msg.chat.id,
+      threadId: params.threadId,
+      senderId: String(params.msg.from.id),
+      receiverId: params.botId,
+    });
+    if (params.isAbortControl) {
+      // Authorized stop always cancels buffered peer work, even when loop
+      // protection suppresses its command response.
+      await peerBotAdmission.cancel(admissionKey);
+      if (
+        shouldSuppressPeerBotCommandLoop({
+          msg: params.msg,
+          botId: params.botId,
+          runtimeCfg: params.runtimeCfg,
+        })
+      ) {
+        return true;
+      }
+      return false;
+    }
+    return await peerBotAdmission.reserve(
+      admissionKey,
+      (admitted) =>
+        admitted &&
+        shouldSuppressPeerBotCommandLoop({
+          msg: params.msg,
+          botId: params.botId,
+          runtimeCfg: params.runtimeCfg,
+        }),
+    )(true);
+  };
   const boundRoute =
     nativeEnabled && nativeSkillsEnabled
       ? resolveAgentRoute({ cfg, channel: "telegram", accountId })
@@ -741,7 +977,7 @@ export const registerTelegramNativeCommands = ({
       "nativeSkillsEnabled is true but no agent route is bound for this Telegram account; skill commands will not appear in the native menu.",
     );
   }
-  let skillCommands =
+  const skillCommands =
     nativeEnabled && nativeSkillsEnabled && boundRoute
       ? telegramDeps.listSkillCommandsForAgents({
           cfg,
@@ -920,7 +1156,7 @@ export const registerTelegramNativeCommands = ({
       isForum,
       messageThreadId: resolvedThreadId ?? messageThreadId,
     });
-    let { route, bindingMode } = resolveTelegramConversationRoute({
+    const { route, bindingMode } = resolveTelegramConversationRoute({
       cfg: runtimeCfg,
       accountId,
       chatId,
@@ -947,7 +1183,17 @@ export const registerTelegramNativeCommands = ({
             bot.api.sendMessage(
               chatId,
               "Configured ACP binding is unavailable right now. Please try again.",
-              buildTelegramThreadParams(threadSpec) ?? {},
+              {
+                ...buildTelegramThreadParams(threadSpec),
+                ...(isTelegramPeerBotMessage(msg) && peerBotReplyToMode !== "off"
+                  ? {
+                      reply_parameters: {
+                        message_id: msg.message_id,
+                        allow_sending_without_reply: true,
+                      },
+                    }
+                  : {}),
+              },
             ),
         });
         return null;
@@ -961,6 +1207,7 @@ export const registerTelegramNativeCommands = ({
       cfg: runtimeCfg,
       channel: "telegram",
       accountId: route.accountId,
+      supportsBlockTables: true,
     });
     const chunkMode = nativeCommandRuntime.resolveChunkMode(
       runtimeCfg,
@@ -982,6 +1229,9 @@ export const registerTelegramNativeCommands = ({
     tableMode: ReturnType<typeof resolveMarkdownTableMode>;
     chunkMode: TelegramChunkMode;
     linkPreview?: boolean;
+    richMessages?: boolean;
+    standardMessages?: boolean;
+    defaultReplyToId?: string;
   }) => ({
     cfg: params.cfg,
     chatId: String(params.chatId),
@@ -995,12 +1245,15 @@ export const registerTelegramNativeCommands = ({
     bot,
     mediaLocalRoots: params.mediaLocalRoots,
     mediaMaxBytes,
-    replyToMode,
+    replyToMode: params.standardMessages ? peerBotReplyToMode : replyToMode,
     textLimit,
     thread: params.threadSpec,
     tableMode: params.tableMode,
     chunkMode: params.chunkMode,
     linkPreview: params.linkPreview,
+    richMessages: params.richMessages,
+    standardMessages: params.standardMessages,
+    defaultReplyToId: params.defaultReplyToId,
   });
   const resolveCommandTargetSessionKey = (params: {
     runtimeCfg: OpenClawConfig;
@@ -1041,17 +1294,22 @@ export const registerTelegramNativeCommands = ({
         if (!msg) {
           return;
         }
+        if (msg.from?.id != null && msg.from.id === ctx.me?.id) {
+          return;
+        }
         if (shouldSkipUpdate(ctx)) {
           return;
         }
         const runtimeCfg = loadFreshRuntimeConfig();
         const runtimeTelegramCfg = resolveFreshTelegramConfig(runtimeCfg);
+        const botId = ctx.me?.id ?? bot.botInfo?.id;
         const auth = await resolveTelegramCommandAuth({
           msg,
           bot,
           cfg: runtimeCfg,
           accountId,
           telegramCfg: runtimeTelegramCfg,
+          replyToMode: peerBotReplyToMode,
           readChannelAllowFromStore: telegramDeps.readChannelAllowFromStore,
           allowFrom,
           groupAllowFrom,
@@ -1059,8 +1317,21 @@ export const registerTelegramNativeCommands = ({
           resolveGroupPolicy,
           resolveTelegramGroupConfig,
           requireAuth: true,
+          shouldSuppressRejection: () =>
+            shouldSuppressPeerBotCommandLoop({ msg, botId, runtimeCfg }),
         });
         if (!auth) {
+          return;
+        }
+        if (
+          await admitAuthorizedPeerBotCommand({
+            msg,
+            botId,
+            isAbortControl: normalizedCommandName === "stop",
+            threadId: auth.admissionThreadId,
+            runtimeCfg,
+          })
+        ) {
           return;
         }
         const {
@@ -1134,20 +1405,45 @@ export const registerTelegramNativeCommands = ({
           commandDefinition.args?.some(
             (arg) => typeof arg.choices === "function" && commandArgs?.values?.[arg.name] == null,
           );
-        const menuModelContext =
-          commandDefinition && menuNeedsModelContext
-            ? resolveTelegramCommandMenuModelContext({
+        const targetSessionKeyForMenu =
+          commandDefinition && menuNeedsModelContext ? await resolveTargetSessionKey() : "";
+        const fastCommandState =
+          commandDefinition?.key === "fast" && menuNeedsModelContext
+            ? resolveTelegramFastCommandState({
                 cfg: runtimeCfg,
                 agentId: route.agentId,
-                sessionKey: await resolveTargetSessionKey(),
+                sessionKey: targetSessionKeyForMenu,
               })
+            : undefined;
+        const fastMenuModelContext =
+          commandDefinition?.key === "fast" && menuNeedsModelContext
+            ? resolveTelegramFastCommandModelContext({
+                cfg: runtimeCfg,
+                agentId: route.agentId,
+                sessionKey: targetSessionKeyForMenu,
+              })
+            : undefined;
+        const menuModelContext =
+          commandDefinition && menuNeedsModelContext
+            ? (fastMenuModelContext ??
+              resolveTelegramCommandMenuModelContext({
+                cfg: runtimeCfg,
+                agentId: route.agentId,
+                sessionKey: targetSessionKeyForMenu,
+              }))
             : {};
+        // Native /think choices need live-discovery metadata; empty keeps config fallback.
+        const menuModelCatalog =
+          commandDefinition?.key === "think" && menuNeedsModelContext
+            ? await loadModelCatalog({ config: runtimeCfg })
+            : undefined;
         const menu = commandDefinition
           ? resolveCommandArgMenu({
               command: commandDefinition,
               args: commandArgs,
               cfg: runtimeCfg,
               ...menuModelContext,
+              ...(menuModelCatalog?.length ? { catalog: menuModelCatalog } : {}),
             })
           : null;
         if (menu && commandDefinition) {
@@ -1160,6 +1456,18 @@ export const registerTelegramNativeCommands = ({
                     cfg: runtimeCfg,
                     agentId: route.agentId,
                     ...menuModelContext,
+                  })
+                : undefined,
+            currentFastModeStatus:
+              commandDefinition.key === "fast"
+                ? resolveTelegramFastMenuCurrentStatus({
+                    state:
+                      fastCommandState ??
+                      resolveTelegramFastCommandState({
+                        cfg: runtimeCfg,
+                        agentId: route.agentId,
+                        sessionKey: targetSessionKeyForMenu,
+                      }),
                   })
                 : undefined,
           });
@@ -1187,6 +1495,14 @@ export const registerTelegramNativeCommands = ({
             fn: () =>
               bot.api.sendMessage(chatId, title, {
                 ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+                ...(isTelegramPeerBotMessage(msg) && peerBotReplyToMode !== "off"
+                  ? {
+                      reply_parameters: {
+                        message_id: msg.message_id,
+                        allow_sending_without_reply: true,
+                      },
+                    }
+                  : {}),
                 ...threadParams,
               }),
           });
@@ -1205,6 +1521,7 @@ export const registerTelegramNativeCommands = ({
             userId: String(senderId || chatId),
             targetSessionKey: sessionKey,
           });
+        const peerBotCommand = isTelegramPeerBotMessage(msg);
         const deliveryBaseOptions = buildCommandDeliveryBaseOptions({
           cfg: executionCfg,
           chatId,
@@ -1218,6 +1535,9 @@ export const registerTelegramNativeCommands = ({
           tableMode,
           chunkMode,
           linkPreview: runtimeTelegramCfg.linkPreview,
+          richMessages: runtimeTelegramCfg.richMessages,
+          standardMessages: peerBotCommand,
+          defaultReplyToId: undefined,
         });
         let topicName: string | undefined;
         if (isForum && resolvedThreadId != null) {
@@ -1283,10 +1603,12 @@ export const registerTelegramNativeCommands = ({
             runtime.error?.(danger(`telegram slash: failed updating session meta: ${String(err)}`)),
         });
 
-        const disableBlockStreaming =
-          resolveTelegramNativeCommandDisableBlockStreaming(runtimeTelegramCfg);
+        const disableBlockStreaming = isTelegramPeerBotMessage(msg)
+          ? true
+          : resolveTelegramNativeCommandDisableBlockStreaming(runtimeTelegramCfg);
         const deliveryState = {
           delivered: false,
+          failedNonSilent: 0,
           skippedNonSilent: 0,
         };
 
@@ -1298,60 +1620,142 @@ export const registerTelegramNativeCommands = ({
           channel: "telegram",
           accountId: route.accountId,
         });
+        const peerBotTurn =
+          peerBotCommand && msg.from?.id != null
+            ? {
+                accountId: route.accountId,
+                chatAliases: [msg.chat.username]
+                  .filter((value): value is string => Boolean(value))
+                  .map((value) => `@${value}`),
+                chatId: String(chatId),
+                messageId: msg.message_id,
+                senderAliases: [msg.from?.username]
+                  .filter((value): value is string => Boolean(value))
+                  .map((value) => `@${value}`),
+                senderId: String(msg.from.id),
+                ...(threadSpec.id != null ? { threadId: threadSpec.id } : {}),
+              }
+            : undefined;
+        const effectiveNativeReplyToMode = peerBotCommand ? peerBotReplyToMode : replyToMode;
+        let peerImplicitReplyAvailable = true;
+        const applyPeerImplicitReply = (payload: TelegramNativeReplyPayload) => {
+          if (
+            effectiveNativeReplyToMode === "off" ||
+            payload.replyToId != null ||
+            (isSingleUseReplyToMode(effectiveNativeReplyToMode) && !peerImplicitReplyAvailable)
+          ) {
+            return payload;
+          }
+          return {
+            ...payload,
+            replyToId: String(msg.message_id),
+            replyToIdSource: "implicit" as const,
+          };
+        };
+        const commitPeerImplicitReply = (payload: TelegramNativeReplyPayload) => {
+          if (
+            payload.replyToIdSource === "implicit" &&
+            isSingleUseReplyToMode(effectiveNativeReplyToMode)
+          ) {
+            peerImplicitReplyAvailable = false;
+          }
+        };
+        const transformQueuedPeerBotPayload = (payload: TelegramNativeReplyPayload) => {
+          const addressedPayload = applyPeerImplicitReply(payload);
+          return {
+            ...addressedPayload,
+            channelData: {
+              ...addressedPayload.channelData,
+              telegram: {
+                ...(addressedPayload.channelData?.telegram as Record<string, unknown> | undefined),
+                standardMessage: true,
+              },
+            },
+          };
+        };
 
-        await telegramDeps.dispatchReplyWithBufferedBlockDispatcher({
-          ctx: ctxPayload,
-          cfg: executionCfg,
-          dispatcherOptions: {
-            ...replyPipeline,
-            beforeDeliver: async (payload) => payload,
-            deliver: async (payload, _info) => {
-              if (
-                shouldSuppressLocalTelegramExecApprovalPrompt({
-                  cfg: executionCfg,
-                  accountId: route.accountId,
-                  payload,
-                })
-              ) {
-                deliveryState.delivered = true;
-                return;
-              }
-              const result = await deliverReplies({
-                replies: [
-                  payload.replyToId
-                    ? payload
-                    : {
-                        ...payload,
-                        replyToId: String(msg.message_id),
-                      },
-                ],
-                ...deliveryBaseOptions,
-                silent: runtimeTelegramCfg.silentErrorReplies === true && payload.isError === true,
-              });
-              if (result.delivered) {
-                deliveryState.delivered = true;
-              }
+        const dispatchNativeCommand = async () =>
+          await telegramDeps.dispatchReplyWithBufferedBlockDispatcher({
+            ctx: ctxPayload,
+            cfg: executionCfg,
+            dispatcherOptions: {
+              ...replyPipeline,
+              beforeDeliver: async (payload) => payload,
+              deliver: async (payload, _info) => {
+                if (
+                  shouldSuppressLocalTelegramExecApprovalPrompt({
+                    cfg: executionCfg,
+                    accountId: route.accountId,
+                    payload,
+                  })
+                ) {
+                  deliveryState.delivered = true;
+                  return;
+                }
+                const addressedPayload = applyPeerImplicitReply(payload);
+                let result: Awaited<ReturnType<typeof deliverReplies>>;
+                try {
+                  result = await deliverReplies({
+                    replies: [addressedPayload],
+                    ...deliveryBaseOptions,
+                    silent:
+                      runtimeTelegramCfg.silentErrorReplies === true && payload.isError === true,
+                  });
+                } catch (error) {
+                  if (isTelegramDeliveryErrorVisible(error)) {
+                    commitPeerImplicitReply(addressedPayload);
+                    deliveryState.delivered = true;
+                  }
+                  const silentFailure =
+                    runtimeTelegramCfg.silentErrorReplies === true && payload.isError === true;
+                  if (!silentFailure) {
+                    deliveryState.failedNonSilent += 1;
+                  }
+                  throw error;
+                }
+                if (result.delivered) {
+                  commitPeerImplicitReply(addressedPayload);
+                  deliveryState.delivered = true;
+                }
+              },
+              onSkip: (_payload, info) => {
+                if (info.reason !== "silent") {
+                  deliveryState.skippedNonSilent += 1;
+                }
+              },
+              onError: (err, info) => {
+                runtime.error?.(danger(`telegram slash ${info.kind} reply failed: ${String(err)}`));
+              },
             },
-            onSkip: (_payload, info) => {
-              if (info.reason !== "silent") {
-                deliveryState.skippedNonSilent += 1;
-              }
+            replyOptions: {
+              skillFilter,
+              disableBlockStreaming,
+              queuedDeliveryPayloadTransform: peerBotCommand
+                ? transformQueuedPeerBotPayload
+                : undefined,
+              queuedDeliveryReplyToMode: peerBotCommand ? effectiveNativeReplyToMode : undefined,
+              queuedDeliveryPayloadDidDeliver: peerBotCommand ? commitPeerImplicitReply : undefined,
+              queuedExecutionContext: peerBotTurn
+                ? (run) => runWithTelegramPeerBotTurn(peerBotTurn, run)
+                : undefined,
+              onModelSelected,
             },
-            onError: (err, info) => {
-              runtime.error?.(danger(`telegram slash ${info.kind} reply failed: ${String(err)}`));
-            },
-          },
-          replyOptions: {
-            skillFilter,
-            disableBlockStreaming,
-            onModelSelected,
-          },
-        });
-        if (!deliveryState.delivered && deliveryState.skippedNonSilent > 0) {
-          await deliverReplies({
-            replies: [{ text: EMPTY_RESPONSE_FALLBACK }],
+          });
+        await (peerBotTurn
+          ? runWithTelegramPeerBotTurn(peerBotTurn, dispatchNativeCommand)
+          : dispatchNativeCommand());
+        if (
+          !deliveryState.delivered &&
+          deliveryState.skippedNonSilent + deliveryState.failedNonSilent > 0
+        ) {
+          const fallbackPayload = applyPeerImplicitReply({ text: EMPTY_RESPONSE_FALLBACK });
+          const fallbackResult = await deliverReplies({
+            replies: [fallbackPayload],
             ...deliveryBaseOptions,
           });
+          if (fallbackResult.delivered) {
+            commitPeerImplicitReply(fallbackPayload);
+          }
         }
       });
     }
@@ -1362,22 +1766,40 @@ export const registerTelegramNativeCommands = ({
         if (!msg) {
           return;
         }
+        if (msg.from?.id != null && msg.from.id === ctx.me?.id) {
+          return;
+        }
         if (shouldSkipUpdate(ctx)) {
           return;
         }
         const chatId = msg.chat.id;
         const runtimeCfg = loadFreshRuntimeConfig();
         const runtimeTelegramCfg = resolveFreshTelegramConfig(runtimeCfg);
+        const botId = ctx.me?.id ?? bot.botInfo?.id;
         const { threadParams } = await resolveTelegramNativeCommandThreadContext({ msg, bot });
         const rawText = ctx.match?.trim() ?? "";
         const commandBody = `/${pluginCommand.command}${rawText ? ` ${rawText}` : ""}`;
         const nativeCommandRuntime = await loadTelegramNativeCommandRuntime();
         const match = nativeCommandRuntime.matchPluginCommand(commandBody);
         if (!match) {
+          if (shouldSuppressPeerBotCommandLoop({ msg, botId, runtimeCfg })) {
+            return;
+          }
           await withTelegramApiErrorLogging({
             operation: "sendMessage",
             runtime,
-            fn: () => bot.api.sendMessage(chatId, "Command not found.", threadParams ?? {}),
+            fn: () =>
+              bot.api.sendMessage(chatId, "Command not found.", {
+                ...(isTelegramPeerBotMessage(msg) && peerBotReplyToMode !== "off"
+                  ? {
+                      reply_parameters: {
+                        message_id: msg.message_id,
+                        allow_sending_without_reply: true,
+                      },
+                    }
+                  : {}),
+                ...threadParams,
+              }),
           });
           return;
         }
@@ -1387,6 +1809,7 @@ export const registerTelegramNativeCommands = ({
           cfg: runtimeCfg,
           accountId,
           telegramCfg: runtimeTelegramCfg,
+          replyToMode: peerBotReplyToMode,
           readChannelAllowFromStore: telegramDeps.readChannelAllowFromStore,
           allowFrom,
           groupAllowFrom,
@@ -1394,8 +1817,21 @@ export const registerTelegramNativeCommands = ({
           resolveGroupPolicy,
           resolveTelegramGroupConfig,
           requireAuth: match.command.requireAuth !== false,
+          shouldSuppressRejection: () =>
+            shouldSuppressPeerBotCommandLoop({ msg, botId, runtimeCfg }),
         });
         if (!auth) {
+          return;
+        }
+        if (
+          await admitAuthorizedPeerBotCommand({
+            msg,
+            botId,
+            isAbortControl: false,
+            threadId: auth.admissionThreadId,
+            runtimeCfg,
+          })
+        ) {
           return;
         }
         const { senderId, commandAuthorized, senderIsOwner, isGroup, isForum, resolvedThreadId } =
@@ -1440,6 +1876,12 @@ export const registerTelegramNativeCommands = ({
           tableMode,
           chunkMode,
           linkPreview: runtimeTelegramCfg.linkPreview,
+          richMessages: runtimeTelegramCfg.richMessages,
+          standardMessages: isTelegramPeerBotMessage(msg),
+          defaultReplyToId:
+            isTelegramPeerBotMessage(msg) && peerBotReplyToMode !== "off"
+              ? String(msg.message_id)
+              : undefined,
         });
         const from = isGroup ? buildTelegramGroupFrom(chatId, threadSpec.id) : `telegram:${chatId}`;
         const to = `telegram:${chatId}`;
@@ -1448,7 +1890,9 @@ export const registerTelegramNativeCommands = ({
         let progressMessageId: number | undefined;
         const progressPlaceholder = resolveTelegramProgressPlaceholder(match.command);
 
-        if (progressPlaceholder) {
+        // Peer bots do not receive rich edits, so bot-originated commands must
+        // wait for the observable standard final instead of a progress placeholder.
+        if (progressPlaceholder && deliveryBaseOptions.standardMessages !== true) {
           try {
             const sent = await withTelegramApiErrorLogging({
               operation: "sendMessage",
@@ -1469,7 +1913,7 @@ export const registerTelegramNativeCommands = ({
           }
         }
 
-        const sessionFileContext = await resolveTelegramCommandSessionFile({
+        const transcriptContext = await resolveTelegramCommandTranscriptContext({
           cfg: runtimeCfg,
           agentId: route.agentId,
           sessionKey: targetSessionKey,
@@ -1486,10 +1930,10 @@ export const registerTelegramNativeCommands = ({
             senderIsOwner,
             agentId: route.agentId,
             sessionKey: targetSessionKey,
-            sessionId: sessionFileContext.sessionId,
-            sessionFile: sessionFileContext.sessionFile,
+            sessionId: transcriptContext.sessionId,
+            sessionFile: transcriptContext.sessionFile,
             authProfileId:
-              sessionFileContext.authProfileId ?? targetSessionEntry?.authProfileOverride,
+              transcriptContext.authProfileId ?? targetSessionEntry?.authProfileOverride,
             commandBody,
             config: runtimeCfg,
             from,
@@ -1515,9 +1959,19 @@ export const registerTelegramNativeCommands = ({
           return;
         }
 
-        const deliverableResult = hasRenderableTelegramNativeReplyPayload(result)
+        const baseDeliverableResult = hasRenderableTelegramNativeReplyPayload(result)
           ? result
           : { text: EMPTY_RESPONSE_FALLBACK };
+        const deliverableResult =
+          isTelegramPeerBotMessage(msg) &&
+          peerBotReplyToMode !== "off" &&
+          baseDeliverableResult.replyToId == null
+            ? {
+                ...baseDeliverableResult,
+                replyToId: String(msg.message_id),
+                replyToIdSource: "implicit" as const,
+              }
+            : baseDeliverableResult;
         const progressResultText =
           typeof deliverableResult.text === "string" && deliverableResult.text.trim().length > 0
             ? deliverableResult.text

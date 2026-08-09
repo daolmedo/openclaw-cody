@@ -1,3 +1,4 @@
+// Browser tests cover navigation guard plugin behavior.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SsrFBlockedError, type LookupFn } from "../infra/net/ssrf.js";
 import {
@@ -81,7 +82,7 @@ describe("browser navigation guard", () => {
     ).rejects.toBeInstanceOf(InvalidBrowserNavigationUrlError);
   });
 
-  it("allows blocked hostnames when explicitly allowed", async () => {
+  it("blocks explicitly allowed hostnames that resolve to loopback", async () => {
     const lookupFn = createLookupFn("127.0.0.1");
     await expect(
       assertBrowserNavigationAllowed({
@@ -91,7 +92,7 @@ describe("browser navigation guard", () => {
         },
         lookupFn,
       }),
-    ).resolves.toBeUndefined();
+    ).rejects.toBeInstanceOf(SsrFBlockedError);
     expect(lookupFn).toHaveBeenCalledWith("agent.internal", { all: true });
   });
 
@@ -249,6 +250,26 @@ describe("browser navigation guard", () => {
         url: "not a url",
       }),
     ).rejects.toBeInstanceOf(InvalidBrowserNavigationUrlError);
+  });
+
+  it("blocks network URLs with embedded credentials before lookup", async () => {
+    const lookupFn = createLookupFn("93.184.216.34");
+    const result = assertBrowserNavigationAllowed({
+      url: "https://user:secret@example.com/private",
+      lookupFn,
+    });
+    await expect(result).rejects.toThrow("URL-embedded credentials are not supported");
+    await expect(result).rejects.toThrow("openclaw browser set credentials");
+    await expect(result).rejects.not.toThrow("secret");
+    expect(lookupFn).not.toHaveBeenCalled();
+  });
+
+  it("redacts malformed credential-bearing URLs from diagnostics", async () => {
+    const result = assertBrowserNavigationAllowed({
+      url: "https://user:secret@",
+    });
+    await expect(result).rejects.toThrow("Invalid URL: [redacted credential-bearing URL]");
+    await expect(result).rejects.not.toThrow("secret");
   });
 
   it("validates final network URLs after navigation", async () => {

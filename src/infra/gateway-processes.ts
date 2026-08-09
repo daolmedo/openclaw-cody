@@ -1,6 +1,7 @@
+// Inspects local gateway processes for status and diagnostics.
 import { spawnSync } from "node:child_process";
 import fsSync from "node:fs";
-import { uniqueValues } from "../shared/string-normalization.js";
+import { uniqueValues } from "@openclaw/normalization-core/string-normalization";
 import { isGatewayArgv, parseProcCmdline } from "./gateway-process-argv.js";
 import { findGatewayPidsOnPortSync as findUnixGatewayPidsOnPortSync } from "./restart-stale-pids.js";
 import {
@@ -8,6 +9,9 @@ import {
   readWindowsProcessArgsSync,
 } from "./windows-port-pids.js";
 
+// Gateway process helpers verify argv before signaling or reporting listener
+// PIDs so stale port owners cannot be mistaken for OpenClaw.
+/** Read command argv for a PID using the current platform's process APIs. */
 export function readGatewayProcessArgsSync(pid: number): string[] | null {
   if (process.platform === "linux") {
     try {
@@ -20,6 +24,7 @@ export function readGatewayProcessArgsSync(pid: number): string[] | null {
     const ps = spawnSync("ps", ["-o", "command=", "-p", String(pid)], {
       encoding: "utf8",
       timeout: 1000,
+      killSignal: "SIGKILL",
     });
     if (ps.error || ps.status !== 0) {
       return null;
@@ -33,14 +38,24 @@ export function readGatewayProcessArgsSync(pid: number): string[] | null {
   return null;
 }
 
+/** Signal a PID only after its argv matches a gateway process. */
 export function signalVerifiedGatewayPidSync(pid: number, signal: "SIGTERM" | "SIGUSR1"): void {
   const args = readGatewayProcessArgsSync(pid);
   if (!args || !isGatewayArgv(args, { allowGatewayBinary: true })) {
     throw new Error(`refusing to signal non-gateway process pid ${pid}`);
   }
-  process.kill(pid, signal);
+  try {
+    process.kill(pid, signal);
+  } catch (err) {
+    // The verified process can exit between argv inspection and signaling;
+    // ESRCH already satisfies the requested stop or restart handoff.
+    if ((err as NodeJS.ErrnoException).code !== "ESRCH") {
+      throw err;
+    }
+  }
 }
 
+/** Find listener PIDs on `port` and keep only verified gateway processes. */
 export function findVerifiedGatewayListenerPidsOnPortSync(port: number): number[] {
   const rawPids =
     process.platform === "win32"
@@ -55,6 +70,7 @@ export function findVerifiedGatewayListenerPidsOnPortSync(port: number): number[
     });
 }
 
+/** Format gateway PIDs for human-facing diagnostics. */
 export function formatGatewayPidList(pids: number[]): string {
   return pids.join(", ");
 }

@@ -1,6 +1,6 @@
 ---
-title: "IDENTITY Template"
 summary: "Agent identity record"
+title: "IDENTITY template"
 read_when:
   - Bootstrapping a workspace manually
 ---
@@ -9,7 +9,8 @@ read_when:
 
 _Fill this in during your first conversation. Make it yours._
 
-- **Name:** Cody
+- **Name:**
+  _(pick something you like)_
 - **Creature:**
   _(AI? robot? familiar? ghost in the machine? something weirder?)_
 - **Vibe:**
@@ -27,3 +28,7 @@ Notes:
 
 - Save this file at the workspace root as `IDENTITY.md`.
 - For avatars, use a workspace-relative path like `avatars/openclaw.png`.
+
+## Related
+
+- [Agent workspace](/concepts/agent-workspace)

@@ -1,3 +1,4 @@
+// Tests ACP dispatch delivery routing and visible reply handoff.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
 import { createAcpDispatchDeliveryCoordinator } from "./dispatch-acp-delivery.js";
@@ -18,15 +19,23 @@ const deliveryMocks = vi.hoisted(() => ({
       _params: unknown,
     ): Promise<{
       ok: boolean;
+      delivered?: boolean;
+      error?: string;
       messageId?: string;
+      partialFailure?: boolean;
       suppressed?: boolean;
       reason?: string;
-    }> => ({ ok: true, messageId: "mock-message" }),
+    }> => ({ ok: true, delivered: true, messageId: "mock-message" }),
   ),
   runMessageAction: vi.fn(async (_params: unknown) => ({ ok: true as const })),
 }));
 
 const channelPluginMocks = vi.hoisted(() => ({
+  accountIds: ["default"] as string[],
+  defaultAccountId: undefined as string | undefined,
+  replyToModeForAccount: undefined as
+    | ((accountId: string | null | undefined) => "all" | "off")
+    | undefined,
   shouldTreatDeliveredTextAsVisible: (({
     kind,
     text,
@@ -44,6 +53,21 @@ const channelPluginMocks = vi.hoisted(() => ({
       return undefined;
     }
     return {
+      config: {
+        listAccountIds: () => channelPluginMocks.accountIds,
+        resolveAccount: () => ({}),
+        ...(channelPluginMocks.defaultAccountId
+          ? { defaultAccountId: () => channelPluginMocks.defaultAccountId ?? "default" }
+          : {}),
+      },
+      ...(channelPluginMocks.replyToModeForAccount
+        ? {
+            threading: {
+              resolveReplyToMode: ({ accountId }: { accountId?: string | null }) =>
+                channelPluginMocks.replyToModeForAccount?.(accountId) ?? "all",
+            },
+          }
+        : {}),
       outbound: {
         shouldTreatDeliveredTextAsVisible: channelPluginMocks.shouldTreatDeliveredTextAsVisible,
         shouldTreatRoutedTextAsVisible: channelPluginMocks.shouldTreatRoutedTextAsVisible,
@@ -152,10 +176,17 @@ async function expectVisibleChatBlockRoutesToAccount(
 describe("createAcpDispatchDeliveryCoordinator", () => {
   beforeEach(() => {
     deliveryMocks.routeReply.mockClear();
-    deliveryMocks.routeReply.mockResolvedValue({ ok: true, messageId: "mock-message" });
+    deliveryMocks.routeReply.mockResolvedValue({
+      ok: true,
+      delivered: true,
+      messageId: "mock-message",
+    });
     deliveryMocks.runMessageAction.mockClear();
     deliveryMocks.runMessageAction.mockResolvedValue({ ok: true as const });
     channelPluginMocks.getChannelPlugin.mockClear();
+    channelPluginMocks.accountIds = ["default"];
+    channelPluginMocks.defaultAccountId = undefined;
+    channelPluginMocks.replyToModeForAccount = undefined;
     channelPluginMocks.shouldTreatDeliveredTextAsVisible = ({
       kind,
       text,
@@ -775,13 +806,99 @@ describe("createAcpDispatchDeliveryCoordinator", () => {
     await coordinator.deliver("block", { text: "hello" }, { skipTts: true });
 
     const [[routeParams]] = deliveryMocks.routeReply.mock.calls as unknown as Array<
-      [{ threadId?: string | number }]
+      [
+        {
+          threadId?: string | number;
+          replyDelivery?: { chatType?: string; replyToMode?: string };
+        },
+      ]
     >;
     expect(routeParams.threadId).toBe("101.000");
+    expect(routeParams.replyDelivery).toEqual({
+      chatType: "direct",
+      replyToMode: "all",
+    });
+  });
+
+  it("uses the routed destination chat type instead of the source context", async () => {
+    const coordinator = createAcpDispatchDeliveryCoordinator({
+      cfg: createAcpTestConfig(),
+      ctx: buildTestCtx({
+        Provider: "webchat",
+        Surface: "webchat",
+        SessionKey: "agent:main:mattermost:channel:town-square",
+        ChatType: "direct",
+      }),
+      dispatcher: createDispatcher(),
+      inboundAudio: false,
+      shouldRouteToOriginating: true,
+      originatingChannel: "mattermost",
+      originatingTo: "channel:town-square",
+      originatingChatType: "channel",
+    });
+
+    await coordinator.deliver("block", { text: "hello" }, { skipTts: true });
+
+    const [[routeParams]] = deliveryMocks.routeReply.mock.calls as unknown as Array<
+      [{ replyDelivery?: { chatType?: string; replyToMode?: string } }]
+    >;
+    expect(routeParams.replyDelivery).toEqual({
+      chatType: "channel",
+      replyToMode: "all",
+    });
+  });
+
+  it("uses the routed channel's listed default account for reply policy", async () => {
+    channelPluginMocks.accountIds = ["work"];
+    channelPluginMocks.replyToModeForAccount = (accountId) =>
+      accountId === "work" ? "off" : "all";
+    const coordinator = createVisibleChatAcpCoordinator(createAcpTestConfig());
+
+    await coordinator.deliver("block", { text: "hello" }, { skipTts: true });
+
+    const [[routeParams]] = deliveryMocks.routeReply.mock.calls as unknown as Array<
+      [
+        {
+          accountId?: string;
+          replyDelivery?: { chatType?: string; replyToMode?: string };
+        },
+      ]
+    >;
+    expect(routeParams.accountId).toBe("work");
+    expect(routeParams.replyDelivery).toEqual({
+      chatType: "direct",
+      replyToMode: "off",
+    });
+  });
+
+  it("uses inherited account and thread metadata for routed ACP replies", async () => {
+    const coordinator = createAcpDispatchDeliveryCoordinator({
+      cfg: createAcpTestConfig(),
+      ctx: buildTestCtx({
+        Provider: "webchat",
+        Surface: "webchat",
+        SessionKey: "agent:main:feishu:direct:ou_123",
+      }),
+      dispatcher: createDispatcher(),
+      inboundAudio: false,
+      shouldRouteToOriginating: true,
+      originatingChannel: "feishu",
+      originatingTo: "user:ou_123",
+      originatingAccountId: "work",
+      originatingThreadId: "thread:om_123",
+    });
+
+    await coordinator.deliver("block", { text: "hello" }, { skipTts: true });
+
+    const [[routeParams]] = deliveryMocks.routeReply.mock.calls as unknown as Array<
+      [{ accountId?: string; threadId?: string | number }]
+    >;
+    expect(routeParams.accountId).toBe("work");
+    expect(routeParams.threadId).toBe("thread:om_123");
   });
 
   it("routes ACP replies when cfg.channels is missing", async () => {
-    await expectVisibleChatBlockRoutesToAccount({} as OpenClawConfig, undefined);
+    await expectVisibleChatBlockRoutesToAccount({} as OpenClawConfig, "default");
   });
 
   it("treats routed plugin-owned block text as visible", async () => {
@@ -804,6 +921,36 @@ describe("createAcpDispatchDeliveryCoordinator", () => {
     expect(coordinator.hasDeliveredVisibleText()).toBe(true);
     expect(coordinator.hasFailedVisibleTextDelivery()).toBe(false);
     expect(coordinator.getRoutedCounts().block).toBe(1);
+  });
+
+  it("records partial routed block delivery as visible and failed without fallback", async () => {
+    deliveryMocks.routeReply.mockResolvedValueOnce({
+      ok: false,
+      delivered: true,
+      partialFailure: true,
+      error: "second chunk failed",
+      messageId: "visible-1",
+    });
+    const coordinator = createVisibleChatAcpCoordinator(createAcpTestConfig());
+
+    const delivered = await coordinator.deliver("block", { text: "hello" }, { skipTts: true });
+
+    expect(delivered).toBe(true);
+    expect(coordinator.hasDeliveredVisibleText()).toBe(true);
+    expect(coordinator.hasFailedVisibleTextDelivery()).toBe(true);
+    expect(coordinator.getRoutedCounts().block).toBe(1);
+  });
+
+  it("does not count a successful routed no-op as ACP delivery", async () => {
+    deliveryMocks.routeReply.mockResolvedValueOnce({ ok: true, delivered: false });
+    const coordinator = createVisibleChatAcpCoordinator(createAcpTestConfig());
+
+    const delivered = await coordinator.deliver("block", { text: "hello" }, { skipTts: true });
+
+    expect(delivered).toBe(false);
+    expect(coordinator.hasDeliveredVisibleText()).toBe(false);
+    expect(coordinator.hasFailedVisibleTextDelivery()).toBe(false);
+    expect(coordinator.getRoutedCounts().block).toBe(0);
   });
 
   it("treats hook-suppressed routed ACP block text as handled", async () => {

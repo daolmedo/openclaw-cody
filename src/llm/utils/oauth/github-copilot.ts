@@ -2,13 +2,17 @@
  * GitHub Copilot OAuth flow
  */
 
+import { resolveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
+import {
+  assertOkOrThrowProviderError,
+  readProviderJsonResponse,
+} from "../../../agents/provider-http-errors.js";
 import {
   nonNegativeSecondsToSafeMilliseconds,
   positiveSecondsToSafeMilliseconds,
   resolveExpiresAtMsFromDurationSeconds,
   resolveExpiresAtMsFromEpochSeconds,
 } from "../../../infra/parse-finite-number.js";
-import { resolveTimerTimeoutMs } from "../../../shared/number-coercion.js";
 import type { Model } from "../../types.js";
 import type { OAuthCredentials, OAuthLoginCallbacks, OAuthProviderInterface } from "./types.js";
 
@@ -175,6 +179,8 @@ async function fetchResponse(
   }
 }
 
+// Shared 16 MiB bounded reader — a hostile OAuth endpoint cannot force the
+// runtime to buffer an unbounded body through `.text()` / `.json()`.
 async function fetchJson(
   url: string,
   init: RequestInit,
@@ -182,11 +188,9 @@ async function fetchJson(
   options: CopilotRequestOptions = {},
 ): Promise<unknown> {
   const response = await fetchResponse(url, init, operation, options);
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`${response.status} ${response.statusText}: ${text}`);
-  }
-  return response.json();
+  const label = `GitHub Copilot ${operation}`;
+  await assertOkOrThrowProviderError(response, label);
+  return readProviderJsonResponse(response, label);
 }
 
 async function startDeviceFlow(
@@ -405,9 +409,10 @@ async function enableGitHubCopilotModel(
 ): Promise<boolean> {
   const baseUrl = getGitHubCopilotBaseUrl(token, enterpriseDomain);
   const url = `${baseUrl}/models/${modelId}/policy`;
+  let response: Response | undefined;
 
   try {
-    const response = await fetchResponse(
+    response = await fetchResponse(
       url,
       {
         method: "POST",
@@ -426,6 +431,8 @@ async function enableGitHubCopilotModel(
     return response.ok;
   } catch {
     return false;
+  } finally {
+    await response?.body?.cancel().catch(() => undefined);
   }
 }
 
@@ -584,5 +591,6 @@ export const githubCopilotOAuthProvider: OAuthProviderInterface = {
 export const testing = {
   enableGitHubCopilotModel,
   listGitHubCopilotModelIds,
+  pollForGitHubAccessToken,
   startDeviceFlow,
 };

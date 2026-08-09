@@ -1,5 +1,7 @@
+// Discord tests cover provider plugin behavior.
 import { EventEmitter } from "node:events";
 import type { ChannelRuntimeSurface } from "openclaw/plugin-sdk/channel-contract";
+import { createPluginRuntimeMock } from "openclaw/plugin-sdk/channel-test-helpers";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { RateLimitError } from "../internal/discord.js";
@@ -65,6 +67,7 @@ function createTestChannelRuntime(): ChannelRuntimeSurface {
     },
   };
   return {
+    ...createPluginRuntimeMock().channel,
     runtimeContexts,
   };
 }
@@ -352,7 +355,7 @@ describe("monitorDiscordProvider", () => {
     expect(createdBindingManagers[0]?.stop).toHaveBeenCalledTimes(1);
   });
 
-  it("disconnects the shared gateway and suppresses late gateway errors when startup fails before lifecycle begins", async () => {
+  it("disconnects the shared gateway and keeps a late error guard when startup fails before lifecycle begins", async () => {
     const disconnect = vi.fn();
     const emitter = new EventEmitter();
     const gateway = { emitter, disconnect, isConnected: false };
@@ -373,13 +376,10 @@ describe("monitorDiscordProvider", () => {
 
     expect(monitorLifecycleMock).not.toHaveBeenCalled();
     expect(disconnect).toHaveBeenCalledTimes(1);
-    expect(
-      emitter.emit("error", new Error("Max reconnect attempts (0) reached after code 1005")),
-    ).toBe(true);
-    expectMockLogContains(
-      runtime.error,
-      "suppressed late gateway reconnect-exhausted error after dispose",
-    );
+    expect(emitter.listenerCount("error")).toBe(1);
+    expect(() =>
+      emitter.emit("error", new Error("late gateway error after cleanup")),
+    ).not.toThrow();
   });
 
   it("fails closed before lifecycle when Discord bot identity fetch rejects", async () => {
@@ -706,6 +706,45 @@ describe("monitorDiscordProvider", () => {
         throw new Error("ACP status check did not receive an abort signal");
       }
       expect(firstCall.signal.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("treats out-of-range running ACP activity timestamps as stale on probe timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(10 * 60 * 1000);
+      getAcpSessionStatusMock.mockImplementation(
+        ({ signal }: { signal?: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+          }),
+      );
+
+      await monitorDiscordProvider({
+        config: baseConfig(),
+        runtime: baseRuntime(),
+      });
+
+      const probePromise = getHealthProbe()({
+        cfg: baseConfig(),
+        accountId: "default",
+        sessionKey: "agent:codex:acp:timeout-invalid-activity",
+        binding: {} as never,
+        session: {
+          acp: {
+            state: "running",
+            lastActivityAt: Number.MAX_SAFE_INTEGER,
+          },
+        } as never,
+      });
+
+      await vi.advanceTimersByTimeAsync(8_100);
+      await expect(probePromise).resolves.toEqual({
+        status: "stale",
+        reason: "status-timeout-running-stale",
+      });
     } finally {
       vi.useRealTimers();
     }

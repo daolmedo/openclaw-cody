@@ -1,3 +1,6 @@
+/**
+ * OpenClaw stdio transport wrapper for MCP server subprocesses.
+ */
 import { spawn, type ChildProcess } from "node:child_process";
 import process from "node:process";
 import { PassThrough } from "node:stream";
@@ -8,7 +11,7 @@ import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { killProcessTree, signalProcessTree } from "../process/kill-tree.js";
 import { prepareOomScoreAdjustedSpawn } from "../process/linux-oom-score.js";
 
-export type OpenClawStdioServerParameters = {
+type OpenClawStdioServerParameters = {
   command: string;
   args?: string[];
   env?: Record<string, string>;
@@ -83,6 +86,7 @@ export class OpenClawStdioClientTransport implements Transport {
       });
       child.stdout?.on("error", (error: Error) => this.onerror?.(error));
       if (this.stderrStream && child.stderr) {
+        child.stderr.on("error", (error: Error) => this.onerror?.(error));
         child.stderr.pipe(this.stderrStream);
       }
     });

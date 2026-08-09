@@ -1,12 +1,15 @@
+// Telegram tests cover action runtime plugin behavior.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { DurableMessageBatchSendResult } from "openclaw/plugin-sdk/channel-outbound";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { resolveStorePath } from "openclaw/plugin-sdk/session-store-runtime";
 import { captureEnv } from "openclaw/plugin-sdk/test-env";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleTelegramAction, telegramActionRuntime } from "./action-runtime.js";
 import { beginTelegramInboundEventDeliveryCorrelation } from "./inbound-event-delivery.js";
+import { runWithTelegramPeerBotTurn } from "./peer-bot-turn.js";
 import {
   getTopicName,
   resetTopicNameCacheForTest,
@@ -31,11 +34,14 @@ const sendDurableMessageBatch = vi.fn(
       text?: string;
       mediaUrl?: string;
       mediaUrls?: string[];
+      replyToId?: string;
       audioAsVoice?: boolean;
       delivery?: {
         pin?: true | { enabled?: boolean; notify?: boolean; required?: boolean };
       };
-      channelData?: { telegram?: { buttons?: unknown; quoteText?: string } };
+      channelData?: {
+        telegram?: { buttons?: unknown; quoteText?: string; standardMessage?: boolean };
+      };
     }>;
     replyToId?: string;
     threadId?: string | number;
@@ -73,16 +79,17 @@ const sendDurableMessageBatch = vi.fn(
         : undefined) ??
       cfg.channels?.telegram?.botToken ??
       process.env.TELEGRAM_BOT_TOKEN;
+    const replyToId = payload.replyToId ?? params.replyToId;
     const baseOptions = {
       cfg: params.cfg,
       token,
       accountId: params.accountId,
       gatewayClientScopes: params.gatewayClientScopes,
-      replyToMessageId:
-        params.replyToId == null ? undefined : Number.parseInt(params.replyToId, 10),
+      replyToMessageId: replyToId == null ? undefined : Number.parseInt(replyToId, 10),
       messageThreadId:
         params.threadId == null ? undefined : Number.parseInt(String(params.threadId), 10),
       quoteText: telegramData?.quoteText,
+      standardMessage: telegramData?.standardMessage,
       asVoice: payload.audioAsVoice,
       silent: params.silent,
       forceDocument: params.forceDocument,
@@ -148,6 +155,11 @@ const sendStickerTelegram = vi.fn(async () => ({
 }));
 const deleteMessageTelegram = vi.fn(async () => ({ ok: true }));
 const editMessageTelegram = vi.fn(async () => ({
+  ok: true,
+  messageId: "456",
+  chatId: "123",
+}));
+const editMessageReplyMarkupTelegram = vi.fn(async () => ({
   ok: true,
   messageId: "456",
   chatId: "123",
@@ -229,20 +241,6 @@ function resultDetails(result: Awaited<ReturnType<typeof handleTelegramAction>>)
   return requireRecord(result.details, "Telegram action details");
 }
 
-function readDurableQueueEntries(stateDir: string): Record<string, unknown>[] {
-  const queueDir = path.join(stateDir, "delivery-queue");
-  if (!fs.existsSync(queueDir)) {
-    return [];
-  }
-  return fs
-    .readdirSync(queueDir)
-    .filter((name) => name.endsWith(".json"))
-    .map((name) => JSON.parse(fs.readFileSync(path.join(queueDir, name), "utf-8"))) as Record<
-    string,
-    unknown
-  >[];
-}
-
 describe("handleTelegramAction", () => {
   const defaultReactionAction = {
     action: "react",
@@ -320,6 +318,7 @@ describe("handleTelegramAction", () => {
       sendStickerTelegram,
       deleteMessageTelegram,
       editMessageTelegram,
+      editMessageReplyMarkupTelegram,
       editForumTopicTelegram,
       pinMessageTelegram,
       createForumTopicTelegram,
@@ -331,6 +330,7 @@ describe("handleTelegramAction", () => {
     sendStickerTelegram.mockClear();
     deleteMessageTelegram.mockClear();
     editMessageTelegram.mockClear();
+    editMessageReplyMarkupTelegram.mockClear();
     editForumTopicTelegram.mockClear();
     pinMessageTelegram.mockClear();
     createForumTopicTelegram.mockClear();
@@ -650,14 +650,402 @@ describe("handleTelegramAction", () => {
     });
   });
 
+  it("keeps an explicit peer-bot DM private while using standard delivery", async () => {
+    await runWithTelegramPeerBotTurn(
+      {
+        accountId: "default",
+        chatId: "-123",
+        messageId: 456,
+        senderAliases: ["@peer_bot"],
+        senderId: "7654321",
+      },
+      async () =>
+        await handleTelegramAction(
+          {
+            action: "sendMessage",
+            to: "@peer_bot",
+            content: "Visible to the peer bot",
+          },
+          telegramConfig(),
+          { sessionKey: "agent:main:telegram:group:-123" },
+        ),
+    );
+
+    const durableCall = mockCall(sendDurableMessageBatch, 0, "peer-bot durable message");
+    expect(requireRecord(durableCall[0], "peer-bot durable message params")).toMatchObject({
+      to: "7654321",
+      payloads: [
+        {
+          text: "Visible to the peer bot",
+          channelData: { telegram: { standardMessage: true } },
+        },
+      ],
+    });
+    expect(
+      requireRecord(durableCall[0], "peer-bot durable message params").replyToId,
+    ).toBeUndefined();
+    expect(mockCall(sendMessageTelegram, 0, "peer-bot message")).toMatchObject([
+      "7654321",
+      "Visible to the peer bot",
+      { replyToMessageId: undefined, standardMessage: true },
+    ]);
+  });
+
+  it("recognizes the peer bot's canonical numeric sender target", async () => {
+    await runWithTelegramPeerBotTurn(
+      {
+        accountId: "default",
+        chatId: "-123",
+        messageId: 456,
+        senderAliases: ["@peer_bot"],
+        senderId: "7654321",
+      },
+      async () =>
+        await handleTelegramAction(
+          { action: "sendMessage", to: "7654321", content: "Numeric private reply" },
+          telegramConfig(),
+        ),
+    );
+
+    expect(mockCall(sendMessageTelegram, 0, "numeric peer target")).toMatchObject([
+      "7654321",
+      "Numeric private reply",
+      { replyToMessageId: undefined, standardMessage: true },
+    ]);
+  });
+
+  it("does not equate distinct short bot usernames when generic lookup normalization fails", async () => {
+    await runWithTelegramPeerBotTurn(
+      {
+        accountId: "default",
+        chatId: "-123",
+        messageId: 456,
+        senderAliases: ["@gif"],
+        senderId: "7654321",
+      },
+      async () =>
+        await handleTelegramAction(
+          { action: "sendMessage", to: "@wiki", content: "Different short bot" },
+          telegramConfig(),
+        ),
+    );
+
+    expect(mockCall(sendMessageTelegram, 0, "distinct short bot target")).toMatchObject([
+      "@wiki",
+      "Different short bot",
+      { standardMessage: undefined },
+    ]);
+  });
+
+  it("canonicalizes a source-group alias for same-chat peer delivery", async () => {
+    await runWithTelegramPeerBotTurn(
+      {
+        accountId: "default",
+        chatAliases: ["@source_group"],
+        chatId: "-123",
+        messageId: 456,
+        senderAliases: ["@peer_bot"],
+        senderId: "7654321",
+      },
+      async () =>
+        await handleTelegramAction(
+          { action: "sendMessage", to: "@source_group", content: "Group reply" },
+          telegramConfig(),
+        ),
+    );
+
+    expect(mockCall(sendMessageTelegram, 0, "peer source-group message")).toMatchObject([
+      "-123",
+      "Group reply",
+      { replyToMessageId: 456, standardMessage: true },
+    ]);
+    expect(
+      requireRecord(
+        mockCall(sendDurableMessageBatch, 0, "peer source-group durable message")[0],
+        "peer source-group durable params",
+      ),
+    ).toMatchObject({ replyToId: "456", replyToMode: "all" });
+  });
+
+  it("preserves explicit replyToMode off for same-chat peer delivery", async () => {
+    await runWithTelegramPeerBotTurn(
+      {
+        accountId: "default",
+        chatId: "-123",
+        messageId: 456,
+        senderId: "7654321",
+      },
+      async () =>
+        await handleTelegramAction(
+          { action: "sendMessage", to: "-123", content: "Unthreaded group reply" },
+          telegramConfig({ replyToMode: "off" }),
+        ),
+    );
+
+    expect(mockCall(sendMessageTelegram, 0, "unthreaded peer source-group message")).toMatchObject([
+      "-123",
+      "Unthreaded group reply",
+      { replyToMessageId: undefined, standardMessage: true },
+    ]);
+  });
+
+  it("preserves explicit peer reply targets when replyToMode is off", async () => {
+    await runWithTelegramPeerBotTurn(
+      {
+        accountId: "default",
+        chatId: "-123",
+        messageId: 456,
+        senderId: "7654321",
+      },
+      async () =>
+        await handleTelegramAction(
+          {
+            action: "sendMessage",
+            to: "-123",
+            content: "Explicit group reply",
+            replyToMessageId: 999,
+          },
+          telegramConfig({ replyToMode: "off" }),
+        ),
+    );
+
+    const durableParams = requireRecord(
+      mockCall(sendDurableMessageBatch, 0, "explicit peer reply")[0],
+      "explicit peer reply params",
+    );
+    expect(durableParams.payloads).toEqual([
+      expect.objectContaining({ text: "Explicit group reply", replyToId: "999" }),
+    ]);
+    expect(durableParams.replyToId).toBeUndefined();
+  });
+
+  it("inherits the source topic when a peer-bot DM uses its username alias", async () => {
+    await runWithTelegramPeerBotTurn(
+      {
+        accountId: "default",
+        chatAliases: ["@peer_bot"],
+        chatId: "123",
+        messageId: 456,
+        senderId: "123",
+        threadId: 7,
+      },
+      async () =>
+        await handleTelegramAction(
+          { action: "sendMessage", to: "@peer_bot", content: "Topic reply" },
+          telegramConfig(),
+          { sessionKey: "agent:main:telegram:direct:123:topic:7" },
+        ),
+    );
+
+    expect(mockCall(sendMessageTelegram, 0, "peer topic message")).toMatchObject([
+      "123",
+      "Topic reply",
+      { messageThreadId: 7, replyToMessageId: 456, standardMessage: true },
+    ]);
+  });
+
+  it.each(["peer_bot", "https://t.me/peer_bot"])(
+    "normalizes peer-bot username target %s before alias matching",
+    async (to) => {
+      await runWithTelegramPeerBotTurn(
+        {
+          accountId: "default",
+          chatAliases: ["@peer_bot"],
+          chatId: "123",
+          messageId: 456,
+          senderId: "123",
+        },
+        async () =>
+          await handleTelegramAction(
+            { action: "sendMessage", to, content: "Normalized alias reply" },
+            telegramConfig(),
+          ),
+      );
+
+      expect(mockCall(sendMessageTelegram, 0, "normalized peer alias")).toMatchObject([
+        "123",
+        "Normalized alias reply",
+        { replyToMessageId: 456, standardMessage: true },
+      ]);
+    },
+  );
+
+  it("does not canonicalize a peer alias for a different Telegram account", async () => {
+    await runWithTelegramPeerBotTurn(
+      {
+        accountId: "default",
+        chatId: "-123",
+        messageId: 456,
+        senderAliases: ["@peer_bot"],
+        senderId: "7654321",
+      },
+      async () =>
+        await handleTelegramAction(
+          {
+            accountId: "other",
+            action: "sendMessage",
+            to: "@peer_bot",
+            content: "Separate account message",
+          },
+          telegramConfig({ accounts: { other: { botToken: "other-tok" } } }),
+        ),
+    );
+
+    expect(mockCall(sendMessageTelegram, 0, "cross-account peer message")).toMatchObject([
+      "@peer_bot",
+      "Separate account message",
+      { accountId: "other", replyToMessageId: undefined, standardMessage: undefined },
+    ]);
+  });
+
+  it("matches peer turns through normalized Telegram account IDs", async () => {
+    await runWithTelegramPeerBotTurn(
+      {
+        accountId: "work",
+        chatId: "-123",
+        messageId: 456,
+        senderAliases: ["@peer_bot"],
+        senderId: "7654321",
+      },
+      async () =>
+        await handleTelegramAction(
+          {
+            accountId: "Work",
+            action: "sendMessage",
+            to: "@peer_bot",
+            content: "Normalized account reply",
+          },
+          telegramConfig({ accounts: { work: { botToken: "work-tok" } } }),
+        ),
+    );
+
+    expect(mockCall(sendMessageTelegram, 0, "normalized account peer message")).toMatchObject([
+      "7654321",
+      "Normalized account reply",
+      { accountId: "Work", standardMessage: true },
+    ]);
+  });
+
+  it("validates peer aliases using the canonical chat for scoped inline buttons", async () => {
+    await runWithTelegramPeerBotTurn(
+      {
+        accountId: "default",
+        chatAliases: ["@peer_bot"],
+        chatId: "123",
+        messageId: 456,
+        senderId: "123",
+      },
+      async () =>
+        await handleTelegramAction(
+          {
+            action: "sendMessage",
+            to: "@peer_bot",
+            content: "Choose",
+            presentation: {
+              blocks: [{ type: "buttons", buttons: [{ label: "Ok", value: "cmd:ok" }] }],
+            },
+          },
+          telegramConfig({ capabilities: { inlineButtons: "dm" } }),
+        ),
+    );
+
+    expect(mockCall(sendMessageTelegram, 0, "peer inline buttons")[0]).toBe("123");
+  });
+
+  it("allows DM-scoped buttons for an explicit peer-bot DM from a group turn", async () => {
+    await runWithTelegramPeerBotTurn(
+      {
+        accountId: "default",
+        chatId: "-123",
+        messageId: 456,
+        senderAliases: ["@peer_bot"],
+        senderId: "7654321",
+      },
+      async () =>
+        await handleTelegramAction(
+          {
+            action: "sendMessage",
+            to: "@peer_bot",
+            content: "Choose privately",
+            presentation: {
+              blocks: [{ type: "buttons", buttons: [{ label: "Ok", value: "cmd:ok" }] }],
+            },
+          },
+          telegramConfig({ capabilities: { inlineButtons: "dm" } }),
+        ),
+    );
+
+    expect(mockCall(sendMessageTelegram, 0, "peer private buttons")).toMatchObject([
+      "7654321",
+      "Choose privately",
+      { replyToMessageId: undefined, standardMessage: true },
+    ]);
+  });
+
+  it("does not apply peer-bot delivery to another Telegram topic", async () => {
+    await runWithTelegramPeerBotTurn(
+      {
+        accountId: "default",
+        chatId: "-123",
+        messageId: 456,
+        senderId: "7654321",
+        threadId: 7,
+      },
+      async () =>
+        await handleTelegramAction(
+          {
+            action: "sendMessage",
+            to: "-123:topic:8",
+            content: "Different topic",
+          },
+          telegramConfig(),
+          { sessionKey: "agent:main:telegram:group:-123:topic:7" },
+        ),
+    );
+
+    const durableCall = requireRecord(
+      mockCall(sendDurableMessageBatch, 0, "cross-topic message")[0],
+      "cross-topic message params",
+    );
+    expect(durableCall.replyToId).toBeUndefined();
+    expect(durableCall.payloads).toEqual([{ text: "Different topic" }]);
+  });
+
+  it("preserves peer-bot delivery for a queued follow-up", async () => {
+    const sessionKey = "agent:main:telegram:group:-123";
+    await runWithTelegramPeerBotTurn(
+      { accountId: "default", chatId: "-123", messageId: 456, senderId: "7654321" },
+      async () =>
+        await handleTelegramAction(
+          { action: "sendMessage", to: "-123", content: "Queued reply" },
+          telegramConfig(),
+          { sessionKey },
+        ),
+    );
+
+    const durableCall = requireRecord(
+      mockCall(sendDurableMessageBatch, 0, "queued peer-bot message")[0],
+      "queued peer-bot message params",
+    );
+    expect(durableCall).toMatchObject({
+      replyToId: "456",
+      payloads: [{ text: "Queued reply", channelData: { telegram: { standardMessage: true } } }],
+    });
+  });
+
   it("persists sendMessage action deliveries before Telegram platform send", async () => {
     const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-telegram-action-durable-"));
-    const { createOutboundTestPlugin, createTestRegistry, setActivePluginRegistry } =
-      await import("openclaw/plugin-sdk/plugin-test-runtime");
+    const {
+      createOutboundTestPlugin,
+      createTestRegistry,
+      readQueuedDeliveryEntriesForTest,
+      setActivePluginRegistry,
+    } = await import("openclaw/plugin-sdk/plugin-test-runtime");
+    const readDurableQueueEntries = () => readQueuedDeliveryEntriesForTest(stateDir);
     const sendText = vi
       .fn()
       .mockImplementationOnce(async () => {
-        const entries = readDurableQueueEntries(stateDir);
+        const entries = readDurableQueueEntries();
         expect(entries).toHaveLength(1);
         expect(entries[0]).toMatchObject({
           channel: "telegram",
@@ -675,7 +1063,7 @@ describe("handleTelegramAction", () => {
         throw new Error("telegram timeout");
       })
       .mockImplementationOnce(async () => {
-        const entries = readDurableQueueEntries(stateDir);
+        const entries = readDurableQueueEntries();
         const liveEntry = entries.find((entry) =>
           JSON.stringify(entry.payloads).includes("delivers after queue write"),
         );
@@ -736,7 +1124,7 @@ describe("handleTelegramAction", () => {
         ),
       ).rejects.toThrow("telegram timeout");
 
-      const retryableEntries = readDurableQueueEntries(stateDir);
+      const retryableEntries = readDurableQueueEntries();
       expect(retryableEntries).toHaveLength(1);
       expect(retryableEntries[0]).toMatchObject({
         payloads: [
@@ -763,8 +1151,8 @@ describe("handleTelegramAction", () => {
         ok: true,
         messageId: "tg-ok",
       });
-      expect(readDurableQueueEntries(stateDir)).toHaveLength(1);
-      expect(readDurableQueueEntries(stateDir)[0]).toMatchObject({
+      expect(readDurableQueueEntries()).toHaveLength(1);
+      expect(readDurableQueueEntries()[0]).toMatchObject({
         payloads: [
           {
             text: "times out after queue write",
@@ -811,6 +1199,44 @@ describe("handleTelegramAction", () => {
       telegramConfig(),
       { sessionKey: "telegram-session" },
     );
+    expect(count).toBe(1);
+    end();
+  });
+
+  it("marks the matching inbound event delivered after a partial send", async () => {
+    const partialError = new Error("second chunk failed");
+    const partialResult: DurableMessageBatchSendResult = {
+      status: "partial_failed",
+      results: [{ channel: "telegram", messageId: "789", chatId: "123" }],
+      receipt: {
+        primaryPlatformMessageId: "789",
+        platformMessageIds: ["789"],
+        parts: [{ platformMessageId: "789", kind: "text", index: 0 }],
+        sentAt: 1,
+      },
+      error: partialError,
+      sentBeforeError: true,
+    };
+    telegramActionRuntime.sendDurableMessageBatch = vi.fn(async () => partialResult);
+    let count = 0;
+    const end = beginTelegramInboundEventDeliveryCorrelation("telegram-session", {
+      outboundTo: "@testchannel",
+      markInboundEventDelivered: () => {
+        count += 1;
+      },
+    });
+
+    await expect(
+      handleTelegramAction(
+        {
+          action: "sendMessage",
+          to: "@testchannel",
+          content: "Hello, Telegram!",
+        },
+        telegramConfig(),
+        { sessionKey: "telegram-session" },
+      ),
+    ).rejects.toBe(partialError);
     expect(count).toBe(1);
     end();
   });
@@ -1428,6 +1854,50 @@ describe("handleTelegramAction", () => {
     expect(requireRecord(call[2], "button-only fallback options").buttons).toEqual([
       [{ text: "Approve", callback_data: "approve" }],
     ]);
+  });
+
+  it("edits reply markup when editMessage only changes buttons", async () => {
+    await handleTelegramAction(
+      {
+        action: "editMessage",
+        chatId: "123456",
+        messageId: 321,
+        presentation: {
+          blocks: [
+            {
+              type: "buttons",
+              buttons: [{ label: "Open", url: "https://example.com" }],
+            },
+          ],
+        },
+      },
+      telegramConfig({ capabilities: { inlineButtons: "all" } }),
+    );
+
+    expect(editMessageTelegram).not.toHaveBeenCalled();
+    const call = mockCall(editMessageReplyMarkupTelegram, 0, "reply markup edit");
+    expect(call[0]).toBe("123456");
+    expect(call[1]).toBe(321);
+    expect(call[2]).toEqual([[{ text: "Open", url: "https://example.com" }]]);
+    expect(requireRecord(call[3], "reply markup edit options").token).toBe("tok");
+  });
+
+  it("uses Telegram caption edits when editMessage receives a caption", async () => {
+    await handleTelegramAction(
+      {
+        action: "editMessage",
+        chatId: "123456",
+        messageId: 321,
+        caption: "Updated caption",
+      },
+      telegramConfig(),
+    );
+
+    const call = mockCall(editMessageTelegram, 0, "caption edit");
+    expect(call[0]).toBe("123456");
+    expect(call[1]).toBe(321);
+    expect(call[2]).toBe("Updated caption");
+    expect(requireRecord(call[3], "caption edit options").editMode).toBe("caption");
   });
 
   it("pins action sends when delivery pin is requested", async () => {

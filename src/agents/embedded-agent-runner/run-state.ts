@@ -1,19 +1,30 @@
+/**
+ * Shared process-local state for active and abandoned embedded-agent runs.
+ */
 import type { SourceReplyDeliveryMode } from "../../auto-reply/get-reply-options.types.js";
 import {
   getActiveReplyRunCount,
   listActiveReplyRunSessionKeys,
   listActiveReplyRunSessionIds,
+  resolveActiveReplyRunSessionId,
 } from "../../auto-reply/reply/reply-run-registry.js";
 import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 
+/**
+ * Shared process state for embedded-agent runs, queues, and snapshots.
+ *
+ * The maps are global-singleton backed so reloads and lazy imports inside the same gateway process
+ * do not split active-run bookkeeping.
+ */
 export type EmbeddedAgentQueueHandle = {
   kind?: "embedded";
   queueMessage: (text: string, options?: EmbeddedAgentQueueMessageOptions) => Promise<void>;
   isStreaming: () => boolean;
+  isAbortable?: () => boolean;
   isCompacting: () => boolean;
   supportsTranscriptCommitWait?: boolean;
   cancel?: (reason?: "user_abort" | "restart" | "superseded") => void;
-  abort: () => void;
+  abort: (reason?: "restart") => void;
   sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
 };
 
@@ -29,13 +40,6 @@ export type ActiveEmbeddedRunSnapshot = {
   transcriptLeafId: string | null;
   messages?: unknown[];
   inFlightPrompt?: string;
-};
-
-export type EmbeddedRunModelSwitchRequest = {
-  provider: string;
-  model: string;
-  authProfileId?: string;
-  authProfileIdSource?: "auto" | "user";
 };
 
 export type EmbeddedRunWaiter = {
@@ -62,7 +66,6 @@ const embeddedRunState = resolveGlobalSingleton(EMBEDDED_RUN_STATE_KEY, () => ({
   abandonedRunSessionIdsByKey: new Map<string, string>(),
   abandonedRunSessionIdsByFile: new Map<string, string>(),
   waiters: new Map<string, Set<EmbeddedRunWaiter>>(),
-  modelSwitchRequests: new Map<string, EmbeddedRunModelSwitchRequest>(),
 }));
 
 export const ACTIVE_EMBEDDED_RUNS =
@@ -89,10 +92,8 @@ export const ABANDONED_EMBEDDED_RUN_SESSION_IDS_BY_FILE =
 export const EMBEDDED_RUN_WAITERS =
   embeddedRunState.waiters ??
   (embeddedRunState.waiters = new Map<string, Set<EmbeddedRunWaiter>>());
-export const EMBEDDED_RUN_MODEL_SWITCH_REQUESTS =
-  embeddedRunState.modelSwitchRequests ??
-  (embeddedRunState.modelSwitchRequests = new Map<string, EmbeddedRunModelSwitchRequest>());
 
+/** Counts active embedded runs while including auto-reply registry runs for shared sessions. */
 export function getActiveEmbeddedRunCount(): number {
   let activeCount = ACTIVE_EMBEDDED_RUNS.size;
   for (const sessionId of listActiveReplyRunSessionIds()) {
@@ -103,6 +104,7 @@ export function getActiveEmbeddedRunCount(): number {
   return Math.max(activeCount, getActiveReplyRunCount());
 }
 
+/** Lists active embedded-run session keys from both embedded and auto-reply registries. */
 export function listActiveEmbeddedRunSessionKeys(): string[] {
   return [
     ...new Set([
@@ -112,6 +114,7 @@ export function listActiveEmbeddedRunSessionKeys(): string[] {
   ].toSorted((a, b) => a.localeCompare(b));
 }
 
+/** Lists active embedded-run session ids from all embedded-run lookup maps. */
 export function listActiveEmbeddedRunSessionIds(): string[] {
   return [
     ...new Set([
@@ -121,4 +124,16 @@ export function listActiveEmbeddedRunSessionIds(): string[] {
       ...listActiveReplyRunSessionIds(),
     ]),
   ].toSorted((a, b) => a.localeCompare(b));
+}
+
+/** Resolves the current session id for an active run after resets or compaction. */
+export function resolveActiveEmbeddedRunSessionId(sessionKey: string): string | undefined {
+  const normalizedSessionKey = sessionKey.trim();
+  if (!normalizedSessionKey) {
+    return undefined;
+  }
+  return (
+    resolveActiveReplyRunSessionId(normalizedSessionKey) ??
+    ACTIVE_EMBEDDED_RUN_SESSION_IDS_BY_KEY.get(normalizedSessionKey)
+  );
 }

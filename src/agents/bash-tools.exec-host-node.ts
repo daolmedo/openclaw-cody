@@ -1,10 +1,17 @@
+/**
+ * Node-host exec orchestration.
+ * Combines local policy, remote node policy, auto-review, approval follow-ups,
+ * and `node.invoke system.run` execution for host=node calls.
+ */
 import { randomUUID } from "node:crypto";
 import { APPROVALS_SCOPE, WRITE_SCOPE } from "../gateway/operator-scopes.js";
 import type { InterpreterInlineEvalHit } from "../infra/command-analysis/inline-eval.js";
 import {
   type ExecSecurity,
+  maxAsk,
   requiresExecApproval,
   resolveExecApprovalAllowedDecisions,
+  resolveExecApprovalUnavailableDecisions,
 } from "../infra/exec-approvals.js";
 import { defaultExecAutoReviewer, type ExecAutoReviewInput } from "../infra/exec-auto-review.js";
 import {
@@ -31,8 +38,6 @@ import {
 import type { ExecToolDetails } from "./bash-tools.exec-types.js";
 import type { AgentToolResult } from "./runtime/index.js";
 import { callGatewayTool } from "./tools/gateway.js";
-
-export type { ExecuteNodeHostCommandParams } from "./bash-tools.exec-host-node.types.js";
 
 const APPROVED_NODE_INVOKE_SCOPES = [WRITE_SCOPE, APPROVALS_SCOPE];
 
@@ -74,6 +79,7 @@ function nodePolicyBlocksAutoReview(params: {
   nodeSecurity?: ExecSecurity;
   nodeAsk?: "off" | "on-miss" | "always";
 }): boolean {
+  // Remote node policy can be stricter than local host policy; do not auto-approve across that gap.
   return (
     !params.nodeApprovalPolicyKnown ||
     params.nodeAsk === "always" ||
@@ -82,6 +88,10 @@ function nodePolicyBlocksAutoReview(params: {
   );
 }
 
+/**
+ * Executes a command on a remote node, requesting approval when policy requires it.
+ * Node-host approval combines caller policy and remote node approval snapshots.
+ */
 export async function executeNodeHostCommand(
   params: ExecuteNodeHostCommandParams,
 ): Promise<AgentToolResult<ExecToolDetails>> {
@@ -92,6 +102,7 @@ export async function executeNodeHostCommand(
     host: "node",
   });
   const target = await resolveNodeExecutionTarget(params);
+  params.signal?.throwIfAborted();
   if (
     shouldSkipNodeApprovalPrepare({
       hostSecurity,
@@ -110,6 +121,7 @@ export async function executeNodeHostCommand(
     hostSecurity,
     hostAsk,
   });
+  params.signal?.throwIfAborted();
   const {
     analysisOk,
     allowlistSatisfied,
@@ -120,7 +132,20 @@ export async function executeNodeHostCommand(
     inlineEvalHit,
     requiresSecurityAuditSuppressionApproval,
     autoReviewArgv,
+    allowAlwaysPersistence,
   } = approvalAnalysis;
+  const approvalDecisionAsk =
+    nodeApprovalPolicyKnown && nodeAsk !== undefined ? maxAsk(hostAsk, nodeAsk) : "always";
+  const allowedDecisions = resolveExecApprovalAllowedDecisions({
+    ask: approvalDecisionAsk,
+    allowAlwaysPersistence,
+  });
+  const unavailableDecisions = resolveExecApprovalUnavailableDecisions({
+    ask: approvalDecisionAsk,
+    allowAlwaysPersistence,
+  });
+  const unavailableDecisionRequestParams =
+    unavailableDecisions.length > 0 ? { unavailableDecisions } : {};
   const requiresAsk =
     requiresExecApproval({
       ask: hostAsk,
@@ -149,11 +174,15 @@ export async function executeNodeHostCommand(
       nodeId: target.nodeId,
       security: hostSecurity,
       ask: hostAsk,
+      ...unavailableDecisionRequestParams,
       commandHighlighting: params.commandHighlighting,
       ...buildExecApprovalRequesterContext({
         agentId: prepared.agentId,
         sessionKey: prepared.sessionKey,
       }),
+      approvalReviewerDeviceIds: params.approvalReviewerDeviceId
+        ? [params.approvalReviewerDeviceId]
+        : undefined,
       ...(options.requireDeliveryRoute !== undefined
         ? { requireDeliveryRoute: options.requireDeliveryRoute }
         : {}),
@@ -213,7 +242,9 @@ export async function executeNodeHostCommand(
           sessionKey: prepared.sessionKey,
         },
       });
-      if (decision.decision === "allow-once") {
+      params.signal?.throwIfAborted();
+      const autoReviewAllowed = decision.decision === "allow-once" && decision.risk === "low";
+      if (autoReviewAllowed) {
         const approvalId = randomUUID();
         await registerNodeApproval(approvalId, {
           requireDeliveryRoute: false,
@@ -229,7 +260,7 @@ export async function executeNodeHostCommand(
         inlineApprovalDecision = "allow-once";
         inlineApprovalId = approvalId;
       }
-      if (decision.decision !== "allow-once") {
+      if (!autoReviewAllowed) {
         autoReviewRequiresHumanApproval = true;
         params.warnings.push(
           `Exec auto-review deferred to human approval (risk=${decision.risk}): ${decision.rationale}`,
@@ -238,6 +269,7 @@ export async function executeNodeHostCommand(
     }
 
     if (!inlineApprovedByAsk) {
+      // Human approval may complete after this tool call returns, so follow-up delivery owns invocation.
       const requestArgs = execHostShared.buildDefaultExecApprovalRequestArgs({
         warnings: params.warnings,
         approvalRunningNoticeMs: params.approvalRunningNoticeMs,
@@ -295,6 +327,8 @@ export async function executeNodeHostCommand(
         const followupTarget = execHostShared.buildExecApprovalFollowupTarget({
           approvalId,
           sessionKey: params.notifySessionKey ?? params.sessionKey,
+          expectedSessionId: params.sessionId,
+          sessionStore: params.sessionStore,
           bashElevated: params.bashElevated,
           turnSourceChannel: params.turnSourceChannel,
           turnSourceTo: params.turnSourceTo,
@@ -319,14 +353,14 @@ export async function executeNodeHostCommand(
           const {
             baseDecision,
             approvedByAsk: initialApprovedByAsk,
-            deniedReason: initialDeniedReason,
+            deniedReason: baseDeniedReason,
           } = execHostShared.createExecApprovalDecisionState({
             decision,
             askFallback,
           });
           let approvedByAsk = initialApprovedByAsk;
           let approvalDecision: "allow-once" | "allow-always" | null = null;
-          let deniedReason = initialDeniedReason;
+          let deniedReason = baseDeniedReason;
 
           if (baseDecision.timedOut && askFallback === "full" && approvedByAsk) {
             approvalDecision = "allow-once";
@@ -338,15 +372,15 @@ export async function executeNodeHostCommand(
             approvalDecision = "allow-always";
           }
 
-          ({ approvedByAsk, deniedReason } = execHostShared.enforceStrictInlineEvalApprovalBoundary(
-            {
-              baseDecision,
-              approvedByAsk,
-              deniedReason,
-              requiresInlineEvalApproval: inlineEvalHit !== null,
-              requiresAutoReviewHumanApproval: autoReviewRequiresHumanApproval,
-            },
-          ));
+          const strictBoundaryDecision = execHostShared.enforceStrictInlineEvalApprovalBoundary({
+            baseDecision,
+            approvedByAsk,
+            deniedReason,
+            requiresInlineEvalApproval: inlineEvalHit !== null,
+            requiresAutoReviewHumanApproval: autoReviewRequiresHumanApproval,
+          });
+          approvedByAsk = strictBoundaryDecision.approvedByAsk;
+          deniedReason = strictBoundaryDecision.deniedReason;
           if (deniedReason) {
             approvalDecision = null;
           }
@@ -360,6 +394,7 @@ export async function executeNodeHostCommand(
           }
 
           try {
+            // Approved follow-up invocations need approval scopes because they mutate remote node state.
             const raw = await callGatewayTool(
               "node.invoke",
               { timeoutMs: target.invokeTimeoutMs },
@@ -424,7 +459,7 @@ export async function executeNodeHostCommand(
           initiatingSurface,
           sentApproverDms,
           unavailableReason,
-          allowedDecisions: resolveExecApprovalAllowedDecisions({ ask: hostAsk }),
+          allowedDecisions,
           nodeId: target.nodeId,
         });
       }
@@ -432,6 +467,7 @@ export async function executeNodeHostCommand(
   }
 
   const startedAt = Date.now();
+  params.signal?.throwIfAborted();
   const invoke = buildNodeSystemRunInvoke({
     target,
     command: prepared.argv,

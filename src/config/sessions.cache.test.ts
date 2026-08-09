@@ -1,3 +1,4 @@
+// Verifies session config cache invalidation and reload behavior.
 import fs from "node:fs";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,10 +8,12 @@ import { createSuiteTempRootTracker } from "../test-helpers/temp-dir.js";
 import {
   getSerializedSessionStore,
   getSerializedSessionStoreCacheStatsForTest,
+  getSerializedSessionStorePromptRefs,
   getSessionStoreSnapshotCacheStatsForTest,
   getSessionStoreStringInternStatsForTest,
   readSessionStoreCache,
   setSerializedSessionStore,
+  setSerializedSessionStorePromptRefs,
   writeSessionStoreCache,
 } from "./sessions/store-cache.js";
 import {
@@ -27,6 +30,7 @@ import {
   updateLastRoute,
 } from "./sessions/store.js";
 import type { SessionEntry } from "./sessions/types.js";
+import type { SessionSkillPromptRef } from "./sessions/types.js";
 
 function createSessionEntry(overrides: Partial<SessionEntry> = {}): SessionEntry {
   return {
@@ -102,6 +106,24 @@ describe("Session Store Cache", () => {
     expect(getSerializedSessionStoreCacheStatsForTest().entries).toBe(maxEntries);
   });
 
+  it("keeps serialized prompt refs on the serialized cache entry lifecycle", () => {
+    const promptRef: SessionSkillPromptRef = {
+      version: 1,
+      algorithm: "sha256",
+      hash: "a".repeat(64),
+      bytes: 123,
+    };
+    const refs = new Map([["session:1", promptRef]]);
+
+    setSerializedSessionStore("store:refs", "{}");
+    setSerializedSessionStorePromptRefs("store:refs", refs);
+
+    expect(getSerializedSessionStorePromptRefs("store:refs")).toBe(refs);
+
+    setSerializedSessionStore("store:refs", "{}");
+    expect(getSerializedSessionStorePromptRefs("store:refs")).toBeUndefined();
+  });
+
   it("should load session store from disk on first call", async () => {
     const testStore = createSingleSessionStore();
 
@@ -111,6 +133,47 @@ describe("Session Store Cache", () => {
     // Load it
     const loaded = loadSessionStore(storePath);
     expect(loaded).toEqual(testStore);
+  });
+
+  it("retries transient session store read failures", async () => {
+    const testStore = createSingleSessionStore();
+    await saveSessionStore(storePath, testStore);
+    clearSessionStoreCacheForTest();
+
+    const originalReadFileSync = fs.readFileSync.bind(fs);
+    let storeReads = 0;
+    const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation((file, ...args) => {
+      if (file === storePath) {
+        storeReads += 1;
+        if (storeReads === 1) {
+          throw Object.assign(
+            new Error("Unknown system error -11: Unknown system error -11, read"),
+            { code: "EAGAIN", errno: -11 },
+          );
+        }
+      }
+      return originalReadFileSync(file, ...(args as [Parameters<typeof fs.readFileSync>[1]]));
+    });
+
+    try {
+      expect(loadSessionStore(storePath, { skipCache: true })).toEqual(testStore);
+      expect(storeReads).toBe(2);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  it("does not retry permanent session store read failures", () => {
+    clearSessionStoreCacheForTest();
+    const missingPath = path.join(testDir, "missing-sessions.json");
+    const readSpy = vi.spyOn(fs, "readFileSync");
+
+    try {
+      expect(loadSessionStore(missingPath, { skipCache: true })).toEqual({});
+      expect(readSpy).toHaveBeenCalledOnce();
+    } finally {
+      readSpy.mockRestore();
+    }
   });
 
   it("should serve freshly saved session stores from cache without disk reads", async () => {
@@ -290,8 +353,11 @@ describe("Session Store Cache", () => {
     const entry = cached?.["session:1"] as (SessionEntry & { polluted?: boolean }) | undefined;
 
     expect(entry).toBeDefined();
+    if (!entry) {
+      throw new Error("Expected cached entry");
+    }
     expect(entry?.polluted).toBeUndefined();
-    expect(Object.prototype.hasOwnProperty.call(entry, "__proto__")).toBe(true);
+    expect(Object.hasOwn(entry as object, "__proto__")).toBe(true);
     expect(Object.prototype).not.toHaveProperty("polluted");
   });
 
@@ -762,6 +828,8 @@ describe("Session Store Cache", () => {
         },
       }),
     });
+    const cached = loadSessionStore(storePath, { clone: false });
+    expect(cached["session:2"].skillsSnapshot?.prompt).toBe(prompt);
     await fs.promises.rm(path.join(testDir, "skills-prompts"), {
       recursive: true,
       force: true,
