@@ -29,25 +29,11 @@ export type PlainTextToolCallBlock = {
 export type PlainTextToolCallParseOptions = {
   /** Optional allowlist of tool names that may be repaired. */
   allowedToolNames?: Iterable<string>;
-  /** Maximum serialized payload size accepted for one repaired call. */
+  /** Maximum JSON payload size accepted for one repaired call. */
   maxPayloadBytes?: number;
 };
 
 const DEFAULT_MAX_PLAIN_TEXT_TOOL_PAYLOAD_BYTES = 256_000;
-const utf8Encoder = new TextEncoder();
-
-function utf8ByteLengthWithinLimit(
-  text: string,
-  start: number,
-  end: number,
-  maxBytes: number,
-): number | null {
-  if (end - start > maxBytes) {
-    return null;
-  }
-  const byteLength = utf8Encoder.encode(text.slice(start, end)).byteLength;
-  return byteLength <= maxBytes ? byteLength : null;
-}
 
 type PlainTextToolCallOpening = {
   allowsOptionalXmlishClose?: boolean;
@@ -154,7 +140,7 @@ function consumeJsonObject(
     return null;
   }
   const end = findJsonObjectEnd(text, cursor, maxPayloadBytes);
-  if (end === null || utf8ByteLengthWithinLimit(text, cursor, end, maxPayloadBytes) === null) {
+  if (end === null) {
     return null;
   }
   const rawJson = text.slice(cursor, end);
@@ -261,17 +247,15 @@ function consumeXmlishParameterBlock(
   text: string,
   start: number,
   maxPayloadBytes: number,
-): { byteLength: number; end: number; name: string; value: string } | null {
+): { end: number; name: string; value: string } | null {
   const bounds = findXmlishParameterBlock(text, start);
   if (!bounds) {
     return null;
   }
-  const byteLength = utf8ByteLengthWithinLimit(text, start, bounds.end, maxPayloadBytes);
-  if (byteLength === null) {
+  if (bounds.end - bounds.start > maxPayloadBytes) {
     return null;
   }
   return {
-    byteLength,
     end: bounds.end,
     name: bounds.name,
     value: extractXmlishParameterValue(text, bounds.payloadStart, bounds.closeStart),
@@ -355,14 +339,12 @@ function parseXmlishPlainTextToolCallBlockAt(
   const args: Record<string, unknown> = {};
   let cursor = opening.end;
   let parameterCount = 0;
-  let payloadBytes = 0;
   while (true) {
     const parameter = consumeXmlishParameterBlock(text, cursor, maxPayloadBytes);
     if (!parameter) {
       break;
     }
-    payloadBytes += parameter.byteLength;
-    if (payloadBytes > maxPayloadBytes) {
+    if (parameter.end - opening.end > maxPayloadBytes) {
       return null;
     }
     args[parameter.name] = parameter.value;

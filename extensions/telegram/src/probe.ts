@@ -87,7 +87,9 @@ function setCachedProbeTransport(
   if (probeTransportCache.size > MAX_PROBE_TRANSPORT_CACHE_SIZE) {
     const oldestKey = probeTransportCache.keys().next().value;
     if (oldestKey !== undefined) {
+      const oldestTransport = probeTransportCache.get(oldestKey);
       probeTransportCache.delete(oldestKey);
+      void oldestTransport?.close();
     }
   }
   return transport;
@@ -166,7 +168,8 @@ export async function probeTelegram(
         // On timeout or network error, promote the transport to its IPv4
         // fallback dispatcher so the next retry (and all future probes
         // sharing this cached transport) skip the stalled IPv6 path.
-        transport.forceFallback?.("probe timeout/network error");
+        // Keep the original socket code in transport fallback diagnostics.
+        transport.forceFallback?.("probe timeout/network error", err);
         if (i < 2) {
           const remainingAfterAttemptMs = resolveRemainingBudgetMs();
           if (remainingAfterAttemptMs <= 0) {

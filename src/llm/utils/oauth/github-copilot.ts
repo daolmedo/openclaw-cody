@@ -4,8 +4,8 @@
 
 import { resolveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
 import {
-  assertOkOrThrowProviderError,
   readProviderJsonResponse,
+  readProviderTextResponse,
 } from "../../../agents/provider-http-errors.js";
 import {
   nonNegativeSecondsToSafeMilliseconds,
@@ -189,7 +189,10 @@ async function fetchJson(
 ): Promise<unknown> {
   const response = await fetchResponse(url, init, operation, options);
   const label = `GitHub Copilot ${operation}`;
-  await assertOkOrThrowProviderError(response, label);
+  if (!response.ok) {
+    const text = await readProviderTextResponse(response, label);
+    throw new Error(`${response.status} ${response.statusText}: ${text}`);
+  }
   return readProviderJsonResponse(response, label);
 }
 
@@ -591,6 +594,5 @@ export const githubCopilotOAuthProvider: OAuthProviderInterface = {
 export const testing = {
   enableGitHubCopilotModel,
   listGitHubCopilotModelIds,
-  pollForGitHubAccessToken,
   startDeviceFlow,
 };

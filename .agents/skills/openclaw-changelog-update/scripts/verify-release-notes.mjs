@@ -1,7 +1,15 @@
 #!/usr/bin/env node
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -74,6 +82,7 @@ Options:
   --no-github-snapshot  Disable GitHub GraphQL snapshot reuse.
   --refresh-github-snapshot
                         Ignore an existing exact-range snapshot and rebuild it.
+  --main-ref <ref>      Canonical mainline used to replace backport PRs.
   --seed-ref <ref>      Use an existing release section as editorial input.
   --shipped-ref <tag>   Exclude PRs already recorded by this shipped tag; repeatable.
   --write-ledger        Write the verified ledger back into CHANGELOG.md.
@@ -91,6 +100,7 @@ function parseArgs(argv) {
     json: false,
     manifestPath: undefined,
     githubSnapshotPath: undefined,
+    mainRef: undefined,
     noGithubSnapshot: false,
     refreshGithubSnapshot: false,
     seedRef: undefined,
@@ -131,6 +141,7 @@ function parseArgs(argv) {
       arg === "--release-tag" ||
       arg === "--shipped-ref" ||
       arg === "--github-snapshot" ||
+      arg === "--main-ref" ||
       arg === "--manifest" ||
       arg === "--seed-ref"
     ) {
@@ -146,6 +157,8 @@ function parseArgs(argv) {
         options.manifestPath = value;
       } else if (arg === "--github-snapshot") {
         options.githubSnapshotPath = value;
+      } else if (arg === "--main-ref") {
+        options.mainRef = value;
       } else if (arg === "--seed-ref") {
         options.seedRef = value;
       } else {
@@ -219,10 +232,25 @@ function gitIsAncestor(base, target) {
   );
 }
 
+function gitCommit(ref, required = false) {
+  const result = spawnSync("git", ["rev-parse", "--verify", `${ref}^{commit}`], {
+    encoding: "utf8",
+    env: { ...process.env, NO_COLOR: "1" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.status === 0) {
+    return result.stdout.trim();
+  }
+  if (!required) {
+    return undefined;
+  }
+  fail(`could not resolve canonical main ref ${ref}: ${result.stderr?.trim() || result.status}`);
+}
+
 function fetchGithubApi(args) {
   try {
     return JSON.parse(
-      run(process.env.OPENCLAW_RELEASE_GITHUB_CLI || "gh", ["api", ...args]).replace(
+      run("ghx", ["api", ...args], { env: { GHX_NO_CACHE: "1" } }).replace(
         /\u001B\[[0-?]*[ -/]*[@-~]/g,
         "",
       ),
@@ -440,42 +468,6 @@ function referencesIn(text) {
   return references;
 }
 
-function referenceLabelsIn(text) {
-  const labels = [];
-  for (const match of text.matchAll(
-    /(?<![A-Za-z0-9_.&-])(?:(?<owner>[A-Za-z0-9_.-]+)\/(?<name>[A-Za-z0-9_.-]+))?#(?<number>\d+)/g,
-  )) {
-    const qualifiedRepository = match.groups?.owner
-      ? `${match.groups.owner}/${match.groups.name}`
-      : undefined;
-    labels.push(
-      !qualifiedRepository || qualifiedRepository.toLowerCase() === repo
-        ? `#${match.groups?.number}`
-        : `${qualifiedRepository}#${match.groups?.number}`,
-    );
-  }
-  return labels;
-}
-
-export function renderContributionRecordEntry(entry) {
-  const references = [];
-  appendUnique(references, referenceLabelsIn(entry.title));
-  appendUnique(
-    references,
-    (entry.priorReferences ?? []).map((number) => `#${number}`),
-  );
-  appendUnique(references, entry.externalReferences ?? []);
-  for (const issue of entry.linkedIssues) {
-    appendUnique(references, [`#${issue.number}`]);
-  }
-  const related = references.length > 0 ? ` Related ${references.join(", ")}.` : "";
-  const attribution =
-    entry.thanks.length > 0
-      ? ` Thanks ${entry.thanks.map((handle) => `@${handle}`).join(" and ")}.`
-      : "";
-  return `- **PR #${entry.number}**${related}${attribution}`;
-}
-
 export function releaseNoteReferences(sectionSource, shippedBaselines) {
   const shippedBaselineLine = formatShippedBaselineExclusions(shippedBaselines);
   // The baseline inventory proves subtraction; its PR ids are not release-note references.
@@ -533,19 +525,9 @@ function handlesIn(text) {
     );
 }
 
-function externalReferencesIn(text) {
-  return referenceLabelsIn(text).filter((reference) => !reference.startsWith("#"));
-}
-
-function appendUnique(values, additions) {
-  const seen = new Set(values.map((value) => value.toLowerCase()));
-  for (const value of additions) {
-    const key = value.toLowerCase();
-    if (!seen.has(key)) {
-      values.push(value);
-      seen.add(key);
-    }
-  }
+function relatedReferencesIn(line) {
+  const related = line.match(/\bRelated ((?:#\d+)(?:, #\d+)*)\./);
+  return related ? referencesIn(related[1]) : [];
 }
 
 function addContributionRecordEntry(entries, key, entry) {
@@ -553,18 +535,16 @@ function addContributionRecordEntry(entries, key, entry) {
   if (!existing) {
     entries.set(key, {
       ...entry,
-      externalReferences: [...(entry.externalReferences ?? [])],
       references: [...entry.references],
       thanks: [...entry.thanks],
     });
     return;
   }
-  appendUnique(existing.externalReferences, entry.externalReferences ?? []);
   appendReferences(existing.references, entry.references);
   addHandles(existing.thanks, entry.thanks);
 }
 
-export function contributionRecordFor(section) {
+function contributionRecordFor(section) {
   const result = { legacyIssues: new Map(), pullRequests: new Map() };
   const recordStart = section.source.search(/\n### Complete contribution (?:ledger|record)\r?$/m);
   if (recordStart < 0) {
@@ -591,10 +571,8 @@ export function contributionRecordFor(section) {
       const number = explicitRecord?.[1] ?? legacyRecord?.[1];
       if (number) {
         const value = Number(number);
-        const metadata = explicitRecord ? line.slice(explicitRecord[0].length) : line;
         addContributionRecordEntry(result.pullRequests, value, {
-          externalReferences: externalReferencesIn(metadata),
-          references: referencesIn(metadata).filter((reference) => reference !== value),
+          references: relatedReferencesIn(line),
           thanks: handlesIn(line),
         });
       }
@@ -611,19 +589,6 @@ export function contributionRecordFor(section) {
     }
   }
   return result;
-}
-
-export function mergeContributionRecords(...records) {
-  const merged = { legacyIssues: new Map(), pullRequests: new Map() };
-  for (const record of records) {
-    for (const [number, entry] of record.pullRequests) {
-      addContributionRecordEntry(merged.pullRequests, number, entry);
-    }
-    for (const [number, entry] of record.legacyIssues) {
-      addContributionRecordEntry(merged.legacyIssues, number, entry);
-    }
-  }
-  return merged;
 }
 
 function completeContributionRecord(section, label) {
@@ -718,7 +683,6 @@ export function withoutExcludedContributionRecords(record, excludedReferences) {
     }
     addContributionRecordEntry(filtered.pullRequests, number, {
       ...entry,
-      externalReferences: entry.externalReferences,
       references: entry.references.filter((reference) => !excludedReferences.has(reference)),
     });
   }
@@ -741,6 +705,12 @@ function contributionRecordMetadataReferences(record) {
   }
   appendReferences(references, record.legacyIssues.keys());
   return references;
+}
+
+export function renderedContributionRecordReferences(record, writeLedger) {
+  // Write mode replaces the existing generated record. Validating stale record
+  // references here would make the verifier unable to repair its own output.
+  return writeLedger ? [] : contributionRecordMetadataReferences(record);
 }
 
 export function contaminatingPullRequestReferences({
@@ -772,7 +742,190 @@ function appendReferences(references, additions) {
   }
 }
 
-function sourceCommits(base, target) {
+function normalizedCommitSubject(subject) {
+  return subject
+    .replace(/\s+\(#\d+\)\s*$/, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function cherryPickOrigins(message) {
+  return [...message.matchAll(/^\(cherry picked from commit ([0-9a-f]{40})\)$/gim)].map((match) =>
+    match[1].toLowerCase(),
+  );
+}
+
+function backportPullRequestOrigins(message) {
+  return [
+    ...message.matchAll(/^Backport of #(\d+) to release\/[A-Za-z0-9._/-]+(?:\.)?\s*$/gim),
+  ].map((match) => Number(match[1]));
+}
+
+export function releaseProvenanceMarkers(message) {
+  const markers = [];
+  for (const line of message.split("\n")) {
+    if (!/^Release provenance:/i.test(line)) {
+      continue;
+    }
+    const match = line.match(/^Release provenance: ([0-9a-f]{40}) -> (#\d+(?:,\s*#\d+)*)\.?\s*$/i);
+    if (!match) {
+      fail(`invalid release provenance marker: ${line}`);
+    }
+    markers.push({
+      commit: match[1].toLowerCase(),
+      pullRequests: [...match[2].matchAll(/#(\d+)/g)].map((reference) => Number(reference[1])),
+    });
+  }
+  return markers;
+}
+
+export function collectReleaseProvenanceOverrides(activeCommits) {
+  const activeCommitHashes = new Set(activeCommits.map((commit) => commit.hash));
+  const overrides = new Map();
+  for (const commit of activeCommits) {
+    for (const marker of releaseProvenanceMarkers(commit.body)) {
+      if (!activeCommitHashes.has(marker.commit)) {
+        fail(`release provenance marker targets commit outside the active range: ${marker.commit}`);
+      }
+      const existing = overrides.get(marker.commit);
+      if (existing && existing.join(",") !== marker.pullRequests.join(",")) {
+        fail(`conflicting release provenance markers for ${marker.commit}`);
+      }
+      overrides.set(marker.commit, marker.pullRequests);
+    }
+  }
+  return overrides;
+}
+
+export function resolvedReleasePullRequests(
+  currentPullRequests,
+  mainPullRequests,
+  hasCanonicalMainCommit,
+  provenanceOverride,
+) {
+  return (
+    provenanceOverride ??
+    canonicalPullRequests(currentPullRequests, mainPullRequests, hasCanonicalMainCommit)
+  );
+}
+
+export function releasePullRequestReferencesToSuppress(
+  currentPullRequests,
+  subject,
+  associatedPullRequests,
+  hasProvenanceOverride,
+) {
+  const candidates = new Set(currentPullRequests);
+  if (hasProvenanceOverride) {
+    for (const match of subject.matchAll(/\(#(\d+)\)\s*$/g)) {
+      candidates.add(Number(match[1]));
+    }
+  }
+  return [...candidates].filter((number) => !associatedPullRequests.includes(number));
+}
+
+function changedPathsForCommit(hash) {
+  return new Set(
+    git(["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", hash, "--"])
+      .split("\n")
+      .filter(Boolean),
+  );
+}
+
+function authorsMatch(left, right) {
+  const leftEmail = left.authorEmail?.trim().toLowerCase();
+  const rightEmail = right.authorEmail?.trim().toLowerCase();
+  if (leftEmail && rightEmail && leftEmail === rightEmail) {
+    return true;
+  }
+  return (
+    left.authorName?.trim().toLowerCase() === right.authorName?.trim().toLowerCase() &&
+    Boolean(left.authorName?.trim())
+  );
+}
+
+function pathsOverlap(left, right) {
+  for (const path of left) {
+    if (right.has(path)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function canonicalMainCommitMatches(commit, candidates) {
+  const exact = candidates.find((candidate) => candidate.hash === commit.hash);
+  if (exact) {
+    return [exact.hash];
+  }
+
+  const origins = new Set(cherryPickOrigins(commit.body));
+  const explicit = candidates
+    .filter((candidate) => origins.has(candidate.hash))
+    .map((candidate) => candidate.hash);
+  if (explicit.length > 0) {
+    return [...new Set(explicit)];
+  }
+
+  const pullRequestOrigins = new Set(backportPullRequestOrigins(commit.body));
+  if (pullRequestOrigins.size > 0) {
+    const pullRequestMatches = candidates.filter(
+      (candidate) =>
+        (candidate.pullRequests ?? []).some((number) => pullRequestOrigins.has(number)) &&
+        authorsMatch(commit, candidate) &&
+        pathsOverlap(commit.changedPaths, candidate.changedPaths),
+    );
+    return pullRequestMatches.length === 1 ? [pullRequestMatches[0].hash] : [];
+  }
+
+  const subject = normalizedCommitSubject(commit.subject);
+  const matches = candidates.filter(
+    (candidate) =>
+      normalizedCommitSubject(candidate.subject) === subject &&
+      authorsMatch(commit, candidate) &&
+      pathsOverlap(commit.changedPaths, candidate.changedPaths),
+  );
+  return matches.length === 1 ? [matches[0].hash] : [];
+}
+
+export function canonicalPullRequests(currentPullRequests, mainPullRequests) {
+  return mainPullRequests.length > 0
+    ? [...new Set(mainPullRequests)].toSorted((left, right) => left - right)
+    : [...new Set(currentPullRequests)].toSorted((left, right) => left - right);
+}
+
+function canonicalMainCommits(base, mainRef) {
+  if (!mainRef) {
+    return [];
+  }
+  const mainCommit = gitCommit(mainRef, true);
+  const mainBase = git(["merge-base", base, mainCommit]);
+  const output = git([
+    "log",
+    "--reverse",
+    "--format=%H%x1f%s%x1f%an%x1f%ae%x1f%B%x1e",
+    `${mainBase}..${mainCommit}`,
+  ]);
+  const commits = [];
+  for (const record of output.split("\x1e")) {
+    if (!record) {
+      continue;
+    }
+    const [rawHash, subject, authorName, authorEmail, ...bodyParts] = record.split("\x1f");
+    const hash = rawHash.trim();
+    commits.push({
+      authorEmail,
+      authorName,
+      body: bodyParts.join("\x1f"),
+      hash,
+      subject,
+    });
+  }
+  return commits;
+}
+
+function sourceCommits(base, target, mainRef) {
   const targetCommit = git(["rev-parse", `${target}^{commit}`]);
   if (!gitIsAncestor(base, targetCommit)) {
     fail(`release range base ${base} must be an ancestor of target ${target}`);
@@ -944,12 +1097,130 @@ function sourceCommits(base, target) {
     activeCommits.map((commit) => commit.hash),
     targetTimestamp,
   );
+  const provenanceOverrides = collectReleaseProvenanceOverrides(activeCommits);
+  const mainCommits = canonicalMainCommits(base, mainRef);
+  const mainCommit = provenanceOverrides.size > 0 ? gitCommit(mainRef, true) : undefined;
+  const mainCommitsByHash = new Map(mainCommits.map((commit) => [commit.hash, commit]));
+  const mainCommitsBySubject = new Map();
+  for (const commit of mainCommits) {
+    const subject = normalizedCommitSubject(commit.subject);
+    const matches = mainCommitsBySubject.get(subject) ?? [];
+    matches.push(commit);
+    mainCommitsBySubject.set(subject, matches);
+  }
+  const canonicalMainCommitsByReleaseCommit = new Map();
+  const namedMainPullRequestsByReleaseCommit = new Map();
+  const canonicalMainHashes = new Set();
+  const mainAssociationCandidateHashes = new Set();
+  const pendingCanonicalMatches = [];
+  const changedPathsByCommit = new Map();
+  const withChangedPaths = (commit) => {
+    if (!changedPathsByCommit.has(commit.hash)) {
+      changedPathsByCommit.set(commit.hash, changedPathsForCommit(commit.hash));
+    }
+    return { ...commit, changedPaths: changedPathsByCommit.get(commit.hash) };
+  };
+  for (const commit of activeCommits) {
+    const exact = mainCommitsByHash.get(commit.hash);
+    if (exact) {
+      canonicalMainCommitsByReleaseCommit.set(commit.hash, []);
+      continue;
+    }
+    const explicit = cherryPickOrigins(commit.body)
+      .map((origin) => mainCommitsByHash.get(origin))
+      .filter(Boolean);
+    if (explicit.length > 0) {
+      const matches = [...new Set(explicit.map((candidate) => candidate.hash))];
+      canonicalMainCommitsByReleaseCommit.set(commit.hash, matches);
+      for (const hash of matches) {
+        canonicalMainHashes.add(hash);
+      }
+      continue;
+    }
+    const releaseCommit = withChangedPaths(commit);
+    const pullRequestOrigins = backportPullRequestOrigins(commit.body);
+    const candidates = new Map(
+      (mainCommitsBySubject.get(normalizedCommitSubject(commit.subject)) ?? []).map((candidate) => [
+        candidate.hash,
+        candidate,
+      ]),
+    );
+    if (pullRequestOrigins.length > 0) {
+      for (const candidate of mainCommits) {
+        if (!authorsMatch(releaseCommit, candidate)) {
+          continue;
+        }
+        const mainCandidate = withChangedPaths(candidate);
+        if (!pathsOverlap(releaseCommit.changedPaths, mainCandidate.changedPaths)) {
+          continue;
+        }
+        candidates.set(candidate.hash, candidate);
+        mainAssociationCandidateHashes.add(candidate.hash);
+      }
+    }
+    pendingCanonicalMatches.push({ candidates, commit: releaseCommit, pullRequestOrigins });
+  }
+  const candidateMainPullRequests = resolveAssociatedPullRequests(
+    [...mainAssociationCandidateHashes],
+    Number.POSITIVE_INFINITY,
+  );
+  for (const { candidates, commit, pullRequestOrigins } of pendingCanonicalMatches) {
+    const matches = canonicalMainCommitMatches(
+      commit,
+      [...candidates.values()].map((candidate) => ({
+        ...withChangedPaths(candidate),
+        pullRequests: candidateMainPullRequests.get(candidate.hash) ?? [],
+      })),
+    );
+    canonicalMainCommitsByReleaseCommit.set(commit.hash, matches);
+    if (pullRequestOrigins.length > 0 && matches.length === 1) {
+      const associatedPullRequests = candidateMainPullRequests.get(matches[0]) ?? [];
+      const namedPullRequests = pullRequestOrigins.filter((number) =>
+        associatedPullRequests.includes(number),
+      );
+      if (namedPullRequests.length > 0) {
+        namedMainPullRequestsByReleaseCommit.set(commit.hash, namedPullRequests);
+      }
+    }
+    for (const hash of matches) {
+      canonicalMainHashes.add(hash);
+    }
+  }
+  const canonicalMainPullRequests = resolveAssociatedPullRequests(
+    [...canonicalMainHashes],
+    targetTimestamp,
+  );
   const resolvedCoauthors = resolveCommitCoauthors(activeCommits);
   const pullRequests = new Set();
   const nonRevertPullRequests = new Set();
   for (const commit of activeCommits) {
-    const associatedPullRequests = activePullRequests.get(commit.hash) ?? [];
+    const currentPullRequests = activePullRequests.get(commit.hash) ?? [];
+    const namedMainPullRequests = namedMainPullRequestsByReleaseCommit.get(commit.hash);
+    const mainPullRequests =
+      namedMainPullRequests ??
+      (canonicalMainCommitsByReleaseCommit.get(commit.hash) ?? []).flatMap(
+        (hash) => canonicalMainPullRequests.get(hash) ?? [],
+      );
+    const matchedMainCommits = canonicalMainCommitsByReleaseCommit.get(commit.hash) ?? [];
+    const provenanceOverride = provenanceOverrides.get(commit.hash);
+    const associatedPullRequests = resolvedReleasePullRequests(
+      currentPullRequests,
+      mainPullRequests,
+      matchedMainCommits.length > 0,
+      provenanceOverride,
+    );
     commit.pullRequests = associatedPullRequests;
+    const suppressedBackportPullRequests = new Set(
+      releasePullRequestReferencesToSuppress(
+        currentPullRequests,
+        commit.subject,
+        associatedPullRequests,
+        provenanceOverride !== undefined,
+      ),
+    );
+    commit.references = commit.references.filter(
+      (number) => !suppressedBackportPullRequests.has(number),
+    );
     addHandles(commit.coauthors, resolvedCoauthors.get(commit.hash) ?? []);
     appendReferences(commit.references, associatedPullRequests);
     for (const number of associatedPullRequests) {
@@ -1004,8 +1275,10 @@ function sourceCommits(base, target) {
   return {
     activeCommits,
     coauthorsByReference,
+    mainCommit,
     mergeBase,
     pullRequests,
+    provenanceOverrides,
     references,
     revertedReferences,
     target: targetCommit,
@@ -1211,7 +1484,9 @@ function resolveReferences(numbers) {
             ... on PullRequest {
               number
               title
+              baseRefName
               mergedAt
+              mergeCommit { oid }
               author { __typename login }
               closingIssuesReferences(first: 100) {
                 nodes { number }
@@ -1231,6 +1506,29 @@ function resolveReferences(numbers) {
     }
   }
   return resolveIssueRelationshipPages(nodes);
+}
+
+export function validateReleaseProvenanceOverrides(
+  provenanceOverrides,
+  nodes,
+  mainCommit,
+  isMainAncestor = gitIsAncestor,
+) {
+  for (const [commit, pullRequests] of provenanceOverrides) {
+    for (const number of pullRequests) {
+      const node = nodes.get(number);
+      // Markers may name current-main forward-ports, but never release-only or unmerged PRs.
+      if (
+        node?.__typename !== "PullRequest" ||
+        node.baseRefName !== "main" ||
+        !node.mergedAt ||
+        !node.mergeCommit?.oid ||
+        !isMainAncestor(node.mergeCommit.oid, mainCommit)
+      ) {
+        fail(`release provenance marker for ${commit} references non-main PR #${number}`);
+      }
+    }
+  }
 }
 
 function resolveGitHubHandles(handles) {
@@ -1551,7 +1849,7 @@ function mergeIssues(...groups) {
   return [...entries.values()];
 }
 
-export function ledgerFor(
+function ledgerFor(
   base,
   target,
   references,
@@ -1562,7 +1860,6 @@ export function ledgerFor(
   priorRecord,
   sourcePullRequests,
   sourceReferences,
-  noteReferences,
   legacyIssuePullRequests,
   revertedReferences,
   shippedBaselines,
@@ -1587,7 +1884,6 @@ export function ledgerFor(
   const recordedPullRequests = new Set([
     ...sourcePullRequests,
     ...sourceReferences,
-    ...noteReferences,
     ...legacyIssuePullRequests,
     ...priorRecord.pullRequests.keys(),
   ]);
@@ -1602,8 +1898,6 @@ export function ledgerFor(
   const issues = entries.filter((entry) => entry.type === "Issue");
   const legacyIssues = legacyIssuesByPullRequest(priorRecord, nodes);
   const records = pullRequests.map((entry) => {
-    const priorEntry = priorRecord.pullRequests.get(entry.number);
-    const priorReferences = priorEntry?.references ?? [];
     const titleIssues = issueEntries(referencesIn(entry.title), nodes);
     const closingIssues = issueEntries(
       entry.closingIssuesReferences?.nodes.map((issue) => issue.number) ?? [],
@@ -1613,23 +1907,33 @@ export function ledgerFor(
       titleIssues,
       closingIssues,
       relationships.issuesByPullRequest.get(entry.number) ?? [],
-      issueEntries(priorReferences, nodes),
       issueEntries(legacyIssues.get(entry.number) ?? [], nodes, priorRecord.legacyIssues),
     );
+    const titleIssueNumbers = new Set(titleIssues.map((issue) => issue.number));
+    const relatedIssues = linkedIssues.filter((issue) => !titleIssueNumbers.has(issue.number));
     const thanks = [...entry.thanks];
-    addHandles(thanks, priorEntry?.thanks ?? []);
     for (const issue of linkedIssues) {
       addHandles(thanks, issue.thanks);
     }
     return {
       ...entry,
       ...editorialClassification(entry.title),
-      externalReferences: priorEntry?.externalReferences ?? [],
       linkedIssues,
-      priorReferences,
+      relatedIssues,
       thanks,
     };
   });
+  const renderEntry = (entry) => {
+    const attribution =
+      entry.thanks.length > 0
+        ? ` Thanks ${entry.thanks.map((handle) => `@${handle}`).join(" and ")}.`
+        : "";
+    const relatedIssues =
+      entry.relatedIssues.length > 0
+        ? ` Related ${entry.relatedIssues.map((issue) => `#${issue.number}`).join(", ")}.`
+        : "";
+    return `- **PR #${entry.number}** ${withSentenceEnding(entry.title)}${relatedIssues}${attribution}`;
+  };
   const shippedBaselineLine = formatShippedBaselineExclusions(shippedBaselines);
   const ledger = [
     "### Complete contribution record",
@@ -1639,7 +1943,7 @@ export function ledgerFor(
     "",
     "#### Pull requests",
     "",
-    ...records.map((entry) => renderContributionRecordEntry(entry)),
+    ...records.map((entry) => renderEntry(entry)),
   ].join("\n");
   return {
     entries,
@@ -1683,7 +1987,7 @@ export function highlightCountError(sectionSource) {
     : `### Highlights must contain 5-8 top-level bullets; found ${count}`;
 }
 
-export function ledgerChecks(section, pullRequests, nodes, directCommits, shippedBaselines = []) {
+function ledgerChecks(section, pullRequests, nodes, directCommits, shippedBaselines) {
   const errors = [];
   let sectionReferences = referencesIn(section.source);
   if (/@undefined\b/i.test(section.source)) {
@@ -1755,25 +2059,6 @@ export function ledgerChecks(section, pullRequests, nodes, directCommits, shippe
     for (const handle of entry.thanks) {
       if (!line.toLowerCase().includes(`@${handle.toLowerCase()}`)) {
         errors.push(`missing Thanks @${handle} for #${entry.number}`);
-      }
-    }
-    const expectedReferences = [];
-    appendUnique(expectedReferences, referenceLabelsIn(entry.title));
-    appendUnique(
-      expectedReferences,
-      entry.priorReferences.map((number) => `#${number}`),
-    );
-    appendUnique(expectedReferences, entry.externalReferences);
-    appendUnique(
-      expectedReferences,
-      entry.linkedIssues.map((issue) => `#${issue.number}`),
-    );
-    const actualReferences = new Set(
-      referenceLabelsIn(line).map((reference) => reference.toLowerCase()),
-    );
-    for (const reference of expectedReferences) {
-      if (!actualReferences.has(reference.toLowerCase())) {
-        errors.push(`missing ${reference} on contribution record for PR #${entry.number}`);
       }
     }
   }
@@ -1868,8 +2153,6 @@ function manifestFor(options, source, ledger, directCommitRecords) {
       type: entry.type,
       editorialEligible: entry.editorialEligible,
       thanks: entry.thanks,
-      externalReferences: entry.externalReferences,
-      relatedReferences: [...new Set([...entry.priorReferences, ...referencesIn(entry.title)])],
       linkedIssues: entry.linkedIssues.map((issue) => ({
         number: issue.number,
         title: issue.title,
@@ -1904,6 +2187,19 @@ function releaseChecks(changelog, version, releaseTags) {
   return checks;
 }
 
+function writeFileAtomic(filePath, contents) {
+  const directory = path.dirname(filePath);
+  mkdirSync(directory, { recursive: true });
+  const tempDirectory = mkdtempSync(path.join(directory, `.${path.basename(filePath)}.tmp-`));
+  const tempPath = path.join(tempDirectory, path.basename(filePath));
+  try {
+    writeFileSync(tempPath, contents);
+    renameSync(tempPath, filePath);
+  } finally {
+    rmSync(tempDirectory, { force: true, recursive: true });
+  }
+}
+
 function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) {
@@ -1913,7 +2209,8 @@ function main() {
   githubSnapshotState = initializeGithubSnapshot(options);
   let changelog = readFileSync("CHANGELOG.md", "utf8");
   let section = sectionFor(changelog, options.version);
-  const source = sourceCommits(options.base, options.target);
+  const defaultMainRef = options.mainRef ?? (gitCommit("origin/main") ? "origin/main" : undefined);
+  const source = sourceCommits(options.base, options.target, defaultMainRef);
   const shippedBaselineRecords = options.shippedRefs.map(shippedBaselineFor);
   const shippedExclusions = subtractShippedPullRequests(source, shippedBaselineRecords);
   source.shippedBaselines = shippedExclusions.baselines;
@@ -1948,19 +2245,16 @@ function main() {
     ...source.revertedReferences,
     ...shippedExclusions.pullRequests,
   ]);
-  const effectiveRenderedRecord = options.writeLedger
-    ? withoutExcludedContributionRecords(renderedRecord, excludedRecordedReferences)
-    : renderedRecord;
-  const effectiveRenderedRecordReferences =
-    contributionRecordMetadataReferences(effectiveRenderedRecord);
-  let seedRecord = { legacyIssues: new Map(), pullRequests: new Map() };
+  const effectiveRenderedRecordReferences = renderedContributionRecordReferences(
+    renderedRecord,
+    options.writeLedger,
+  );
+  let priorRecord = { legacyIssues: new Map(), pullRequests: new Map() };
   if (options.seedRef) {
     const seedChangelog = git(["show", `${options.seedRef}:CHANGELOG.md`]);
     const seedSection = sectionFor(seedChangelog, options.version);
-    seedRecord = contributionRecordFor(seedSection);
+    priorRecord = contributionRecordFor(seedSection);
   }
-  seedRecord = withoutExcludedContributionRecords(seedRecord, excludedRecordedReferences);
-  let priorRecord = mergeContributionRecords(effectiveRenderedRecord, seedRecord);
   priorRecord = withoutExcludedContributionRecords(priorRecord, excludedRecordedReferences);
   const recordedReferences = contributionRecordMetadataReferences(priorRecord);
   const revertedRecordedReferences = recordedReferences.filter((number) =>
@@ -1983,7 +2277,7 @@ function main() {
     recordedReferences: effectiveRenderedRecordReferences,
     sourcePullRequests: source.pullRequests,
     sourceReferences: source.references,
-    seededPullRequests: new Set(seedRecord.pullRequests.keys()),
+    seededPullRequests: new Set(priorRecord.pullRequests.keys()),
     nodes,
   });
   if (contamination.length > 0) {
@@ -2006,6 +2300,7 @@ function main() {
         .join(", ")}`,
     );
   }
+  validateReleaseProvenanceOverrides(source.provenanceOverrides, nodes, source.mainCommit);
   const provisionalEntries = references
     .map((number) => nodes.get(number))
     .filter((node) => node?.__typename === "PullRequest");
@@ -2063,7 +2358,6 @@ function main() {
     priorRecord,
     source.pullRequests,
     source.references,
-    noteReferences,
     legacyIssuePullRequests,
     source.revertedReferences,
     source.shippedBaselines,
@@ -2075,38 +2369,43 @@ function main() {
     ledger,
     relationships.directCommits,
   );
-
   if (options.manifestPath) {
-    writeFileSync(options.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    writeFileAtomic(options.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   }
 
+  let candidateChangelog = changelog;
+  let candidateSection = section;
   if (options.writeLedger) {
-    changelog = replaceLedger(
+    candidateChangelog = replaceLedger(
       changelog,
       section,
       ledger.ledger,
       ledger.pullRequests,
       relationships.directCommits,
     );
-    writeFileSync("CHANGELOG.md", changelog);
-    section = sectionFor(changelog, options.version);
+    candidateSection = sectionFor(candidateChangelog, options.version);
   }
 
   const errors = ledgerChecks(
-    section,
+    candidateSection,
     ledger.pullRequests,
     nodes,
     relationships.directCommits,
     source.shippedBaselines,
   );
   const github = options.checkGithub
-    ? releaseChecks(changelog, options.version, options.releaseTags)
+    ? releaseChecks(candidateChangelog, options.version, options.releaseTags)
     : [];
   for (const check of github) {
     if (!check.matches) {
       errors.push(
         `GitHub release ${check.tag} does not match the ${options.version} CHANGELOG section`,
       );
+    }
+  }
+  if (errors.length === 0) {
+    if (options.writeLedger) {
+      writeFileAtomic("CHANGELOG.md", candidateChangelog);
     }
   }
 
@@ -2149,6 +2448,6 @@ function main() {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   main();
 }

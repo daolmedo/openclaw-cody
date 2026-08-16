@@ -160,7 +160,6 @@ type AcpDispatchDeliveryState = {
   deliveredFinalReply: boolean;
   deliveredVisibleText: boolean;
   failedVisibleTextDelivery: boolean;
-  requiresVisibleTextFallback: boolean;
   queuedDirectVisibleTextDeliveries: number;
   settledDirectVisibleText: boolean;
   routedCounts: Record<ReplyDispatchKind, number>;
@@ -183,7 +182,6 @@ export type AcpDispatchDeliveryCoordinator = {
   hasDeliveredFinalReply: () => boolean;
   hasDeliveredVisibleText: () => boolean;
   hasFailedVisibleTextDelivery: () => boolean;
-  requiresVisibleTextFallback: () => boolean;
   getRoutedCounts: () => Record<ReplyDispatchKind, number>;
   applyRoutedCounts: (counts: Record<ReplyDispatchKind, number>) => void;
 };
@@ -250,7 +248,6 @@ export function createAcpDispatchDeliveryCoordinator(params: {
     deliveredFinalReply: false,
     deliveredVisibleText: false,
     failedVisibleTextDelivery: false,
-    requiresVisibleTextFallback: false,
     queuedDirectVisibleTextDeliveries: 0,
     settledDirectVisibleText: false,
     routedCounts: {
@@ -282,7 +279,6 @@ export function createAcpDispatchDeliveryCoordinator(params: {
     const failedVisibleCount = failedCounts.block + failedCounts.final;
     if (failedVisibleCount > 0) {
       state.failedVisibleTextDelivery = true;
-      state.requiresVisibleTextFallback = true;
     }
     if (state.queuedDirectVisibleTextDeliveries > failedVisibleCount) {
       state.deliveredVisibleText = true;
@@ -459,13 +455,11 @@ export function createAcpDispatchDeliveryCoordinator(params: {
       if (!result.ok) {
         if (tracksVisibleText) {
           state.failedVisibleTextDelivery = true;
-          if (!result.delivered) {
-            state.requiresVisibleTextFallback = true;
-          }
         }
         logVerbose(
           `dispatch-acp: route-reply (acp/${kind}) failed: ${result.error ?? "unknown error"}`,
         );
+        return false;
       }
       if (result.suppressed) {
         if (kind === "final") {
@@ -475,9 +469,6 @@ export function createAcpDispatchDeliveryCoordinator(params: {
           state.deliveredVisibleText = true;
         }
         return true;
-      }
-      if (!result.delivered) {
-        return false;
       }
       if (kind === "tool" && meta?.toolCallId && result.messageId) {
         state.toolMessageByCallId.set(meta.toolCallId, {
@@ -522,7 +513,6 @@ export function createAcpDispatchDeliveryCoordinator(params: {
       state.settledDirectVisibleText = false;
     } else if (!delivered && tracksVisibleText) {
       state.failedVisibleTextDelivery = true;
-      state.requiresVisibleTextFallback = true;
     }
     if (kind === "block" && delivered) {
       hasPendingDirectBlockReplyDelivery = true;
@@ -542,7 +532,6 @@ export function createAcpDispatchDeliveryCoordinator(params: {
     hasDeliveredFinalReply: () => state.deliveredFinalReply,
     hasDeliveredVisibleText: () => state.deliveredVisibleText,
     hasFailedVisibleTextDelivery: () => state.failedVisibleTextDelivery,
-    requiresVisibleTextFallback: () => state.requiresVisibleTextFallback,
     getRoutedCounts: () => ({ ...state.routedCounts }),
     applyRoutedCounts: (counts) => {
       counts.tool += state.routedCounts.tool;

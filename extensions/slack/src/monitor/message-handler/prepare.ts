@@ -653,8 +653,41 @@ export async function prepareSlackMessage(params: {
   }
   const { senderId, allowFromLower } = authorization;
   const messageText = message.text ?? "";
+  let resolvedSenderName = normalizeOptionalString(message.username);
+  const resolveSenderName = async (): Promise<string> => {
+    if (resolvedSenderName) {
+      return resolvedSenderName;
+    }
+    if (message.user) {
+      const sender = await ctx.resolveUserName(message.user);
+      const normalized = normalizeOptionalString(sender?.name);
+      if (normalized) {
+        resolvedSenderName = normalized;
+        return resolvedSenderName;
+      }
+    }
+    resolvedSenderName = message.user ?? message.bot_id ?? "unknown";
+    return resolvedSenderName;
+  };
   const mentionMetadata = collectSlackMentionMetadata(messageText);
   const { mentionedUserIds, mentionedSubteamIds, hasAnyMention } = mentionMetadata;
+  const messageAssistantThreadContext = resolveSlackMessageAssistantThreadContext(message);
+  const assistantContextLookupChannelId =
+    messageAssistantThreadContext?.assistantChannelId ?? message.channel;
+  const assistantContextLookupThreadTs =
+    messageAssistantThreadContext?.threadTs ?? message.thread_ts ?? message.ts;
+  const cachedAssistantThreadContext = isDirectMessage
+    ? ctx.getSlackAssistantThreadContext(
+        assistantContextLookupChannelId,
+        assistantContextLookupThreadTs,
+      )
+    : undefined;
+  const restoredAssistantThreadContextPromise =
+    isDirectMessage &&
+    !cachedAssistantThreadContext &&
+    !hasSlackAssistantThreadMetadata(messageAssistantThreadContext)
+      ? restoreSlackAssistantThreadContextFromMetadata({ ctx, message })
+      : Promise.resolve(undefined);
   const { explicitlyMentionedBotUser, explicitlyMentionedBotSubteam, explicitlyMentioned } =
     await resolveSlackExplicitMentionState({
       ctx,
@@ -676,23 +709,7 @@ export async function prepareSlackMessage(params: {
     : isGroupDm
       ? "group"
       : "channel";
-  const messageAssistantThreadContext = resolveSlackMessageAssistantThreadContext(message);
-  const assistantContextLookupChannelId =
-    messageAssistantThreadContext?.assistantChannelId ?? message.channel;
-  const assistantContextLookupThreadTs =
-    messageAssistantThreadContext?.threadTs ?? message.thread_ts ?? message.ts;
-  const cachedAssistantThreadContext = isDirectMessage
-    ? ctx.getSlackAssistantThreadContext(
-        assistantContextLookupChannelId,
-        assistantContextLookupThreadTs,
-      )
-    : undefined;
-  const restoredAssistantThreadContext =
-    isDirectMessage &&
-    !cachedAssistantThreadContext &&
-    !hasSlackAssistantThreadMetadata(messageAssistantThreadContext)
-      ? await restoreSlackAssistantThreadContextFromMetadata({ ctx, message })
-      : undefined;
+  const restoredAssistantThreadContext = await restoredAssistantThreadContextPromise;
   const assistantThreadContext = mergeSlackAssistantThreadContext(
     messageAssistantThreadContext,
     cachedAssistantThreadContext ?? restoredAssistantThreadContext,
@@ -704,8 +721,10 @@ export async function prepareSlackMessage(params: {
   if (assistantThreadContextToCache) {
     ctx.saveSlackAssistantThreadContext(assistantThreadContextToCache);
   }
+  const channelReplyToMode =
+    channelConfig?.replyToMode ?? resolveSlackReplyToMode(account, channelChatType);
   const willImplicitlyThreadReply =
-    isRoom && !channelRequireMention && resolveSlackReplyToMode(account, channelChatType) !== "off";
+    isRoom && !channelRequireMention && channelReplyToMode !== "off";
   const seedTopLevelRoomThreadBySource =
     opts.source === "app_mention" ||
     opts.wasMentioned === true ||
@@ -719,6 +738,7 @@ export async function prepareSlackMessage(params: {
     isGroupDm,
     isRoom,
     isRoomish,
+    channelConfig,
     seedTopLevelRoomThread: seedTopLevelRoomThreadBySource,
     assistantThreadTs: assistantThreadContext?.threadTs,
   });
@@ -763,6 +783,7 @@ export async function prepareSlackMessage(params: {
       isGroupDm,
       isRoom,
       isRoomish,
+      channelConfig,
       seedTopLevelRoomThread: true,
       assistantThreadTs: assistantThreadContext?.threadTs,
     });
@@ -821,6 +842,14 @@ export async function prepareSlackMessage(params: {
       return null;
     }
   }
+  const senderNameForAuthPromise: Promise<
+    { ok: true; name: string | undefined } | { ok: false; error: unknown }
+  > = ctx.allowNameMatching
+    ? resolveSenderName().then(
+        (name) => ({ ok: true, name }),
+        (error: unknown) => ({ ok: false, error }),
+      )
+    : Promise.resolve({ ok: true, name: undefined });
   const directThreadRoutedToDmSession =
     !assistantThreadContext &&
     isDirectMessage &&
@@ -852,22 +881,6 @@ export async function prepareSlackMessage(params: {
           );
   }
 
-  let resolvedSenderName = normalizeOptionalString(message.username);
-  const resolveSenderName = async (): Promise<string> => {
-    if (resolvedSenderName) {
-      return resolvedSenderName;
-    }
-    if (message.user) {
-      const sender = await ctx.resolveUserName(message.user);
-      const normalized = normalizeOptionalString(sender?.name);
-      if (normalized) {
-        resolvedSenderName = normalized;
-        return resolvedSenderName;
-      }
-    }
-    resolvedSenderName = message.user ?? message.bot_id ?? "unknown";
-    return resolvedSenderName;
-  };
   const recordDroppedHistory = async (
     reason: "slack-mention-detection-unavailable" | "slack-no-mention" | "slack-other-mention",
   ): Promise<void> => {
@@ -926,7 +939,11 @@ export async function prepareSlackMessage(params: {
       },
     });
   };
-  const senderNameForAuth = ctx.allowNameMatching ? await resolveSenderName() : undefined;
+  const senderNameForAuthResult = await senderNameForAuthPromise;
+  if (!senderNameForAuthResult.ok) {
+    throw senderNameForAuthResult.error;
+  }
+  const senderNameForAuth = senderNameForAuthResult.name;
 
   const allowTextCommands = shouldHandleTextCommands({
     cfg,
@@ -1047,20 +1064,46 @@ export async function prepareSlackMessage(params: {
     return null;
   }
 
+  // Thread participation is broad on Slack; only an explicit bot mention escapes this gate.
+  // Native bot identity distinguishes bot pings from other Slack mentions.
+  const ignoreOtherMentions = channelConfig?.ignoreOtherMentions ?? false;
+  if (isRoom && ignoreOtherMentions && Boolean(ctx.botUserId) && hasAnyMention && !wasMentioned) {
+    logInboundDrop({
+      log: logVerbose,
+      channel: "slack",
+      reason: "other-mention",
+      target: senderId,
+    });
+    await recordDroppedHistory("slack-other-mention");
+    return null;
+  }
+
   if (isRoom && shouldRequireMention && messageIngress.activationAccess.shouldSkip) {
     ctx.logger.info({ channel: message.channel, reason: "no-mention" }, "skipping channel message");
     await recordDroppedHistory("slack-no-mention");
     return null;
   }
 
-  const threadStarter =
+  const threadStarterPromise =
     isThreadReply && threadTs
-      ? await resolveSlackThreadStarter({
+      ? resolveSlackThreadStarter({
           channelId: message.channel,
           threadTs,
           client: ctx.app.client,
         })
-      : null;
+      : Promise.resolve(null);
+  const chatType = resolveSlackChatType(conversation.resolvedChannelType);
+  const inboundEventKind = classifyChannelInboundEvent({
+    conversation: { kind: chatType },
+    unmentionedGroupPolicy: resolveUnmentionedGroupInboundPolicy({
+      cfg,
+      agentId: route.agentId,
+    }),
+    wasMentioned: effectiveWasMentioned,
+    hasControlCommand: hasControlCommandInMessage,
+    hasAbortRequest,
+  });
+  const threadStarter = await threadStarterPromise;
   const resolvedMessageContent = await resolveSlackMessageContent({
     message,
     isThreadReply,
@@ -1075,18 +1118,6 @@ export async function prepareSlackMessage(params: {
     return null;
   }
   const { rawBody, effectiveDirectMedia } = resolvedMessageContent;
-  const chatType = resolveSlackChatType(conversation.resolvedChannelType);
-  const inboundEventKind = classifyChannelInboundEvent({
-    conversation: { kind: chatType },
-    unmentionedGroupPolicy: resolveUnmentionedGroupInboundPolicy({
-      cfg,
-      agentId: route.agentId,
-    }),
-    wasMentioned: effectiveWasMentioned,
-    hasControlCommand: hasControlCommandInMessage,
-    hasAbortRequest,
-  });
-
   const ackReaction = resolveAckReaction(cfg, route.agentId, {
     channel: "slack",
     accountId: account.accountId,
@@ -1098,11 +1129,13 @@ export async function prepareSlackMessage(params: {
       ctx: { ChatType: chatType, InboundEventKind: inboundEventKind },
     }) === "message_tool_only";
   const statusReactionsExplicitlyEnabled = cfg.messages?.statusReactions?.enabled === true;
+  const isRoomEvent = inboundEventKind === "room_event";
   const shouldAckReaction = () =>
     Boolean(
       ackReaction &&
       shouldAckReactionGate({
         scope: ctx.ackReactionScope as AckReactionScope | undefined,
+        inboundEventKind,
         isDirect: isDirectMessage,
         isGroup: isRoomish,
         isMentionableGroup: isRoom,
@@ -1116,11 +1149,14 @@ export async function prepareSlackMessage(params: {
   const ackReactionMessageTs = message.ts;
   const allowToolOnlyStatusReaction =
     statusReactionsExplicitlyEnabled && (effectiveWasMentioned || shouldBypassMention);
+  const shouldSendConfiguredAck = shouldAckReaction();
   const shouldSendAckReaction =
-    shouldAckReaction() && (!sourceRepliesAreToolOnly || allowToolOnlyStatusReaction);
+    shouldSendConfiguredAck &&
+    (!sourceRepliesAreToolOnly || allowToolOnlyStatusReaction || isRoomEvent);
   const statusReactionsWillHandle =
     Boolean(ackReactionMessageTs) &&
-    cfg.messages?.statusReactions?.enabled !== false &&
+    !isRoomEvent &&
+    statusReactionsExplicitlyEnabled &&
     shouldSendAckReaction;
   const ackReactionPromise =
     !statusReactionsWillHandle && shouldSendAckReaction && ackReactionMessageTs && ackReactionValue
@@ -1252,7 +1288,7 @@ export async function prepareSlackMessage(params: {
   const {
     threadStarterBody,
     threadHistoryBody,
-    threadSessionPreviousTimestamp,
+    shouldSeedInitialThreadContext,
     threadLabel,
     threadStarterMedia,
   } = await resolveSlackThreadContextData({
@@ -1298,6 +1334,7 @@ export async function prepareSlackMessage(params: {
       id: senderId,
       name: senderName,
       displayLabel: senderName,
+      isBot: isBotMessage || undefined,
     },
     conversation: {
       kind: chatType,
@@ -1347,7 +1384,7 @@ export async function prepareSlackMessage(params: {
       thread: {
         // Only include thread starter body for NEW sessions (existing sessions already have it in their transcript)
         starterBody:
-          !directThreadRoutedToDmSession && !threadSessionPreviousTimestamp
+          !directThreadRoutedToDmSession && shouldSeedInitialThreadContext
             ? threadStarterBody
             : undefined,
         historyBody: supplementalThreadHistoryBody,
@@ -1367,7 +1404,7 @@ export async function prepareSlackMessage(params: {
         isThreadReply &&
         threadTs &&
         !directThreadRoutedToDmSession &&
-        !threadSessionPreviousTimestamp
+        shouldSeedInitialThreadContext
           ? true
           : undefined,
       ...buildSlackMentionContextPayload({
@@ -1381,6 +1418,7 @@ export async function prepareSlackMessage(params: {
       }),
     },
   }) satisfies FinalizedMsgContext;
+  ctxPayload.ReplyToMode = replyToMode;
 
   if (isRoomish && !shouldRequireMention) {
     channelHistory.record({
@@ -1413,7 +1451,9 @@ export async function prepareSlackMessage(params: {
   }
 
   if (shouldLogVerbose()) {
-    logVerbose(`slack inbound: channel=${message.channel} from=${slackFrom} preview="${preview}"`);
+    logVerbose(
+      `slack inbound: account=${route.accountId} agent=${route.agentId} channel=${message.channel} message_ts=${message.ts ?? "unknown"} thread_ts=${effectiveMessageThreadId ?? "none"} from=${slackFrom} chat=${chatType} chars=${rawBody.length}`,
+    );
   }
 
   const updateLastRouteSessionKey = resolveInboundLastRouteSessionKey({ route, sessionKey });

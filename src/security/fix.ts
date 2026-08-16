@@ -449,7 +449,6 @@ export async function fixSecurityFootguns(opts?: {
     includePaths = await collectIncludePathsRecursive({
       configPath: snap.path,
       parsed: snap.parsed,
-      env,
     }).catch(() => []);
   }
 

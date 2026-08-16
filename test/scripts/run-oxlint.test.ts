@@ -310,19 +310,19 @@ describe("run-oxlint", () => {
             CHILD_PID_PATH: childPidPath,
             OPENCLAW_OXLINT_SHARD_HEARTBEAT_MS: "0",
             OPENCLAW_OXLINT_SHARD_KILL_GRACE_MS: "25",
-            OPENCLAW_OXLINT_SHARD_TIMEOUT_MS: "1000",
+            OPENCLAW_OXLINT_SHARD_TIMEOUT_MS: "250",
           },
           extraArgs: [],
           runner,
           shard: { name: "timeout-group-test", args: [] },
         });
 
-        await waitFor(() => existsSync(childPidPath), 15_000);
+        await waitFor(() => existsSync(childPidPath), 2_000);
         childPid = Number(readFileSync(childPidPath, "utf8"));
         expect(isProcessAlive(childPid)).toBe(true);
 
         await expect(command).resolves.toBe(124);
-        await waitFor(() => !isProcessAlive(childPid), 15_000);
+        await waitFor(() => !isProcessAlive(childPid), 2_000);
       } finally {
         if (childPid && isProcessAlive(childPid)) {
           process.kill(childPid, "SIGKILL");

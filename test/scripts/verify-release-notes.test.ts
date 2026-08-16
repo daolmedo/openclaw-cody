@@ -4,6 +4,9 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  canonicalMainCommitMatches,
+  canonicalPullRequests,
+  collectReleaseProvenanceOverrides,
   contaminatingPullRequestReferences,
   countTopLevelSectionBullets,
   createGithubSnapshotState,
@@ -11,11 +14,15 @@ import {
   defaultGithubSnapshotPath,
   githubApiWithSnapshot,
   highlightCountError,
-  mergeContributionRecords,
   persistGithubSnapshot,
   releaseNoteReferences,
+  releasePullRequestReferencesToSuppress,
+  releaseProvenanceMarkers,
+  renderedContributionRecordReferences,
+  resolvedReleasePullRequests,
   standardRevertedHash,
   subtractShippedPullRequests,
+  validateReleaseProvenanceOverrides,
   withoutExcludedContributionRecords,
 } from "../../.agents/skills/openclaw-changelog-update/scripts/verify-release-notes.mjs";
 
@@ -38,50 +45,225 @@ function git(cwd: string, args: string[]): string {
 }
 
 describe("release-note verification", () => {
-  it("preserves current contribution metadata while merging an optional historical seed", () => {
-    const current = {
-      legacyIssues: new Map([[20, { references: [], thanks: ["reporter"] }]]),
-      pullRequests: new Map([
-        [
-          10,
-          {
-            externalReferences: ["GHSA-current"],
-            references: [20],
-            thanks: ["current-author"],
-          },
-        ],
+  it("accepts only exact release provenance markers for active commits", () => {
+    const releaseCommit = "a".repeat(40);
+    const markerCommit = "b".repeat(40);
+    const body = [
+      `Release provenance: ${releaseCommit} -> #104905, #102980, #104956`,
+      `Release provenance for ${"c".repeat(40)} -> #123`,
+    ].join("\n");
+
+    expect(releaseProvenanceMarkers(body)).toEqual([
+      {
+        commit: releaseCommit,
+        pullRequests: [104905, 102980, 104956],
+      },
+    ]);
+    expect(
+      collectReleaseProvenanceOverrides([
+        { body: "", hash: releaseCommit },
+        { body, hash: markerCommit },
       ]),
-    };
-    const seed = {
-      legacyIssues: new Map([[21, { references: [], thanks: ["seed-reporter"] }]]),
-      pullRequests: new Map([
-        [
-          10,
-          {
-            externalReferences: ["GHSA-seed"],
-            references: [21],
-            thanks: ["seed-author"],
-          },
-        ],
+    ).toEqual(new Map([[releaseCommit, [104905, 102980, 104956]]]));
+    expect(resolvedReleasePullRequests([104939], [], false, [104905, 102980, 104956])).toEqual([
+      104905, 102980, 104956,
+    ]);
+    expect(
+      releasePullRequestReferencesToSuppress(
+        [],
+        "test(live): harden GPT-5.6 nonce retries for July (#104939)",
+        [104905, 102980, 104956],
+        true,
+      ),
+    ).toEqual([104939]);
+  });
+
+  it("rejects malformed, out-of-range, or conflicting release provenance markers", () => {
+    const releaseCommit = "a".repeat(40);
+    const firstMarkerCommit = "b".repeat(40);
+    const secondMarkerCommit = "c".repeat(40);
+
+    expect(() => releaseProvenanceMarkers("Release provenance: short -> #123")).toThrow(
+      "invalid release provenance marker",
+    );
+    expect(() =>
+      collectReleaseProvenanceOverrides([
+        {
+          body: `Release provenance: ${"d".repeat(40)} -> #104905`,
+          hash: firstMarkerCommit,
+        },
       ]),
+    ).toThrow("release provenance marker targets commit outside the active range");
+    expect(() =>
+      collectReleaseProvenanceOverrides([
+        { body: "", hash: releaseCommit },
+        {
+          body: `Release provenance: ${releaseCommit} -> #104905`,
+          hash: firstMarkerCommit,
+        },
+        {
+          body: `Release provenance: ${releaseCommit} -> #104956`,
+          hash: secondMarkerCommit,
+        },
+      ]),
+    ).toThrow(`conflicting release provenance markers for ${releaseCommit}`);
+  });
+
+  it("requires release provenance PRs to be merged into current main", () => {
+    const releaseCommit = "a".repeat(40);
+    const mainCommit = "b".repeat(40);
+    const mergeCommit = "c".repeat(40);
+    const overrides = new Map([[releaseCommit, [104905]]]);
+    const validNode = {
+      __typename: "PullRequest",
+      baseRefName: "main",
+      mergeCommit: { oid: mergeCommit },
+      mergedAt: "2026-07-12T00:00:00Z",
     };
 
-    expect(mergeContributionRecords(current, seed)).toEqual({
-      legacyIssues: new Map([
-        [20, { externalReferences: [], references: [], thanks: ["reporter"] }],
-        [21, { externalReferences: [], references: [], thanks: ["seed-reporter"] }],
+    expect(() =>
+      validateReleaseProvenanceOverrides(
+        overrides,
+        new Map([[104905, validNode]]),
+        mainCommit,
+        () => true,
+      ),
+    ).not.toThrow();
+    for (const node of [
+      { ...validNode, baseRefName: "release/2026.7.1" },
+      { ...validNode, mergedAt: null },
+    ]) {
+      expect(() =>
+        validateReleaseProvenanceOverrides(
+          overrides,
+          new Map([[104905, node]]),
+          mainCommit,
+          () => true,
+        ),
+      ).toThrow("references non-main PR #104905");
+    }
+    expect(() =>
+      validateReleaseProvenanceOverrides(
+        overrides,
+        new Map([[104905, validNode]]),
+        mainCommit,
+        () => false,
+      ),
+    ).toThrow("references non-main PR #104905");
+  });
+
+  it("uses the original main PR for explicit and uniquely matched backports", () => {
+    const mainCommit = {
+      authorEmail: "maintainer@example.com",
+      authorName: "Maintainer",
+      changedPaths: new Set(["src/channel.ts"]),
+      hash: "a".repeat(40),
+      pullRequests: [123],
+      subject: "fix(channel): preserve durable replies",
+    };
+    const explicitBackport = {
+      authorEmail: "other@example.com",
+      authorName: "Other",
+      body: `(cherry picked from commit ${mainCommit.hash})`,
+      changedPaths: new Set(["src/channel.ts"]),
+      hash: "b".repeat(40),
+      subject: "fix(channel): preserve durable replies",
+    };
+    const integratedBackport = {
+      authorEmail: mainCommit.authorEmail,
+      authorName: mainCommit.authorName,
+      body: "",
+      changedPaths: new Set(["src/channel.ts", "src/release.ts"]),
+      hash: "c".repeat(40),
+      subject: "fix(channel): preserve durable replies",
+    };
+    const pullRequestBackport = {
+      authorEmail: mainCommit.authorEmail,
+      authorName: mainCommit.authorName,
+      body: "Backport of #123 to release/2026.7.1.",
+      changedPaths: new Set(["src/channel.ts"]),
+      hash: "d".repeat(40),
+      subject: "fix(channel): keep replies after renewal",
+    };
+
+    expect(canonicalMainCommitMatches(explicitBackport, [mainCommit])).toEqual([mainCommit.hash]);
+    expect(canonicalMainCommitMatches(integratedBackport, [mainCommit])).toEqual([mainCommit.hash]);
+    expect(canonicalMainCommitMatches(pullRequestBackport, [mainCommit])).toEqual([
+      mainCommit.hash,
+    ]);
+    expect(
+      canonicalMainCommitMatches(pullRequestBackport, [
+        {
+          ...mainCommit,
+          pullRequests: [],
+          body: "Original main PR #123.",
+          subject: "fix(channel): preserve durable replies",
+        },
       ]),
-      pullRequests: new Map([
-        [
-          10,
-          {
-            externalReferences: ["GHSA-current", "GHSA-seed"],
-            references: [20, 21],
-            thanks: ["current-author", "seed-author"],
-          },
-        ],
+    ).toEqual([]);
+    expect(
+      canonicalMainCommitMatches(pullRequestBackport, [
+        {
+          ...mainCommit,
+          pullRequests: [999],
+          subject: "fix(channel): keep replies after renewal",
+        },
       ]),
-    });
+    ).toEqual([]);
+    expect(
+      canonicalMainCommitMatches(
+        { ...pullRequestBackport, authorEmail: "other@example.com", authorName: "Other" },
+        [mainCommit],
+      ),
+    ).toEqual([]);
+    expect(
+      canonicalMainCommitMatches(
+        { ...pullRequestBackport, changedPaths: new Set(["src/other.ts"]) },
+        [mainCommit],
+      ),
+    ).toEqual([]);
+    expect(
+      canonicalMainCommitMatches({ ...pullRequestBackport, body: "Related #123." }, [mainCommit]),
+    ).toEqual([]);
+    expect(
+      canonicalMainCommitMatches(pullRequestBackport, [
+        mainCommit,
+        { ...mainCommit, hash: "e".repeat(40), pullRequests: [123] },
+      ]),
+    ).toEqual([]);
+    expect(
+      canonicalMainCommitMatches(pullRequestBackport, [
+        mainCommit,
+        {
+          ...mainCommit,
+          body: "Original main PR #123.",
+          hash: "f".repeat(40),
+          pullRequests: [],
+        },
+      ]),
+    ).toEqual([mainCommit.hash]);
+    expect(canonicalPullRequests([456], [123])).toEqual([123]);
+  });
+
+  it("keeps the release PR without an unambiguous main forward-port", () => {
+    const releaseCommit = {
+      authorEmail: "maintainer@example.com",
+      authorName: "Maintainer",
+      body: "",
+      changedPaths: new Set(["src/channel.ts"]),
+      hash: "c".repeat(40),
+      subject: "fix(channel): preserve durable replies",
+    };
+    const ambiguousMainCommits = ["a", "b"].map((prefix) => ({
+      authorEmail: releaseCommit.authorEmail,
+      authorName: releaseCommit.authorName,
+      changedPaths: new Set(["src/channel.ts"]),
+      hash: prefix.repeat(40),
+      subject: "fix(channel): preserve durable replies (#123)",
+    }));
+
+    expect(canonicalMainCommitMatches(releaseCommit, ambiguousMainCommits)).toEqual([]);
+    expect(canonicalPullRequests([456], [])).toEqual([456]);
   });
 
   it("stores default GitHub snapshots in the shared Git common directory", () => {
@@ -326,6 +508,16 @@ describe("release-note verification", () => {
     ).toEqual([]);
   });
 
+  it("ignores the stale generated record while rewriting it", () => {
+    const record = {
+      pullRequests: new Map([[104732, { references: [102289], thanks: ["fuller-stack-dev"] }]]),
+      legacyIssues: new Map(),
+    };
+
+    expect(renderedContributionRecordReferences(record, true)).toEqual([]);
+    expect(renderedContributionRecordReferences(record, false)).toEqual([104732, 102289]);
+  });
+
   it("excludes Unreleased records from a cumulative shipped tag boundary", () => {
     const changelog = [
       "# Changelog",
@@ -388,12 +580,8 @@ describe("release-note verification", () => {
 
     const filtered = withoutExcludedContributionRecords(record, new Set([2, 10]));
 
-    expect([...filtered.pullRequests]).toEqual([
-      [1, { externalReferences: [], references: [], thanks: [] }],
-    ]);
-    expect([...filtered.legacyIssues]).toEqual([
-      [11, { externalReferences: [], references: [], thanks: [] }],
-    ]);
+    expect([...filtered.pullRequests]).toEqual([[1, { references: [], thanks: [] }]]);
+    expect([...filtered.legacyIssues]).toEqual([[11, { references: [], thanks: [] }]]);
   });
 
   it("does not treat the shipped baseline inventory as current release-note references", () => {
@@ -463,6 +651,57 @@ describe("release-note verification", () => {
       expect(readFileSync(join(cwd, "CHANGELOG.md"), "utf8")).toContain(
         `This audited record covers the complete HEAD..${targetSha} history:`,
       );
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves CHANGELOG.md untouched when the rendered ledger fails validation", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "openclaw-release-notes-"));
+    try {
+      git(cwd, ["init", "-q"]);
+      const changelog = [
+        "# Changelog",
+        "",
+        "## 2026.7.1",
+        "",
+        "### Highlights",
+        "",
+        "- Only one highlight.",
+        "",
+        "### Changes",
+        "",
+        "### Fixes",
+        "",
+      ].join("\n");
+      writeFileSync(join(cwd, "CHANGELOG.md"), changelog);
+      git(cwd, ["add", "CHANGELOG.md"]);
+      git(cwd, ["commit", "-qm", "initial"]);
+      const manifestPath = join(cwd, "release-manifest.json");
+
+      const result = spawnSync(
+        process.execPath,
+        [
+          verifier,
+          "--base",
+          "HEAD",
+          "--target",
+          "HEAD",
+          "--main-ref",
+          "HEAD",
+          "--manifest",
+          manifestPath,
+          "--version",
+          "2026.7.1",
+          "--write-ledger",
+        ],
+        { cwd, encoding: "utf8" },
+      );
+
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("1 errors");
+      expect(JSON.parse(readFileSync(manifestPath, "utf8")).version).toBe("2026.7.1");
+      expect(readFileSync(join(cwd, "CHANGELOG.md"), "utf8")).toBe(changelog);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }

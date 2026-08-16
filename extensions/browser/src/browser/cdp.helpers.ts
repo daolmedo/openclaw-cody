@@ -5,15 +5,17 @@
  * redaction/headers, and request/response correlation over WebSocket.
  */
 import { parseBrowserHttpUrl, redactCdpUrl } from "openclaw/plugin-sdk/browser-config";
+import { readProviderJsonResponse } from "openclaw/plugin-sdk/provider-http";
+import { sleep } from "openclaw/plugin-sdk/runtime-env";
 import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
 import WebSocket from "ws";
 import { isLoopbackHost } from "../gateway/net.js";
 import {
   SsrFBlockedError,
+  isPrivateNetworkAllowedByPolicy,
   type SsrFPolicy,
   resolvePinnedHostnameWithPolicy,
 } from "../infra/net/ssrf.js";
-import { redactToolPayloadText } from "../logging/redact.js";
 import {
   getDirectAgentForCdp,
   withManagedProxyForCdpUrl,
@@ -22,10 +24,8 @@ import {
 import { CDP_HTTP_REQUEST_TIMEOUT_MS, CDP_WS_HANDSHAKE_TIMEOUT_MS } from "./cdp-timeouts.js";
 import { BrowserCdpEndpointBlockedError } from "./errors.js";
 import { resolveBrowserRateLimitMessage } from "./rate-limit-message.js";
-import { withAllowedHostname, withExactHostnamePolicy } from "./ssrf-policy-helpers.js";
+import { withExactHostnamePolicy } from "./ssrf-policy-helpers.js";
 import { normalizeBrowserTimerDelayMs } from "./timer-delay.js";
-
-const CDP_URL_IN_TEXT_RE = /\b(?:https?|wss?):\/\/[^\s"'<>`]+/gi;
 
 export { isLoopbackHost };
 export { parseBrowserHttpUrl, redactCdpUrl };
@@ -86,10 +86,42 @@ export function scopeCdpPolicyToConfiguredEndpoint(
   return withExactHostnamePolicy(ssrfPolicy, new URL(cdpUrl).hostname);
 }
 
+type CdpEndpointSource =
+  | { source?: "configured" }
+  | { source: "discovered"; configuredUrl: string };
+
+function cdpEndpointAuthority(url: string): string {
+  const parsed = new URL(url);
+  const usesTls = parsed.protocol === "https:" || parsed.protocol === "wss:";
+  const port = parsed.port || (usesTls ? "443" : "80");
+  return `${usesTls ? "tls" : "plain"}://${parsed.hostname}:${port}`;
+}
+
+function assertDiscoveredCdpEndpointMatchesConfigured(
+  discoveredUrl: string,
+  configuredUrl: string,
+  ssrfPolicy?: SsrFPolicy,
+): void {
+  if (
+    !ssrfPolicy ||
+    isPrivateNetworkAllowedByPolicy(ssrfPolicy) ||
+    cdpEndpointAuthority(discoveredUrl) === cdpEndpointAuthority(configuredUrl)
+  ) {
+    return;
+  }
+  throw new BrowserCdpEndpointBlockedError({
+    cause: new SsrFBlockedError("discovered CDP endpoint changed configured authority"),
+  });
+}
+
 export async function assertCdpEndpointAllowed(
   cdpUrl: string,
   ssrfPolicy?: SsrFPolicy,
+  options?: CdpEndpointSource,
 ): Promise<void> {
+  if (options?.source === "discovered") {
+    assertDiscoveredCdpEndpointMatchesConfigured(cdpUrl, options.configuredUrl, ssrfPolicy);
+  }
   if (!ssrfPolicy) {
     return;
   }
@@ -98,9 +130,13 @@ export async function assertCdpEndpointAllowed(
     throw new Error(`Invalid CDP URL protocol: ${parsed.protocol.replace(":", "")}`);
   }
   try {
-    const policy = isLoopbackHost(parsed.hostname)
-      ? withAllowedHostname(ssrfPolicy, parsed.hostname)
-      : ssrfPolicy;
+    // Configured loopback CDP is a local control plane. Discovered endpoints
+    // must remain within the caller's selected-host policy and cannot claim a
+    // new loopback exception through returned JSON.
+    const policy =
+      isLoopbackHost(parsed.hostname) && options?.source !== "discovered"
+        ? withExactHostnamePolicy(ssrfPolicy, parsed.hostname)
+        : ssrfPolicy;
     await resolvePinnedHostnameWithPolicy(parsed.hostname, {
       policy,
     });
@@ -174,8 +210,7 @@ export function getHeadersWithAuth(url: string, headers: Record<string, string> 
   return mergedHeaders;
 }
 
-/** Remove URL userinfo after callers have converted it to an Authorization header. */
-export function stripCdpUrlCredentials(url: string): string {
+function stripUrlCredentials(url: string): string {
   try {
     const parsed = new URL(url);
     if (!parsed.username && !parsed.password) {
@@ -187,12 +222,6 @@ export function stripCdpUrlCredentials(url: string): string {
   } catch {
     return url;
   }
-}
-
-/** Redact CDP URLs and credential-shaped text before dependency errors leave Browser. */
-export function redactCdpErrorText(text: string): string {
-  const redactedUrls = text.replace(CDP_URL_IN_TEXT_RE, (match) => redactCdpUrl(match) ?? match);
-  return redactToolPayloadText(redactedUrls);
 }
 
 /** Append a JSON endpoint path to a CDP HTTP base URL. */
@@ -337,7 +366,7 @@ export async function fetchJson<T>(
 ): Promise<T> {
   const { response, release } = await fetchCdpChecked(url, timeoutMs, init, ssrfPolicy);
   try {
-    return (await response.json()) as T;
+    return await readProviderJsonResponse<T>(response, "cdp-json");
   } finally {
     await release();
   }
@@ -364,14 +393,14 @@ export async function fetchCdpChecked(
   };
   try {
     const headers = getHeadersWithAuth(url, (init?.headers as Record<string, string>) || {});
-    const fetchUrl = stripCdpUrlCredentials(url);
+    const fetchUrl = stripUrlCredentials(url);
     const res = await withManagedProxyForCdpUrl(fetchUrl, () =>
-      withNoProxyForCdpUrl(fetchUrl, async () => {
+      withNoProxyForCdpUrl(url, async () => {
         const parsedUrl = new URL(fetchUrl);
         // Loopback CDP is an OpenClaw control plane, not page navigation. Allow
         // its exact host while preserving the caller's policy for remote hosts.
         const policy = isLoopbackHost(parsedUrl.hostname)
-          ? withAllowedHostname(ssrfPolicy, parsedUrl.hostname)
+          ? withExactHostnamePolicy(ssrfPolicy, parsedUrl.hostname)
           : (ssrfPolicy ?? { allowPrivateNetwork: true });
         const guarded = await fetchWithSsrFGuard({
           url: fetchUrl,
@@ -422,12 +451,12 @@ export function openCdpWebSocket(
     typeof opts?.handshakeTimeoutMs === "number" && Number.isFinite(opts.handshakeTimeoutMs)
       ? Math.max(1, Math.floor(opts.handshakeTimeoutMs))
       : CDP_WS_HANDSHAKE_TIMEOUT_MS;
-  const connectionUrl = stripCdpUrlCredentials(wsUrl);
-  const agent = getDirectAgentForCdp(connectionUrl);
+  const agent = getDirectAgentForCdp(wsUrl);
+  const bypassUrl = stripUrlCredentials(wsUrl);
   return withManagedProxyForCdpUrl(
-    connectionUrl,
+    bypassUrl,
     () =>
-      new WebSocket(connectionUrl, {
+      new WebSocket(wsUrl, {
         handshakeTimeout: handshakeTimeoutMs,
         ...(Object.keys(headers).length ? { headers } : {}),
         ...(agent ? { agent } : {}),
@@ -443,12 +472,6 @@ type CdpSocketOptions = {
   handshakeRetryDelayMs?: number;
   handshakeMaxRetryDelayMs?: number;
 };
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
 
 function normalizeRetryCount(value: number | undefined, fallback: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {

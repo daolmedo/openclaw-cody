@@ -112,12 +112,25 @@ describe("OpenAI provider Codex transport hooks", () => {
         baseUrl: "https://chatgpt.com/backend-api/codex",
         input: ["text", "image"],
         contextWindow: 372_000,
-        contextTokens: 272_000,
+        contextTokens: 372_000,
         maxTokens: 128_000,
         thinkingLevelMap: { off: null, xhigh: "xhigh", max: "max" },
       });
     },
   );
+
+  it("does not invent a bare GPT-5.6 alias for the Codex transport", () => {
+    const provider = buildOpenAIProvider();
+
+    const model = provider.resolveDynamicModel?.({
+      provider: "openai",
+      modelId: "gpt-5.6",
+      authProfileMode: "oauth",
+      modelRegistry: { find: () => null },
+    } as never);
+
+    expect(model).toBeUndefined();
+  });
 
   it.each([
     { name: "fills a missing map", thinkingLevelMap: undefined, expectedOff: null },
@@ -137,7 +150,7 @@ describe("OpenAI provider Codex transport hooks", () => {
           baseUrl: "https://api.openai.com/v1",
           reasoning: true,
           input: ["text"],
-          cost: { input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25 },
+          cost: { input: 1, output: 6, cacheRead: 0.1, cacheWrite: 1.25 },
           contextWindow: 372_000,
           maxTokens: 128_000,
           ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
@@ -149,7 +162,6 @@ describe("OpenAI provider Codex transport hooks", () => {
       api: "openai-chatgpt-responses",
       baseUrl: "https://chatgpt.com/backend-api/codex",
       input: ["text", "image"],
-      contextTokens: 272_000,
       thinkingLevelMap: { off: expectedOff, xhigh: "xhigh", max: "max" },
     });
   });

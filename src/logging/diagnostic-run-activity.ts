@@ -55,11 +55,6 @@ type DiagnosticRunProgressActivityEvent = Pick<
   "runId" | "sessionId" | "sessionKey" | "reason"
 >;
 
-// Quiet-but-alive tools are normal agent behavior, so blocked-tool recovery
-// keeps this floor even when stuckSessionAbortMs is lower. CLI children also
-// retain their independent byte watchdog for truly silent subprocesses.
-export const BLOCKED_TOOL_CALL_ABORT_FLOOR_MS = 15 * 60_000;
-
 export type DiagnosticSessionActivitySnapshot = {
   activeWorkKind?: DiagnosticSessionActiveWorkKind;
   hasActiveEmbeddedRun?: boolean;

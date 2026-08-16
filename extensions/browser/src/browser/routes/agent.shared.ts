@@ -6,7 +6,6 @@
  */
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveBrowserNavigationProxyMode } from "../browser-proxy-mode.js";
-import { redactCdpErrorText } from "../cdp.helpers.js";
 import { toBrowserErrorResponse } from "../errors.js";
 import {
   assertBrowserNavigationResultAllowed,
@@ -59,7 +58,7 @@ export function handleRouteError(ctx: BrowserRouteContext, res: BrowserResponse,
   if (browserMapped) {
     return jsonError(res, browserMapped.status, browserMapped.message);
   }
-  jsonError(res, 500, redactCdpErrorText(String(err)));
+  jsonError(res, 500, String(err));
 }
 
 /** Resolve the requested browser profile and respond with JSON on failure. */
@@ -109,7 +108,7 @@ export async function requirePwAi(
     [
       `Playwright is not available in this gateway build; '${feature}' is unsupported.`,
       "Reinstall or update OpenClaw so the core browser runtime dependency is present, then restart the gateway. In Docker, also install Chromium with the bundled playwright-core CLI.",
-      "Docs: /tools/browser#playwright-requirement",
+      "Docs: /tools/browser-control#playwright-requirement",
     ].join("\n"),
   );
   return null;
@@ -151,6 +150,8 @@ export async function withRouteTabContext<T>(
     // Agent routes can address local-managed tabs through Playwright when per-tab WS discovery lags.
     const tab = await profileCtx.ensureTabAvailable(params.targetId, {
       allowPlaywrightFallback: true,
+      signal: params.req.signal,
+      timeoutMs: params.ctx.state().resolved.actionTimeoutMs,
     });
     if (params.enforceCurrentUrlAllowed) {
       await assertBrowserNavigationResultAllowed({
@@ -168,6 +169,8 @@ export async function withRouteTabContext<T>(
           profileCtx,
           targetId: tab.targetId,
           fallbackUrl,
+          signal: params.req.signal,
+          timeoutMs: params.ctx.state().resolved.actionTimeoutMs,
         }),
     });
   } catch (err) {
@@ -185,8 +188,16 @@ export async function resolveSafeRouteTabUrl(params: {
   profileCtx: ProfileContext;
   targetId: string;
   fallbackUrl?: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
 }): Promise<string | undefined> {
-  const tabs = await params.profileCtx.listTabs().catch(() => []);
+  let tabs: Array<{ targetId: string; url: string }>;
+  try {
+    tabs = await params.profileCtx.listTabs({ signal: params.signal, timeoutMs: params.timeoutMs });
+  } catch {
+    params.signal?.throwIfAborted();
+    tabs = [];
+  }
   const candidateUrl =
     tabs.find((tab) => tab.targetId === params.targetId)?.url ?? params.fallbackUrl;
   if (!candidateUrl) {

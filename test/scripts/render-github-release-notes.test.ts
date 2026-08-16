@@ -171,31 +171,6 @@ describe("GitHub release-note rendering", () => {
     expect(rendered.body).toContain("## 2026.7.1");
   });
 
-  it("prefers a correction tag's dedicated changelog section when one exists", () => {
-    const changelog = [
-      "# Changelog",
-      "",
-      "## 2026.7.1-2",
-      "",
-      "- Correction-only fix.",
-      "",
-      `## ${version}`,
-      "",
-      "- Stable release notes.",
-      "",
-    ].join("\n");
-    const rendered = renderGithubReleaseNotes({
-      changelog,
-      version,
-      tag: "v2026.7.1-2",
-      repository,
-    });
-
-    expect(rendered.body).toContain("## 2026.7.1-2");
-    expect(rendered.body).toContain("Correction-only fix.");
-    expect(rendered.body).not.toContain("Stable release notes.");
-  });
-
   it("round-trips canonical shipped baseline exclusions and rejects malformed metadata", () => {
     const line = formatShippedBaselineExclusions([
       { ref: "v2026.6.11", count: 2, pullRequests: [108, 101] },

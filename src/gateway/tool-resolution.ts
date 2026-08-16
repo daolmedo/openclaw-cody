@@ -7,7 +7,6 @@ import {
   resolveSubagentToolPolicyForSession,
 } from "../agents/agent-tools.policy.js";
 import { createOpenClawTools } from "../agents/openclaw-tools.js";
-import { resolveSandboxRuntimeStatus } from "../agents/sandbox/runtime-status.js";
 import {
   isSubagentEnvelopeSession,
   resolveSubagentCapabilityStore,
@@ -104,11 +103,6 @@ export function resolveGatewayScopedTools(params: {
     messageProvider: params.messageProvider,
     accountId: params.accountId ?? null,
   });
-  const sandboxRuntime = resolveSandboxRuntimeStatus({
-    cfg: params.cfg,
-    sessionKey: params.sessionKey,
-  });
-  const sandboxPolicy = sandboxRuntime.sandboxed ? sandboxRuntime.toolPolicy : undefined;
   const subagentStore = resolveSubagentCapabilityStore(params.sessionKey, {
     cfg: params.cfg,
   });
@@ -147,7 +141,6 @@ export function resolveGatewayScopedTools(params: {
     agentPolicy,
     agentProviderPolicy,
     groupPolicy,
-    sandboxPolicy,
     subagentPolicy,
     inheritedToolPolicy,
     defaultGatewayDeny.length > 0 ? { deny: defaultGatewayDeny } : undefined,
@@ -167,7 +160,6 @@ export function resolveGatewayScopedTools(params: {
     agentPolicy,
     agentProviderPolicy,
     groupPolicy,
-    sandboxPolicy,
     subagentPolicy,
     inheritedToolPolicy,
     gatewayRequestedTools.length > 0 ? { allow: gatewayRequestedTools } : undefined,
@@ -199,7 +191,6 @@ export function resolveGatewayScopedTools(params: {
     wrapBeforeToolCallHook: false,
     config: params.cfg,
     workspaceDir,
-    sandboxed: sandboxRuntime.sandboxed,
     pluginToolAllowlist: collectExplicitAllowlist([
       profilePolicy,
       providerProfilePolicy,
@@ -208,7 +199,6 @@ export function resolveGatewayScopedTools(params: {
       agentPolicy,
       agentProviderPolicy,
       groupPolicy,
-      sandboxPolicy,
       subagentPolicy,
       inheritedToolPolicy,
       gatewayRequestedTools.length > 0 ? { allow: gatewayRequestedTools } : undefined,
@@ -240,7 +230,6 @@ export function resolveGatewayScopedTools(params: {
         groupPolicy,
         agentId,
       }),
-      { policy: sandboxPolicy, label: "sandbox tools.allow" },
       { policy: subagentPolicy, label: "subagent tools.allow" },
       { policy: inheritedToolPolicy, label: "inherited tools" },
     ],
@@ -270,5 +259,6 @@ export function resolveGatewayScopedTools(params: {
   return {
     agentId,
     tools,
+    workspaceDir,
   };
 }

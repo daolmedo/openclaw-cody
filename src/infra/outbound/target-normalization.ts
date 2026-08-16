@@ -67,12 +67,15 @@ export function resolveReservedTargetLiteral(params: {
     return undefined;
   }
   const normalized = normalizeTargetLiteral(stripped);
+  if (!normalized) {
+    return undefined;
+  }
   const reserved = new Set(
     reservedLiterals
       .map(normalizeTargetLiteral)
       .filter((literal): literal is string => Boolean(literal)),
   );
-  return normalized && reserved.has(normalized) ? normalized : undefined;
+  return reserved.has(normalized) ? normalized : undefined;
 }
 
 function resetTargetNormalizerCacheForTests(): void {
@@ -285,4 +288,3 @@ function hashSignature(value: string): string {
   }
   return (hash >>> 0).toString(36);
 }
-export { testing as __testing };

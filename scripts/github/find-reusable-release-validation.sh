@@ -161,9 +161,9 @@ if ! jq -e \
   no_reuse "workflow SHA is not on trusted main lineage"
 fi
 
-# Exact-target reuse still requires internally consistent npm version stamps.
-# Native version metadata is outside the npm-only extended-stable contract.
-if ! (cd "$REPO_DIR" && node "$PREFLIGHT" --npm-versions-only >&2); then
+# Exact-target reuse still requires internally consistent version stamps
+# (for example package.json must agree with the macOS plist).
+if ! (cd "$REPO_DIR" && node "$PREFLIGHT" --macos-versions-only >&2); then
   no_reuse "target version metadata is inconsistent"
 fi
 
@@ -299,7 +299,6 @@ for ((index = 0; index < run_count; index += 1)); do
   write_output evidence_root_run_id "$run_id"
   write_output evidence_run_url "$run_url"
   write_output evidence_sha "$prior_sha"
-  write_output evidence_policy "exact-target-full-validation-v1"
   write_output changed_path_count "0"
   write_output changed_paths "[]"
   write_output evidence_manifest "$(jq -c '.manifest' <<< "$validation_record")"

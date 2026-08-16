@@ -9,6 +9,7 @@ import type {
   TelegramDirectConfig,
   TelegramGroupConfig,
 } from "openclaw/plugin-sdk/config-contracts";
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
 import { deriveLastRoutePolicy } from "openclaw/plugin-sdk/routing";
 import { normalizeAccountId, resolveThreadSessionKeys } from "openclaw/plugin-sdk/routing";
 import { logVerbose } from "openclaw/plugin-sdk/runtime-env";
@@ -46,10 +47,6 @@ import {
 import { enforceTelegramDmAccess } from "./dm-access.js";
 import { evaluateTelegramGroupBaseAccess } from "./group-access.js";
 import {
-  resolveTelegramGroupHistoryContextModeForAccount,
-  type TelegramGroupHistoryContextMode,
-} from "./group-history-context.js";
-import {
   buildTelegramStatusReactionVariants,
   type TelegramReactionEmoji,
   isTelegramSupportedReactionEmoji,
@@ -64,14 +61,9 @@ export type {
   TelegramMediaRef,
 } from "./bot-message-context.types.js";
 
-type TelegramMessageContextRuntime = typeof import("./bot-message-context.runtime.js");
-
-let telegramMessageContextRuntimePromise: Promise<TelegramMessageContextRuntime> | undefined;
-
-async function loadTelegramMessageContextRuntime() {
-  telegramMessageContextRuntimePromise ??= import("./bot-message-context.runtime.js");
-  return await telegramMessageContextRuntimePromise;
-}
+const loadTelegramMessageContextRuntime = createLazyRuntimeModule(
+  () => import("./bot-message-context.runtime.js"),
+);
 
 type TelegramMessageContextPayload = Awaited<ReturnType<typeof buildTelegramInboundContextPayload>>;
 type TelegramReactionApi = (
@@ -110,7 +102,6 @@ export type TelegramMessageContext = {
   historyKey?: string;
   historyLimit: BuildTelegramMessageContextParams["historyLimit"];
   groupHistories: BuildTelegramMessageContextParams["groupHistories"];
-  groupHistoryContextMode?: TelegramGroupHistoryContextMode;
   route: ReturnType<typeof resolveTelegramConversationRoute>["route"];
   skillFilter: TelegramMessageContextPayload["skillFilter"];
   sendTyping: () => Promise<void>;
@@ -152,18 +143,6 @@ export const buildTelegramMessageContext = async ({
   sendChatActionHandler,
 }: BuildTelegramMessageContextParams): Promise<TelegramMessageContext | null> => {
   const msg = primaryCtx.message;
-  let admissionFinalized = false;
-  const finalizeAdmission = async (admitted: boolean): Promise<boolean> => {
-    if (admissionFinalized) {
-      return false;
-    }
-    admissionFinalized = true;
-    return (await options?.afterAdmissionShouldDrop?.(admitted)) ?? false;
-  };
-  const dropBeforeAdmission = async (): Promise<null> => {
-    await finalizeAdmission(false);
-    return null;
-  };
   const chatId = msg.chat.id;
   const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
   const senderId = msg.from?.id ? String(msg.from.id) : "";
@@ -287,7 +266,7 @@ export const buildTelegramMessageContext = async ({
       reason: "non-default account requires explicit binding",
       target: route.accountId,
     });
-    return await dropBeforeAdmission();
+    return null;
   }
   const groupAllowOverride = firstDefined(topicConfig?.allowFrom, groupConfig?.allowFrom);
   const dmAllow = await resolveTelegramDmAllow({
@@ -322,27 +301,27 @@ export const buildTelegramMessageContext = async ({
   if (!baseAccess.allowed) {
     if (baseAccess.reason === "group-disabled") {
       logVerbose(`Blocked telegram group ${chatId} (group disabled)`);
-      return await dropBeforeAdmission();
+      return null;
     }
     if (baseAccess.reason === "topic-disabled") {
       logVerbose(
         `Blocked telegram topic ${chatId} (${resolvedThreadId ?? "unknown"}) (topic disabled)`,
       );
-      return await dropBeforeAdmission();
+      return null;
     }
     logVerbose(
       isGroup
         ? `Blocked telegram group sender ${senderId || "unknown"} (group allowFrom override)`
         : `Blocked telegram DM sender ${senderId || "unknown"} (DM allowFrom override)`,
     );
-    return await dropBeforeAdmission();
+    return null;
   }
 
   const requireTopic = directConfig?.requireTopic;
   const topicRequiredButMissing = !isGroup && requireTopic === true && dmThreadId == null;
   if (topicRequiredButMissing) {
     logVerbose(`Blocked telegram DM ${chatId}: requireTopic=true but no topic present`);
-    return await dropBeforeAdmission();
+    return null;
   }
 
   const sendTyping = async () => {
@@ -386,7 +365,7 @@ export const buildTelegramMessageContext = async ({
       upsertPairingRequest,
     }))
   ) {
-    return await dropBeforeAdmission();
+    return null;
   }
   let initialTypingCueSent = false;
   const ensureConfiguredBindingReady = async (): Promise<boolean> => {
@@ -449,15 +428,14 @@ export const buildTelegramMessageContext = async ({
     agentId: route.agentId,
   });
   const baseRequireMention = resolveGroupRequireMention(chatId);
+  const groupRequireMention = firstDefined(
+    topicConfig?.requireMention,
+    activationOverride,
+    telegramGroupConfig?.requireMention,
+    baseRequireMention,
+  );
   const requireMention =
-    isGroup && bindingMode.kind === "plugin-owned-runtime"
-      ? false
-      : firstDefined(
-          topicConfig?.requireMention,
-          activationOverride,
-          telegramGroupConfig?.requireMention,
-          baseRequireMention,
-        );
+    isGroup && bindingMode.kind === "plugin-owned-runtime" ? false : groupRequireMention;
 
   const recordChannelActivity =
     runtime?.recordChannelActivity ??
@@ -496,28 +474,19 @@ export const buildTelegramMessageContext = async ({
     logger,
   });
   if (!bodyResult) {
-    return await dropBeforeAdmission();
-  }
-
-  const groupHistoryContextMode = isGroup
-    ? resolveTelegramGroupHistoryContextModeForAccount({
-        cfg,
-        accountId: route.accountId,
-      })
-    : undefined;
-
-  if (!(await ensureConfiguredBindingReady())) {
-    return await dropBeforeAdmission();
-  }
-  if (await finalizeAdmission(true)) {
     return null;
   }
-  // Direct chats are now reply-eligible; send the first typing cue before
-  // expensive context/session construction without showing typing for dropped turns.
-  if (!isGroup) {
+
+  if (!(await ensureConfiguredBindingReady())) {
+    return null;
+  }
+
+  // Send the first typing cue before expensive context/session construction,
+  // but only after intake has accepted the message as a non-room-event turn.
+  if (bodyResult.inboundEventKind !== "room_event") {
     initialTypingCueSent = true;
     void sendTyping().catch((err: unknown) => {
-      logVerbose(`telegram early direct typing cue failed for chat ${chatId}: ${String(err)}`);
+      logVerbose(`telegram early typing cue failed for chat ${chatId}: ${String(err)}`);
     });
   }
 
@@ -543,10 +512,11 @@ export const buildTelegramMessageContext = async ({
     historyKey: bodyResult.historyKey ?? "",
     historyLimit,
     groupHistories,
-    groupHistoryContextMode,
     groupConfig,
     topicConfig,
     effectiveWasMentioned: bodyResult.effectiveWasMentioned,
+    inboundEventKind: bodyResult.inboundEventKind,
+    groupRequireMention: Boolean(groupRequireMention),
     mentionFacts: bodyResult.mentionFacts,
     hasControlCommand: bodyResult.hasControlCommand,
     stickerCacheHit: bodyResult.stickerCacheHit,
@@ -561,7 +531,8 @@ export const buildTelegramMessageContext = async ({
     topicName,
     sessionRuntime,
   });
-  const canShowStatusReaction = ctxPayload.InboundEventKind !== "room_event";
+  const isRoomEvent = ctxPayload.InboundEventKind === "room_event";
+  const canShowStatusReaction = !isRoomEvent;
   const ackReaction = resolveAckReaction(cfg, route.agentId, {
     channel: "telegram",
     accountId: account.accountId,
@@ -570,10 +541,10 @@ export const buildTelegramMessageContext = async ({
     ackReaction && isTelegramSupportedReactionEmoji(ackReaction) ? ackReaction : undefined;
   const removeAckAfterReply = cfg.messages?.removeAckAfterReply ?? false;
   const shouldSendAckReaction = Boolean(
-    canShowStatusReaction &&
     ackReaction &&
     shouldAckReactionGate({
       scope: ackReactionScope,
+      inboundEventKind: ctxPayload.InboundEventKind,
       isDirect: !isGroup,
       isGroup,
       isMentionableGroup: isGroup,
@@ -585,7 +556,10 @@ export const buildTelegramMessageContext = async ({
   );
   const statusReactionsConfig = cfg.messages?.statusReactions;
   const statusReactionsEnabled =
-    statusReactionsConfig?.enabled === true && Boolean(reactionApi) && shouldSendAckReaction;
+    canShowStatusReaction &&
+    statusReactionsConfig?.enabled === true &&
+    Boolean(reactionApi) &&
+    shouldSendAckReaction;
   const resolvedStatusReactionEmojis = statusReactionsEnabled
     ? resolveTelegramStatusReactionEmojis({
         initialEmoji: ackReaction,
@@ -681,7 +655,6 @@ export const buildTelegramMessageContext = async ({
     historyKey: bodyResult.historyKey ?? "",
     historyLimit,
     groupHistories,
-    groupHistoryContextMode,
     route,
     skillFilter,
     sendTyping,

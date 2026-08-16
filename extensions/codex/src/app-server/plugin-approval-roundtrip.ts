@@ -6,6 +6,7 @@ import {
   callGatewayTool,
   type EmbeddedRunAttemptParams,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
+import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { resolveCodexGatewayTimeoutWithGraceMs } from "./attempt-timeouts.js";
 
 const DEFAULT_CODEX_APPROVAL_TIMEOUT_MS = 120_000;
@@ -41,10 +42,6 @@ export async function requestPluginApproval(params: {
   toolName: string;
   toolCallId?: string;
   allowedDecisions?: ExecApprovalDecision[];
-  finalResponse?: {
-    signal?: AbortSignal;
-    onAccepted?: (result: ApprovalRequestResult) => void;
-  };
 }): Promise<ApprovalRequestResult | undefined> {
   const timeoutMs = DEFAULT_CODEX_APPROVAL_TIMEOUT_MS;
   return callGatewayTool(
@@ -67,17 +64,7 @@ export async function requestPluginApproval(params: {
       twoPhase: true,
       ...(params.allowedDecisions ? { allowedDecisions: params.allowedDecisions } : {}),
     },
-    params.finalResponse
-      ? {
-          expectFinal: true,
-          onAccepted: (payload) => {
-            if (payload && typeof payload === "object" && !Array.isArray(payload)) {
-              params.finalResponse?.onAccepted?.(payload as ApprovalRequestResult);
-            }
-          },
-          signal: params.finalResponse.signal,
-        }
-      : { expectFinal: false },
+    { expectFinal: false },
   ) as Promise<ApprovalRequestResult | undefined>;
 }
 
@@ -93,33 +80,6 @@ export function approvalRequestExplicitlyUnavailable(result: unknown): boolean {
     return false;
   }
   return descriptor !== undefined && "value" in descriptor && descriptor.value === null;
-}
-
-/** Reads a decision only from a final response, never from the accepted-phase payload. */
-export function readFinalApprovalDecision(
-  result: unknown,
-): ExecApprovalDecision | null | undefined {
-  if (!result || typeof result !== "object" || Array.isArray(result)) {
-    return undefined;
-  }
-  try {
-    const status = Object.getOwnPropertyDescriptor(result, "status");
-    if (status && "value" in status && status.value === "accepted") {
-      return undefined;
-    }
-    const decision = Object.getOwnPropertyDescriptor(result, "decision");
-    if (!decision || !("value" in decision)) {
-      return undefined;
-    }
-    return decision.value === null ||
-      decision.value === "allow-once" ||
-      decision.value === "allow-always" ||
-      decision.value === "deny"
-      ? decision.value
-      : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 /** Waits for the gateway's final approval decision, respecting turn aborts. */
@@ -171,7 +131,7 @@ export function mapExecDecisionToOutcome(
 }
 
 function truncateForGateway(value: string, maxLength: number): string {
-  return value.length <= maxLength ? value : `${value.slice(0, Math.max(0, maxLength - 3))}...`;
+  return value.length <= maxLength ? value : `${truncateUtf16Safe(value, maxLength - 3)}...`;
 }
 
 function toLintErrorObject(value: unknown, fallbackMessage: string): Error {

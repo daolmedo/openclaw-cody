@@ -2,12 +2,14 @@
  * Runs model and image fallback chains across provider/model candidates.
  */
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { TRANSCRIPT_NOT_CONTINUABLE_ERROR_CODE } from "../../packages/agent-core/src/errors.js";
 import { sanitizeForLog } from "../../packages/terminal-core/src/ansi.js";
 import {
   resolveAgentModelFallbackValues,
   resolveAgentModelPrimaryValue,
 } from "../config/model-input.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { isCronTerminalAbortReasonText } from "../cron/service/execution-errors.js";
 import { emitFailoverEvent } from "../infra/diagnostic-events.js";
 import { formatErrorMessage, toErrorObject } from "../infra/errors.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
@@ -31,6 +33,7 @@ import { isActiveUnusableWindow } from "./auth-profiles/usage-state.js";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "./defaults.js";
 import { isLikelyContextOverflowError } from "./embedded-agent-helpers/errors.js";
 import type { FailoverReason } from "./embedded-agent-helpers/types.js";
+import { isOpenClawAbortableWrapper } from "./embedded-agent-runner/run/abortable.js";
 import {
   FailoverError,
   buildFailoverRemediationHint,
@@ -75,7 +78,7 @@ import {
   resolveConfiguredModelRef,
   resolveModelRefFromString,
 } from "./model-selection-resolve.js";
-import { isAgentRunRestartAbortReason } from "./run-termination.js";
+import { isAgentRunDirectAbortReason, isAgentRunRestartAbortReason } from "./run-termination.js";
 import {
   resolveSessionSuspensionReason,
   runWithDeferredSessionSuspension,
@@ -84,6 +87,14 @@ import {
 } from "./session-suspension.js";
 
 const log = createSubsystemLogger("model-fallback");
+
+function isTranscriptNotContinuableError(err: unknown): boolean {
+  if (!err || typeof err !== "object") {
+    return false;
+  }
+  const code = (err as { code?: unknown }).code;
+  return code === TRANSCRIPT_NOT_CONTINUABLE_ERROR_CODE;
+}
 
 function hasExactConfiguredProviderModel(params: {
   cfg?: OpenClawConfig;
@@ -165,7 +176,7 @@ export function isFallbackSummaryError(err: unknown): err is FallbackSummaryErro
   return err instanceof FallbackSummaryError;
 }
 
-export type ModelFallbackRunOptions = {
+type ModelFallbackRunOptions = {
   allowTransientCooldownProbe?: boolean;
   isFinalFallbackAttempt?: boolean;
 };
@@ -188,21 +199,74 @@ type ModelFallbackRunFn<T> = (
   options?: ModelFallbackRunOptions,
 ) => Promise<T>;
 
+function isTerminalAbortReasonString(reason: string): boolean {
+  return isCronTerminalAbortReasonText(reason);
+}
+
+function getErrorCauseCandidates(err: Error): unknown[] {
+  const candidates: unknown[] = [];
+  if ("cause" in err && err.cause !== undefined) {
+    candidates.push(err.cause);
+    if (err.cause instanceof Error && "cause" in err.cause && err.cause.cause !== undefined) {
+      candidates.push(err.cause.cause);
+    }
+  }
+  return candidates;
+}
+
+function isTerminalAbortCandidate(candidate: unknown): boolean {
+  if (typeof candidate === "string") {
+    return isTerminalAbortReasonString(candidate);
+  }
+  if (!(candidate instanceof Error)) {
+    return false;
+  }
+  if (isAgentRunRestartAbortReason(candidate)) {
+    return true;
+  }
+  if (candidate.name === "TimeoutError") {
+    return true;
+  }
+  if (candidate.name === "ClientDisconnectError") {
+    return true;
+  }
+  return isTerminalAbortReasonString(candidate.message);
+}
+
 function isTerminalAbort(signal: AbortSignal | undefined): boolean {
   if (!signal?.aborted) {
     return false;
   }
   const reason = signal.reason;
-  if (!(reason instanceof Error)) {
+
+  if (reason instanceof Error) {
+    const candidates: unknown[] = [reason, ...getErrorCauseCandidates(reason)];
+    return candidates.some(isTerminalAbortCandidate);
+  }
+
+  return isTerminalAbortCandidate(reason);
+}
+
+function isTerminalAbortFromError(err: unknown): boolean {
+  if (!(err instanceof Error)) {
     return false;
   }
-  if (isAgentRunRestartAbortReason(reason)) {
+  if (isAgentRunRestartAbortReason(err)) {
     return true;
   }
-  if (reason.name === "TimeoutError") {
-    return true;
+  const causeCandidates = getErrorCauseCandidates(err);
+  if (err.name !== "AbortError") {
+    return false;
   }
-  return reason.name === "ClientDisconnectError";
+  for (const candidate of causeCandidates) {
+    if (isAgentRunRestartAbortReason(candidate)) {
+      return true;
+    }
+  }
+  if (!isOpenClawAbortableWrapper(err)) {
+    return false;
+  }
+  return causeCandidates.some(isTerminalAbortCandidate);
 }
 
 function isCallerAbortSignal(signal: AbortSignal | undefined): boolean {
@@ -354,7 +418,10 @@ async function runFallbackCandidate<T>(params: {
     if (isTerminalAbort(params.abortSignal) || isCallerAbortSignal(params.abortSignal)) {
       throw err;
     }
-    if (isAgentRunRestartAbortReason(err)) {
+    if (isAgentRunDirectAbortReason(err) || isAgentRunRestartAbortReason(err)) {
+      throw err;
+    }
+    if (isTerminalAbortFromError(err)) {
       throw err;
     }
     // Normalize abort-wrapped rate-limit errors (e.g. Google Vertex RESOURCE_EXHAUSTED)
@@ -496,16 +563,20 @@ function isCliAgentRuntime(runtime: string | undefined, cfg: OpenClawConfig | un
 
 async function resolveModelFallbackCandidateHarnessAuthPrecheck(
   params: ModelFallbackRuntimeContext & ModelCandidate,
-): Promise<{ skipsProviderAuthCooldown: boolean }> {
-  if (!params.cfg) {
-    return { skipsProviderAuthCooldown: false };
-  }
+): Promise<{ skipsProviderAuthCooldown: boolean; agentHarnessRuntimeOverride?: string }> {
   const agentHarnessRuntimeOverride = params.resolveAgentHarnessRuntimeOverride?.(
     params.provider,
     params.model,
   );
+  const result = (skipsProviderAuthCooldown: boolean) => ({
+    skipsProviderAuthCooldown,
+    agentHarnessRuntimeOverride,
+  });
+  if (!params.cfg) {
+    return result(false);
+  }
   if (isCliProvider(params.provider, params.cfg)) {
-    return { skipsProviderAuthCooldown: true };
+    return result(true);
   }
   const agentRuntimeOverride = normalizeOptionalAgentRuntimeId(agentHarnessRuntimeOverride);
   const harnessPolicy = resolveAgentHarnessPolicy({
@@ -526,13 +597,13 @@ async function resolveModelFallbackCandidateHarnessAuthPrecheck(
   if (isCliAgentRuntime(agentRuntime, params.cfg)) {
     // CLI runtimes own their transport/auth, so stale OpenClaw provider
     // profile state must not block the candidate before the CLI starts.
-    return { skipsProviderAuthCooldown: true };
+    return result(true);
   }
   if (agentRuntime === "openclaw") {
-    return { skipsProviderAuthCooldown: false };
+    return result(false);
   }
   if (agentRuntime === "auto" || (agentRuntime === "codex" && agentRuntimeSource === "implicit")) {
-    return { skipsProviderAuthCooldown: false };
+    return result(false);
   }
   await params.prepareAgentHarnessRuntime?.({
     provider: params.provider,
@@ -544,7 +615,7 @@ async function resolveModelFallbackCandidateHarnessAuthPrecheck(
   }
   // Explicit non-Codex plugin harnesses own transport/auth; stale OpenClaw
   // provider cooldowns must not block the harness before it starts.
-  return { skipsProviderAuthCooldown: agentRuntime !== "codex" };
+  return result(agentRuntime !== "codex");
 }
 
 function resolveCandidateAttemptError(
@@ -640,6 +711,20 @@ function findLiveSessionModelSwitchRedirectIndex(params: {
     }
   }
   return null;
+}
+
+function hasDifferentLiveSessionRuntimeSelection(params: {
+  error: LiveSessionModelSwitchError;
+  currentAgentHarnessRuntimeOverride?: string;
+}): boolean {
+  const normalizeRuntime = (runtime: string | undefined) => {
+    const normalized = normalizeOptionalAgentRuntimeId(runtime);
+    return normalized && !isDefaultAgentRuntimeId(normalized) ? normalized : undefined;
+  };
+  return (
+    normalizeRuntime(params.currentAgentHarnessRuntimeOverride) !==
+    normalizeRuntime(params.error.agentRuntimeOverride)
+  );
 }
 
 function throwFallbackFailureSummary(params: {
@@ -809,6 +894,7 @@ export const testing = {
   resolveImageFallbackCandidates,
   resolveCooldownDecision,
   resolveSessionSuspensionReason,
+  shouldDiscardDeferredSessionSuspension,
 } as const;
 
 export function resolveModelCandidateChain(
@@ -1308,9 +1394,12 @@ function shouldDiscardDeferredSessionSuspension(params: {
   return (
     isTerminalAbort(params.abortSignal) ||
     isCallerAbortSignal(params.abortSignal) ||
+    isAgentRunDirectAbortReason(params.error) ||
     isAgentRunRestartAbortReason(params.error) ||
+    isTerminalAbortFromError(params.error) ||
     isCommandLaneTaskTimeoutError(params.error) ||
     isNonProviderRuntimeCoordinationError(params.error) ||
+    isTranscriptNotContinuableError(params.error) ||
     isLikelyContextOverflowError(formatErrorMessage(params.error))
   );
 }
@@ -1706,6 +1795,9 @@ async function runWithModelFallbackInternal<T>(
       if (isNonProviderRuntimeCoordinationError(err)) {
         throw err;
       }
+      if (isTranscriptNotContinuableError(err)) {
+        throw err;
+      }
       if (transientProbeProviderForAttempt) {
         const probeFailureReason = describeFailoverError(err).reason;
         if (!shouldPreserveTransientCooldownProbeSlot(probeFailureReason)) {
@@ -1737,6 +1829,17 @@ async function runWithModelFallbackInternal<T>(
       // so the outer runner cannot loop on the conflicting model, but they
       // are not provider overloads.
       if (err instanceof LiveSessionModelSwitchError) {
+        // Runtime selection is part of the live switch transaction. The outer
+        // owner must apply it before any retry; redirecting here would pair the
+        // new model with the stale harness runtime captured by the caller.
+        if (
+          hasDifferentLiveSessionRuntimeSelection({
+            error: err,
+            currentAgentHarnessRuntimeOverride: candidateHarnessAuth.agentHarnessRuntimeOverride,
+          })
+        ) {
+          throw err;
+        }
         const liveSwitchTargetIndex = findLiveSessionModelSwitchRedirectIndex({
           error: err,
           candidates,

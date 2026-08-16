@@ -18,6 +18,7 @@ import {
   fetchWithSsrFGuard,
   withTrustedEnvProxyGuardedFetchMode,
 } from "../infra/net/fetch-guard.js";
+import { wrapGuardedBodyStream } from "../infra/net/guarded-body-stream.js";
 import { shouldUseEnvHttpProxyForUrl } from "../infra/net/proxy-env.js";
 import {
   mergeSsrFPolicies,
@@ -28,6 +29,11 @@ import {
 import type { Model } from "../llm/types.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { resolveDebugProxySettings } from "../proxy-capture/env.js";
+import {
+  resolveSecretSentinel,
+  SECRET_SENTINEL_PATTERN,
+  swapSecretSentinelsInText,
+} from "../secrets/sentinel.js";
 import { emitModelTransportDebug } from "./model-transport-debug.js";
 import { formatModelTransportDebugUrl } from "./model-transport-url.js";
 import { ProviderHttpError, readResponseTextLimited } from "./provider-http-errors.js";
@@ -50,6 +56,9 @@ const log = createSubsystemLogger("provider-transport-fetch");
  *  when a hostile streaming endpoint returns a never-ending JSON response
  *  without Content-Length. */
 const SSE_SYNTHESIZE_JSON_MAX_BYTES = 16 * 1024 * 1024;
+
+/** Max bytes read from a non-OK response body before truncation. */
+const SSE_NONOK_BODY_MAX_BYTES = 64 * 1024;
 
 /** Max decoded characters buffered while waiting for the next SSE event boundary. */
 const SSE_SANITIZE_BUFFER_MAX_CHARS = 16 * 1024 * 1024;
@@ -94,13 +103,60 @@ function findSseEventBoundary(buffer: string): { index: number; length: number }
   return best;
 }
 
+function capNonOkResponseBodyLazily(response: Response, maxBytes: number): Response {
+  const source = response.body;
+  if (!source) {
+    return response;
+  }
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let total = 0;
+  // Own the reader: Node can leak an internal pipeThrough writer rejection when
+  // downstream cancellation races the cap terminating the transform.
+  const capped = new ReadableStream<Uint8Array>({
+    start() {
+      reader = source.getReader();
+    },
+    async pull(controller) {
+      try {
+        const chunk = await reader?.read();
+        if (!chunk || chunk.done) {
+          controller.close();
+          return;
+        }
+        const remaining = maxBytes - total;
+        if (chunk.value.byteLength > remaining) {
+          if (remaining > 0) {
+            controller.enqueue(chunk.value.subarray(0, remaining));
+          }
+          total = maxBytes;
+          controller.close();
+          void reader?.cancel().catch(() => undefined);
+          return;
+        }
+        total += chunk.value.byteLength;
+        controller.enqueue(chunk.value);
+      } catch (error) {
+        controller.error(error);
+        void reader?.cancel(error).catch(() => undefined);
+      }
+    },
+    async cancel(reason) {
+      await reader?.cancel(reason).catch(() => undefined);
+    },
+  });
+  return new Response(capped, response);
+}
+
 function sanitizeOpenAISdkSseResponse(
   response: Response,
   options?: { synthesizeJsonAsSse?: boolean },
 ): Response {
   const contentType = response.headers.get("content-type") ?? "";
-  if (!response.ok || !response.body) {
+  if (!response.body) {
     return response;
+  }
+  if (!response.ok) {
+    return capNonOkResponseBodyLazily(response, SSE_NONOK_BODY_MAX_BYTES);
   }
   if (
     options?.synthesizeJsonAsSse === true &&
@@ -259,10 +315,6 @@ function isJsonContentType(contentType: string): boolean {
   return /\bapplication\/json\b/i.test(contentType) || /\+json\b/i.test(contentType);
 }
 
-function isOpenAISdkStreamContentType(contentType: string): boolean {
-  return /\btext\/event-stream\b/i.test(contentType) || isJsonContentType(contentType);
-}
-
 type OpenAISdkStreamBodyKind = "html" | "json" | "sse" | "unknown";
 
 function classifyOpenAISdkStreamBodyPrefix(text: string): OpenAISdkStreamBodyKind {
@@ -337,7 +389,20 @@ async function normalizeOpenAISdkStreamContentType(params: {
   localServiceLease?: ProviderLocalServiceLease;
 }): Promise<Response> {
   const contentType = params.response.headers.get("content-type") ?? "";
-  if (!params.response.ok || !params.response.body || isOpenAISdkStreamContentType(contentType)) {
+  if (!params.response.ok || !params.response.body) {
+    return params.response;
+  }
+  if (/\btext\/event-stream\b/i.test(contentType)) {
+    return params.response;
+  }
+  if (isJsonContentType(contentType)) {
+    // Some OpenAI-compatible gateways stream real SSE (`data: {...}`) but mislabel
+    // the response as JSON. Without relabeling, the JSON-wrap fallback below would
+    // re-prefix each frame as `data: data: {...}`, breaking JSON.parse in the SDK.
+    const kind = await classifyOpenAISdkStreamBody(params.response).catch(() => "unknown" as const);
+    if (kind === "sse") {
+      return withOpenAISdkStreamContentType(params.response, "text/event-stream; charset=utf-8");
+    }
     return params.response;
   }
   if (!contentType.trim()) {
@@ -517,12 +582,6 @@ function shouldBypassLongSdkRetry(response: Response): boolean {
   return status === 429;
 }
 
-const managedStreamCleanupRegistry = new FinalizationRegistry<{ finalize: () => Promise<void> }>(
-  (held) => {
-    void held.finalize();
-  },
-);
-
 function buildManagedResponse(
   response: Response,
   release: () => Promise<void>,
@@ -536,53 +595,18 @@ function buildManagedResponse(
     void release().finally(finalizeLocalServiceLease);
     return response;
   }
-  const source = response.body;
-  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-  let released = false;
-  const cleanupRegistrationToken = {};
-  const finalize = async () => {
-    if (released) {
-      return;
-    }
-    released = true;
-    managedStreamCleanupRegistry.unregister(cleanupRegistrationToken);
-    try {
-      await reader?.cancel().catch(() => undefined);
-      await release().catch(() => undefined);
-    } finally {
-      finalizeLocalServiceLease();
-    }
-  };
-  const wrappedBody = new ReadableStream<Uint8Array>({
-    start() {
-      reader = source.getReader();
-    },
-    async pull(controller) {
+  const wrappedBody = wrapGuardedBodyStream({
+    body: response.body,
+    // Lease release must survive a failed guard release so local services do not leak.
+    cleanup: async () => {
       try {
-        const chunk = await reader?.read();
-        if (!chunk || chunk.done) {
-          controller.close();
-          await finalize();
-          return;
-        }
-        refreshTimeout?.();
-        controller.enqueue(chunk.value);
-      } catch (error) {
-        controller.error(error);
-        await finalize();
-      }
-    },
-    async cancel(reason) {
-      try {
-        await reader?.cancel(reason);
+        await release().catch(() => undefined);
       } finally {
-        await finalize();
+        finalizeLocalServiceLease();
       }
     },
+    refreshTimeout,
   });
-  // Stream consumers should cancel deterministically; this catches abandoned
-  // wrapper bodies so guarded dispatchers and local-service leases do not leak.
-  managedStreamCleanupRegistry.register(wrappedBody, { finalize }, cleanupRegistrationToken);
   return new Response(wrappedBody, {
     status: response.status,
     statusText: response.statusText,
@@ -711,13 +735,13 @@ function canApplyFakeIpHostnamePolicy(value: unknown): value is string {
   );
 }
 
-function resolveModelTransportSsrFPolicy(params: {
-  model: Model;
+export function resolveProviderTransportSsrFPolicy(params: {
+  baseUrl?: string;
   url: string;
   allowPrivateNetwork?: boolean;
   trustConfiguredBaseUrlOrigin?: boolean;
 }): SsrFPolicy | undefined {
-  const baseUrl = (params.model as { baseUrl?: unknown }).baseUrl;
+  const baseUrl = params.baseUrl;
   const baseOrigin = resolveHttpOrigin(baseUrl);
   const requestOrigin = resolveHttpOrigin(params.url);
   const requestMatchesBaseOrigin =
@@ -739,6 +763,63 @@ function resolveModelTransportSsrFPolicy(params: {
     fakeIpPolicy,
     params.allowPrivateNetwork ? { allowPrivateNetwork: true } : undefined,
   );
+}
+
+function headersContainSecretSentinel(headers: HeadersInit | undefined): boolean {
+  if (!headers) {
+    return false;
+  }
+  for (const value of new Headers(headers).values()) {
+    if (value.includes("oc-sent-v1-")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function swapSecretSentinelsInUrl(url: string): { text: string; unknown: string[] } {
+  if (!url.includes("oc-sent-v1-")) {
+    return { text: url, unknown: [] };
+  }
+  const unknown = new Set<string>();
+  const text = url.replace(new RegExp(SECRET_SENTINEL_PATTERN.source, "g"), (sentinel) => {
+    const value = resolveSecretSentinel(sentinel);
+    if (value === undefined) {
+      unknown.add(sentinel);
+      return sentinel;
+    }
+    // Sentinels are URL-safe placeholders. Encode the real bytes so query/path structure is stable.
+    return encodeURIComponent(value);
+  });
+  return { text, unknown: [...unknown] };
+}
+
+function swapSecretSentinelsForEgress(params: { url: string; headers?: HeadersInit }): {
+  url: string;
+  headers?: Headers;
+} {
+  if (!params.url.includes("oc-sent-v1-") && !headersContainSecretSentinel(params.headers)) {
+    return { url: params.url };
+  }
+  const urlSwap = swapSecretSentinelsInUrl(params.url);
+  const headers = params.headers ? new Headers(params.headers) : undefined;
+  const unknown = new Set(urlSwap.unknown);
+  if (headers) {
+    for (const [name, value] of headers.entries()) {
+      const swapped = swapSecretSentinelsInText(value);
+      headers.set(name, swapped.text);
+      for (const sentinel of swapped.unknown) {
+        unknown.add(sentinel);
+      }
+    }
+  }
+  const unresolved = unknown.values().next().value;
+  if (unresolved) {
+    throw new Error(
+      `Secret sentinel ${unresolved} is not registered in this process; refusing to send request`,
+    );
+  }
+  return { url: urlSwap.text, ...(headers ? { headers } : {}) };
 }
 
 export function buildGuardedModelFetch(
@@ -770,7 +851,7 @@ export function buildGuardedModelFetch(
   return async (input, init) => {
     let localServiceLease: ProviderLocalServiceLease | undefined;
     const request = input instanceof Request ? new Request(input, init) : undefined;
-    const url =
+    const rawUrl =
       request?.url ??
       (input instanceof URL
         ? input.toString()
@@ -779,8 +860,14 @@ export function buildGuardedModelFetch(
           : (() => {
               throw new Error("Unsupported fetch input for transport-aware model request");
             })());
-    const policy = resolveModelTransportSsrFPolicy({
-      model,
+    const rawHeaders = request?.headers ?? init?.headers;
+    const swappedEgress = swapSecretSentinelsForEgress({
+      url: rawUrl,
+      headers: rawHeaders,
+    });
+    const url = swappedEgress.url;
+    const policy = resolveProviderTransportSsrFPolicy({
+      baseUrl: model.baseUrl,
       url,
       allowPrivateNetwork: requestConfig.allowPrivateNetwork,
       // Only operator-configured custom/local endpoints get exact-origin trust;
@@ -794,13 +881,15 @@ export function buildGuardedModelFetch(
       request &&
       ({
         method: request.method,
-        headers: request.headers,
+        headers: swappedEgress.headers ?? request.headers,
         body: request.body ?? undefined,
         redirect: request.redirect,
         signal: request.signal,
         ...(request.body ? ({ duplex: "half" } as const) : {}),
       } satisfies RequestInit & { duplex?: "half" });
-    const baseInit = requestInit ?? init;
+    const baseInit =
+      requestInit ??
+      (swappedEgress.headers && init ? { ...init, headers: swappedEgress.headers } : init);
     const synthesizeJsonAsSse = await requestBodyHasStreamTrue(request, baseInit);
     const baseSignal = baseInit?.signal ?? undefined;
     const localServiceSignal = buildModelRequestSignal(baseSignal, requestTimeoutMs);
@@ -828,14 +917,15 @@ export function buildGuardedModelFetch(
     emitModelTransportDebug(
       log,
       `[model-fetch] start provider=${model.provider} api=${model.api} model=${model.id} ` +
-        `method=${baseInit?.method ?? "GET"} url=${formatModelTransportDebugUrl(url)} timeoutMs=${requestTimeoutMs} ` +
+        // Log the pre-swap URL: the swapped URL can carry an injected credential in its path.
+        `method=${baseInit?.method ?? "GET"} url=${formatModelTransportDebugUrl(rawUrl)} timeoutMs=${requestTimeoutMs} ` +
         `proxy=${dispatcherPolicy ? "configured" : useEnvProxy ? "env" : "none"} ` +
         `policy=${policy ? "custom" : "default"}`,
     );
     try {
       localServiceLease = await ensureModelProviderLocalService(
         model,
-        baseInit?.headers,
+        rawHeaders,
         localServiceSignal,
       );
       result = await fetchWithSsrFGuard(

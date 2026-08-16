@@ -615,7 +615,7 @@ async function evaluateSystemRunPolicyPhase(
           sessionKey: parsed.sessionKey,
         },
       });
-      if (decision.decision === "allow-once" && decision.risk === "low") {
+      if (decision.decision === "allow-once") {
         approvalDecision = "allow-once";
         policy = evaluateSystemRunPolicy({
           security,

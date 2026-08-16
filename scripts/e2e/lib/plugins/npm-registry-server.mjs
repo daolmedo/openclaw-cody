@@ -6,6 +6,7 @@ import http from "node:http";
 import path from "node:path";
 
 const [portFile, ...packageArgs] = process.argv.slice(2);
+
 function normalizeUpstreamRegistry(raw) {
   if (!raw) {
     return undefined;
@@ -133,12 +134,12 @@ function resolveUpstreamRequestUrl(rawRequestUrl) {
   return `${upstreamRegistry}${requestUrl.pathname}${requestUrl.search}`;
 }
 
-async function proxyUpstream(rawRequestUrl, response) {
+async function proxyUpstream(requestUrl, response) {
   if (!upstreamRegistry) {
     return false;
   }
   try {
-    const upstreamUrl = resolveUpstreamRequestUrl(rawRequestUrl);
+    const upstreamUrl = resolveUpstreamRequestUrl(requestUrl);
     const upstreamResponse = await fetch(upstreamUrl, { redirect: "manual" });
     const body = Buffer.from(await upstreamResponse.arrayBuffer());
     // Fetch decodes compressed bodies but preserves upstream length metadata.

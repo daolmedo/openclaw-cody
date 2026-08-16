@@ -5,20 +5,24 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
-import { confirm, isCancel } from "@clack/prompts";
+import { confirm, isCancel, text } from "@clack/prompts";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { stripAnsi } from "../../../packages/terminal-core/src/ansi.js";
 import { stylePromptMessage } from "../../../packages/terminal-core/src/prompt-style.js";
+import { sanitizeTerminalText } from "../../../packages/terminal-core/src/safe-text.js";
 import { theme } from "../../../packages/terminal-core/src/theme.js";
 import {
   checkShellCompletionStatus,
   ensureCompletionCacheExists,
 } from "../../commands/doctor-completion.js";
-import { DOCTOR_DISABLE_CROSS_STATE_DIR_IMPORTS_ENV } from "../../commands/doctor-invocation.js";
 import { doctorCommand } from "../../commands/doctor.js";
 import {
   UPDATE_DEFER_CONFIGURED_PLUGIN_INSTALL_REPAIR_ENV,
+  UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION_ENV,
+  UPDATE_PARENT_ALLOWS_GATEWAY_SERVICE_REPAIR_ENV,
   UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE_ENV,
+  UPDATE_PARENT_SUPPORTS_GATEWAY_RESTART_ENV,
 } from "../../commands/doctor/shared/update-phase.js";
 import { createPreUpdateConfigSnapshot } from "../../config/backup-rotation.js";
 import {
@@ -43,6 +47,10 @@ import {
 import { resolveGatewayInstallEntrypoint } from "../../daemon/gateway-entrypoint.js";
 import { disableCurrentOpenClawUpdateLaunchdJob } from "../../daemon/launchd.js";
 import { resolveGatewayRestartLogPath } from "../../daemon/restart-logs.js";
+import {
+  resumeScheduledTaskAutoStartAfterUpdate,
+  suspendScheduledTaskAutoStartForUpdate,
+} from "../../daemon/schtasks.js";
 import { summarizeGatewayServiceLayout } from "../../daemon/service-layout.js";
 import type { GatewayServiceCommandConfig } from "../../daemon/service-types.js";
 import {
@@ -50,6 +58,7 @@ import {
   resolveGatewayService,
   type GatewayService,
 } from "../../daemon/service.js";
+import type { ClawHubRiskAcknowledgementRequest } from "../../infra/clawhub-install-trust.js";
 import { createLowDiskSpaceWarning } from "../../infra/disk-space.js";
 import { pathExists } from "../../infra/fs-safe.js";
 import { readJsonIfExists, writeJson } from "../../infra/json-files.js";
@@ -104,7 +113,11 @@ import {
   POST_CORE_UPDATE_SOURCE_CONFIG_PATH_ENV,
   type PreUpdateConfigRestoreInput,
 } from "../../infra/update-post-core-context.js";
-import { runGatewayUpdate, type UpdateRunResult } from "../../infra/update-runner.js";
+import {
+  resolveUpdateDoctorExecutionPolicy,
+  runGatewayUpdate,
+  type UpdateRunResult,
+} from "../../infra/update-runner.js";
 import { getWindowsSystem32ExePath } from "../../infra/windows-install-roots.js";
 import { normalizePluginsConfig, resolveEffectiveEnableState } from "../../plugins/config-state.js";
 import {
@@ -118,6 +131,7 @@ import {
   resolveTrustedSourceLinkedOfficialNpmSpec,
 } from "../../plugins/official-external-install-records.js";
 import {
+  isClawHubTrustSkippedOutcome,
   syncPluginsForUpdateChannel,
   updateNpmInstalledPlugins,
   type PluginUpdateIntegrityDriftParams,
@@ -141,6 +155,16 @@ import {
 import { commitPluginInstallRecordsWithConfig } from "../plugins-install-record-commit.js";
 import { listPersistedBundledPluginLocationBridges } from "../plugins-location-bridges.js";
 import { refreshPluginRegistryAfterConfigMutation } from "../plugins-registry-refresh.js";
+import {
+  registerSignalExitBarrier,
+  registerSignalExitGate,
+  waitForSignalExitBarriers,
+} from "../signal-exit-barrier.js";
+import {
+  hasNativePackageInstallPayload,
+  resolveBundleInstallRecordPayload,
+  validateBundleInstallRecordPayload,
+} from "./plugin-payload-validation.js";
 import {
   convergenceWarningsToOutcomes,
   runPostCorePluginConvergence,
@@ -238,6 +262,78 @@ type MissingPluginInstallPayload = {
 };
 
 type PostUpdatePluginWarning = NonNullable<PostCorePluginUpdateResult["warnings"]>[number];
+
+export function resolvePostSyncPluginUpdateSkipIds(params: {
+  switchedToClawHub: readonly string[];
+  switchedToNpm: readonly string[];
+  repairedMissingPayloadIds: ReadonlySet<string>;
+}): Set<string> {
+  return new Set([
+    ...params.switchedToClawHub,
+    ...params.switchedToNpm,
+    ...params.repairedMissingPayloadIds,
+  ]);
+}
+
+function isClawHubTrustNotice(message: string): boolean {
+  const trimmed = stripAnsi(message).trimStart();
+  return (
+    trimmed.startsWith("ClawHub trust warning ") ||
+    trimmed.startsWith("╭─ REVIEW RECOMMENDED - ClawHub ") ||
+    trimmed.startsWith("╭─ WARNING - ClawHub found security risks ") ||
+    trimmed.startsWith("╭─ BLOCKED - ClawHub ")
+  );
+}
+
+function isNonBlockingClawHubTrustNotice(message: string): boolean {
+  const trimmed = stripAnsi(message).trimStart();
+  return (
+    trimmed.startsWith("ClawHub trust warning ") ||
+    trimmed.startsWith("╭─ REVIEW RECOMMENDED - ClawHub ")
+  );
+}
+
+function formatPluginUpdateWarning(message: string): string {
+  return message.includes("╭─") ? message : theme.warn(message);
+}
+
+function resolveUpdateClawHubRiskAcknowledgementOptions(
+  opts: UpdateCommandOptions,
+  params: {
+    renderWarningBeforePrompt?: (warning: string) => void;
+  } = {},
+): {
+  acknowledgeClawHubRisk?: boolean;
+  onClawHubRisk?: (request: ClawHubRiskAcknowledgementRequest) => Promise<boolean>;
+} {
+  if (opts.acknowledgeClawHubRisk) {
+    return { acknowledgeClawHubRisk: true };
+  }
+  if (opts.dryRun || opts.yes || opts.json || !process.stdin.isTTY || !process.stdout.isTTY) {
+    return {};
+  }
+  return {
+    onClawHubRisk: async (request) => {
+      params.renderWarningBeforePrompt?.(request.warning);
+      const packageName = sanitizeTerminalText(request.packageName);
+      const releaseLabel = `${packageName}@${sanitizeTerminalText(request.version)}`;
+      if (request.acknowledgementKind === "type-package") {
+        const answer = await text({
+          message: stylePromptMessage(`type: '${packageName}' to update anyway`),
+          placeholder: packageName,
+        });
+        return !isCancel(answer) && answer.trim() === packageName;
+      }
+      const ok = await confirm({
+        message: stylePromptMessage(
+          `Update ClawHub package "${releaseLabel}" after reviewing the warning above?`,
+        ),
+        initialValue: false,
+      });
+      return !isCancel(ok) && ok;
+    },
+  };
+}
 
 function pickUpdateQuip(): string {
   return UPDATE_QUIPS[Math.floor(Math.random() * UPDATE_QUIPS.length)] ?? "Update complete.";
@@ -515,6 +611,22 @@ export async function collectMissingPluginInstallPayloads(params: {
       missing.push({ pluginId, installPath, reason: "missing-package-dir" });
       continue;
     }
+    const bundlePayload = resolveBundleInstallRecordPayload({ record, installPath });
+    if (bundlePayload.isBundlePayload) {
+      if (await hasNativePackageInstallPayload(installPath)) {
+        continue;
+      }
+      const bundleFailure = validateBundleInstallRecordPayload({
+        pluginId,
+        installPath,
+        record,
+        bundleFormat: bundlePayload.bundleFormat,
+      });
+      if (bundleFailure) {
+        missing.push({ pluginId, installPath, reason: "missing-package-json" });
+      }
+      continue;
+    }
     const packageJsonPath = path.join(installPath, "package.json");
     if (!(await pathExists(packageJsonPath))) {
       missing.push({ pluginId, installPath, reason: "missing-package-json" });
@@ -556,16 +668,24 @@ function createPostUpdatePluginWarning(params: {
   };
 }
 
-function createGuidedPostUpdatePluginOutcome(outcome: PluginUpdateOutcome): {
+function createGuidedPostUpdatePluginOutcome(
+  outcome: PluginUpdateOutcome,
+  options: { includeWarningInReason?: boolean } = {},
+): {
   outcome: PluginUpdateOutcome;
   warning?: PostUpdatePluginWarning;
 } {
-  if (outcome.status !== "error" && !isDisabledAfterFailureOutcome(outcome)) {
+  if (outcome.status !== "error" && !isActionableSkippedPostUpdateOutcome(outcome)) {
     return { outcome };
   }
+  const includeWarningInReason = options.includeWarningInReason ?? true;
+  const warningReason =
+    outcome.warning && includeWarningInReason
+      ? `${outcome.warning}\n${outcome.message}`
+      : outcome.message;
   const warning = createPostUpdatePluginWarning({
     ...(outcome.pluginId && outcome.pluginId !== "unknown" ? { pluginId: outcome.pluginId } : {}),
-    reason: outcome.message,
+    reason: warningReason,
   });
   return {
     outcome: {
@@ -592,6 +712,10 @@ function collectPluginChannelFallbackMessages(outcomes: readonly PluginUpdateOut
 
 function isDisabledAfterFailureOutcome(outcome: PluginUpdateOutcome): boolean {
   return outcome.status === "skipped" && outcome.message.includes("after plugin update failure");
+}
+
+function isActionableSkippedPostUpdateOutcome(outcome: PluginUpdateOutcome): boolean {
+  return isDisabledAfterFailureOutcome(outcome) || isClawHubTrustSkippedOutcome(outcome);
 }
 
 /**
@@ -644,8 +768,12 @@ export function shouldPrepareUpdatedInstallRestart(params: {
   serviceInstalled: boolean;
   serviceLoaded: boolean;
   serviceStoppedForUpdate?: boolean;
+  serviceMatchesMutationRoot?: boolean;
   serviceMatchesUpdateRoot?: boolean;
 }): boolean {
+  if (params.serviceMatchesMutationRoot === false) {
+    return false;
+  }
   if (isPackageManagerUpdateMode(params.updateMode)) {
     return params.serviceInstalled;
   }
@@ -796,8 +924,21 @@ type PreManagedServiceStop = {
   inspected: boolean;
   runtimeInspected: boolean;
   running: boolean;
+  serviceMatchesMutationRoot?: boolean;
   blockMessage?: string;
   serviceEnv?: NodeJS.ProcessEnv;
+  windowsTaskAutoStartRecovery?: WindowsTaskAutoStartRecovery;
+};
+
+type WindowsTaskAutoStartRecovery = {
+  suspended: Promise<boolean>;
+  restore: () => Promise<void>;
+  complete: () => void;
+  interrupted: () => boolean;
+};
+
+type UpdateCommandRecoveryState = {
+  windowsTaskAutoStartRecovery?: WindowsTaskAutoStartRecovery;
 };
 
 class UpdateCommandAbort extends Error {
@@ -805,6 +946,14 @@ class UpdateCommandAbort extends Error {
     super("openclaw-update-abort");
     this.name = "UpdateCommandAbort";
   }
+}
+
+function createAggregateErrorWithCause(
+  errors: unknown[],
+  message: string,
+  cause: unknown,
+): AggregateError {
+  return new AggregateError(errors, message, { cause });
 }
 
 type ManagedServiceRootRedirect = {
@@ -862,6 +1011,136 @@ function serviceControlStdoutForMode(jsonMode: boolean): NodeJS.WritableStream {
   return jsonMode ? JSON_MODE_SERVICE_STDOUT : process.stdout;
 }
 
+function armWindowsTaskAutoStartRecovery(
+  serviceEnv: NodeJS.ProcessEnv,
+): WindowsTaskAutoStartRecovery {
+  let restorePromise: Promise<void> | undefined;
+  let unregisterSignalExitBarrier = () => {};
+  let finishUpdate: (() => void) | undefined;
+  let interrupted = false;
+  const updateFinished = new Promise<void>((resolve) => {
+    finishUpdate = resolve;
+  });
+  const unregisterSignalExitGate = registerSignalExitGate(updateFinished);
+  // Task Scheduler persists the disabled bit beyond this process, so recover it
+  // before normal signal exits as well as from the update's ordinary paths.
+  const onSignal = (exitCode: number) => {
+    interrupted = true;
+    void waitForSignalExitBarriers()
+      .catch((err: unknown) => {
+        defaultRuntime.error(`Failed to complete update shutdown cleanup: ${String(err)}`);
+      })
+      .finally(() => {
+        process.exit(exitCode);
+      });
+  };
+  const onSigint = () => onSignal(130);
+  const onSigterm = () => onSignal(143);
+  const onSigbreak = () => onSignal(130);
+  const removeSignalHandlers = () => {
+    process.off("SIGINT", onSigint);
+    process.off("SIGTERM", onSigterm);
+    process.off("SIGBREAK", onSigbreak);
+    unregisterSignalExitBarrier();
+  };
+  const complete = () => {
+    finishUpdate?.();
+    finishUpdate = undefined;
+    unregisterSignalExitGate();
+  };
+  const restore = () => {
+    restorePromise ??= suspensionPromise
+      .then(async (suspended) => {
+        if (suspended) {
+          await resumeScheduledTaskAutoStartAfterUpdate(serviceEnv);
+        }
+      })
+      .finally(removeSignalHandlers);
+    return restorePromise;
+  };
+  process.on("SIGINT", onSigint);
+  process.on("SIGTERM", onSigterm);
+  process.on("SIGBREAK", onSigbreak);
+  unregisterSignalExitBarrier = registerSignalExitBarrier(restore);
+  // Arm recovery before starting the persistent state change. A signal arriving
+  // while schtasks is still returning waits for that result before restoring.
+  const suspensionPromise = suspendScheduledTaskAutoStartForUpdate(serviceEnv);
+  return { suspended: suspensionPromise, restore, complete, interrupted: () => interrupted };
+}
+
+async function abortWindowsTaskUpdateIfInterrupted(
+  recovery: WindowsTaskAutoStartRecovery,
+): Promise<void> {
+  if (!recovery.interrupted()) {
+    return;
+  }
+  try {
+    await recovery.restore();
+  } finally {
+    recovery.complete();
+  }
+  throw new UpdateCommandAbort();
+}
+
+async function maybeSuspendWindowsTaskAutoStartForPackageUpdate(params: {
+  updateInstallKind: "git" | "package";
+  serviceEnv: NodeJS.ProcessEnv | undefined;
+}): Promise<WindowsTaskAutoStartRecovery | undefined> {
+  if (
+    params.updateInstallKind !== "package" ||
+    process.platform !== "win32" ||
+    !params.serviceEnv
+  ) {
+    return undefined;
+  }
+  const recovery = armWindowsTaskAutoStartRecovery(params.serviceEnv);
+  let suspended: boolean;
+  try {
+    suspended = await recovery.suspended;
+  } catch (err) {
+    await recovery.restore().catch(() => undefined);
+    recovery.complete();
+    throw err;
+  }
+  await abortWindowsTaskUpdateIfInterrupted(recovery);
+  if (!suspended) {
+    try {
+      await recovery.restore();
+    } finally {
+      recovery.complete();
+    }
+    return undefined;
+  }
+  return recovery;
+}
+
+async function maybeResumeWindowsTaskAutoStartAfterPackageUpdate(
+  stopState: PreManagedServiceStop | undefined,
+): Promise<void> {
+  if (!stopState?.windowsTaskAutoStartRecovery) {
+    return;
+  }
+  // The recovery exists only when this update disabled an enabled task. Clear it
+  // after use so later failure paths cannot repeat the state change.
+  await stopState.windowsTaskAutoStartRecovery.restore();
+  stopState.windowsTaskAutoStartRecovery = undefined;
+}
+
+async function restoreWindowsTaskAutoStartOrExit(
+  stopState: PreManagedServiceStop | undefined,
+): Promise<boolean> {
+  try {
+    await maybeResumeWindowsTaskAutoStartAfterPackageUpdate(stopState);
+    return true;
+  } catch (err) {
+    defaultRuntime.error(
+      `Failed to restore Windows Scheduled Task autostart after package update: ${String(err)}`,
+    );
+    defaultRuntime.exit(1);
+    return false;
+  }
+}
+
 async function maybeStopManagedServiceBeforeMutableUpdate(params: {
   updateInstallKind: "git" | "package";
   root: string;
@@ -889,6 +1168,13 @@ async function maybeStopManagedServiceBeforeMutableUpdate(params: {
     };
   }
 
+  const serviceMatchesMutationRoot = await gatewayServiceCommandUsesRoot({
+    root: params.root,
+    command: serviceState.command,
+  });
+  const serviceOwnership =
+    serviceMatchesMutationRoot === null ? {} : { serviceMatchesMutationRoot };
+
   if (!params.shouldRestart) {
     if (!params.jsonMode && serviceState.running) {
       defaultRuntime.log(
@@ -897,32 +1183,56 @@ async function maybeStopManagedServiceBeforeMutableUpdate(params: {
         ),
       );
     }
+    const windowsTaskAutoStartRecovery = isRunningInsideGatewayService()
+      ? undefined
+      : await maybeSuspendWindowsTaskAutoStartForPackageUpdate({
+          updateInstallKind: params.updateInstallKind,
+          serviceEnv: serviceState.env,
+        });
     return {
       stopped: false,
       inspected: true,
       runtimeInspected,
       running: serviceState.running,
+      ...serviceOwnership,
       serviceEnv: serviceState.env,
+      ...(windowsTaskAutoStartRecovery ? { windowsTaskAutoStartRecovery } : {}),
     };
   }
 
   if (!runtimeInspected) {
+    // An inherited gateway process cannot safely update and will be rejected below.
+    // Do not leave its task disabled while returning that rejection.
+    const windowsTaskAutoStartRecovery = isRunningInsideGatewayService()
+      ? undefined
+      : await maybeSuspendWindowsTaskAutoStartForPackageUpdate({
+          updateInstallKind: params.updateInstallKind,
+          serviceEnv: serviceState.env,
+        });
     return {
       stopped: false,
       inspected: true,
       runtimeInspected: false,
       running: false,
+      ...serviceOwnership,
       serviceEnv: serviceState.env,
+      ...(windowsTaskAutoStartRecovery ? { windowsTaskAutoStartRecovery } : {}),
     };
   }
 
   if (!serviceState.running) {
+    const windowsTaskAutoStartRecovery = await maybeSuspendWindowsTaskAutoStartForPackageUpdate({
+      updateInstallKind: params.updateInstallKind,
+      serviceEnv: serviceState.env,
+    });
     return {
       stopped: false,
       inspected: true,
       runtimeInspected: true,
       running: false,
+      ...serviceOwnership,
       serviceEnv: serviceState.env,
+      ...(windowsTaskAutoStartRecovery ? { windowsTaskAutoStartRecovery } : {}),
     };
   }
 
@@ -933,20 +1243,17 @@ async function maybeStopManagedServiceBeforeMutableUpdate(params: {
       inspected: true,
       runtimeInspected: true,
       running: true,
+      ...serviceOwnership,
       blockMessage,
       serviceEnv: serviceState.env,
     };
   }
 
-  if (
-    params.updateInstallKind === "git" &&
-    (await gatewayServiceCommandUsesRoot({ root: params.root, command: serviceState.command })) ===
-      false
-  ) {
+  if (serviceMatchesMutationRoot === false) {
     if (!params.jsonMode) {
       defaultRuntime.log(
         theme.muted(
-          "Managed gateway service points at a different OpenClaw root; leaving it running during this git update.",
+          `Managed gateway service points at a different OpenClaw root; leaving it running during this ${params.updateInstallKind} update.`,
         ),
       );
     }
@@ -955,6 +1262,7 @@ async function maybeStopManagedServiceBeforeMutableUpdate(params: {
       inspected: true,
       runtimeInspected: true,
       running: true,
+      ...serviceOwnership,
       serviceEnv: serviceState.env,
     };
   }
@@ -964,16 +1272,48 @@ async function maybeStopManagedServiceBeforeMutableUpdate(params: {
       theme.muted(`Stopping managed gateway service before ${params.updateInstallKind} update...`),
     );
   }
-  await service.stop({
-    env: serviceState.env,
-    stdout: serviceControlStdoutForMode(params.jsonMode),
+  const windowsTaskAutoStartRecovery = await maybeSuspendWindowsTaskAutoStartForPackageUpdate({
+    updateInstallKind: params.updateInstallKind,
+    serviceEnv: serviceState.env,
   });
+  try {
+    await service.stop({
+      env: serviceState.env,
+      stdout: serviceControlStdoutForMode(params.jsonMode),
+    });
+    if (windowsTaskAutoStartRecovery) {
+      await abortWindowsTaskUpdateIfInterrupted(windowsTaskAutoStartRecovery);
+    }
+  } catch (err) {
+    if (err instanceof UpdateCommandAbort) {
+      throw err;
+    }
+    if (windowsTaskAutoStartRecovery) {
+      try {
+        await windowsTaskAutoStartRecovery.restore();
+      } catch (resumeErr) {
+        throw createAggregateErrorWithCause(
+          [err, resumeErr],
+          `Failed to stop the managed gateway (${String(err)}) and restore Windows Scheduled Task autostart (${String(resumeErr)})`,
+          err,
+        );
+      } finally {
+        windowsTaskAutoStartRecovery.complete();
+      }
+      if (windowsTaskAutoStartRecovery.interrupted()) {
+        throw new UpdateCommandAbort();
+      }
+    }
+    throw err;
+  }
   return {
     stopped: true,
     inspected: true,
     runtimeInspected: true,
     running: true,
+    ...serviceOwnership,
     serviceEnv: serviceState.env,
+    ...(windowsTaskAutoStartRecovery ? { windowsTaskAutoStartRecovery } : {}),
   };
 }
 
@@ -1094,7 +1434,7 @@ async function resolvePackageRuntimePreflightError(params: {
     `The requested package requires ${status.nodeEngine}.`,
     runtime.nodeRunner
       ? "Upgrade the Node runtime that owns the managed Gateway service, then rerun `openclaw update`."
-      : "Upgrade Node to 22.19+ or Node 24, then rerun `openclaw update`.",
+      : "Upgrade to Node 22.22.3+, Node 24.15.0+, or Node 25.9.0+, then rerun `openclaw update`.",
     "Bare `npm i -g openclaw` can silently install an older compatible release.",
     "After upgrading Node, use `npm i -g openclaw@latest`.",
   ].join("\n");
@@ -1166,10 +1506,7 @@ export function resolvePostInstallDoctorEnv(params?: {
   serviceEnv?: NodeJS.ProcessEnv;
   invocationCwd?: string;
 }): NodeJS.ProcessEnv {
-  const resolvedEnv: NodeJS.ProcessEnv = {
-    ...disableUpdatedPackageCompileCacheEnv(params?.baseEnv ?? process.env),
-    [DOCTOR_DISABLE_CROSS_STATE_DIR_IMPORTS_ENV]: "1",
-  };
+  const resolvedEnv = disableUpdatedPackageCompileCacheEnv(params?.baseEnv ?? process.env);
   if (!params?.serviceEnv) {
     return resolvedEnv;
   }
@@ -1374,10 +1711,11 @@ async function tryInstallShellCompletion(opts: {
   }
 
   const status = await checkShellCompletionStatus(CLI_NAME);
+  const generationOptions = { generationMode: "core-only" } as const;
 
   if (status.usesSlowPattern) {
     defaultRuntime.log(theme.muted("Upgrading shell completion to cached version..."));
-    const cacheGenerated = await ensureCompletionCacheExists(CLI_NAME);
+    const cacheGenerated = await ensureCompletionCacheExists(CLI_NAME, generationOptions);
     if (cacheGenerated) {
       await installShellCompletionForUpdate(status.shell, true);
     }
@@ -1386,7 +1724,7 @@ async function tryInstallShellCompletion(opts: {
 
   if (status.profileInstalled && !status.cacheExists) {
     defaultRuntime.log(theme.muted("Regenerating shell completion cache..."));
-    await ensureCompletionCacheExists(CLI_NAME);
+    await ensureCompletionCacheExists(CLI_NAME, generationOptions);
     return;
   }
 
@@ -1410,7 +1748,7 @@ async function tryInstallShellCompletion(opts: {
       return;
     }
 
-    const cacheGenerated = await ensureCompletionCacheExists(CLI_NAME);
+    const cacheGenerated = await ensureCompletionCacheExists(CLI_NAME, generationOptions);
     if (!cacheGenerated) {
       defaultRuntime.log(theme.warn("Failed to generate completion cache."));
       return;
@@ -1525,7 +1863,12 @@ async function gatewayServiceCommandUsesRoot(params: {
       : params.command;
   const layout = await summarizeGatewayServiceLayout(command);
   const serviceRoot = layout?.packageRoot;
-  if (!serviceRoot) {
+  const serviceEntrypoint = layout?.entrypoint;
+  if (
+    !serviceRoot ||
+    !serviceEntrypoint ||
+    (!path.isAbsolute(serviceEntrypoint) && !path.win32.isAbsolute(serviceEntrypoint))
+  ) {
     return null;
   }
   const [expectedRootReal, serviceRootReal] = await Promise.all([
@@ -1544,6 +1887,8 @@ async function runPackageInstallUpdate(params: {
   startedAt: number;
   progress: ReturnType<typeof createUpdateProgress>["progress"];
   jsonMode: boolean;
+  allowGatewayServiceRepair: boolean;
+  allowGatewayActivation: boolean;
   managedServiceEnv?: NodeJS.ProcessEnv;
   invocationCwd?: string;
   honorPackageRoot?: boolean;
@@ -1619,12 +1964,16 @@ async function runPackageInstallUpdate(params: {
         await createUpdateConfigSnapshot();
         const candidateHostVersion = await readPackageVersion(verifiedPackageRoot);
         const doctorResultPath = createUpdatePostInstallDoctorResultPath();
+        const doctorPolicy = resolveUpdateDoctorExecutionPolicy({
+          targetVersion: candidateHostVersion,
+          allowGatewayServiceRepair: params.allowGatewayServiceRepair,
+        });
         const doctorArgv = [
           params.nodeRunner ?? resolveNodeRunner(),
           entryPath,
           "doctor",
           "--non-interactive",
-          "--fix",
+          ...(doctorPolicy.fix ? ["--fix"] : []),
         ];
         const doctorProgressInfo = {
           name: `${CLI_NAME} doctor`,
@@ -1645,6 +1994,16 @@ async function runPackageInstallUpdate(params: {
             OPENCLAW_UPDATE_IN_PROGRESS: "1",
             [UPDATE_DEFER_CONFIGURED_PLUGIN_INSTALL_REPAIR_ENV]: "1",
             [UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE_ENV]: "1",
+            [UPDATE_PARENT_SUPPORTS_GATEWAY_RESTART_ENV]: "1",
+            [UPDATE_PARENT_ALLOWS_GATEWAY_SERVICE_REPAIR_ENV]: params.allowGatewayServiceRepair
+              ? "1"
+              : "0",
+            [UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION_ENV]: params.allowGatewayActivation
+              ? "1"
+              : "0",
+            ...(doctorPolicy.serviceRepairPolicy
+              ? { OPENCLAW_SERVICE_REPAIR_POLICY: doctorPolicy.serviceRepairPolicy }
+              : {}),
             [UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH_ENV]: doctorResultPath,
             ...(candidateHostVersion === null
               ? {}
@@ -1695,7 +2054,12 @@ async function runGitUpdate(params: {
   opts: UpdateCommandOptions;
   stop: () => void;
   devTargetRef?: string;
-  beforeGitMutation?: () => Promise<void>;
+  beforeGitMutation?: () => Promise<{
+    allowGatewayServiceRepair?: boolean;
+    allowGatewayActivation?: boolean;
+  } | void>;
+  allowGatewayServiceRepair: boolean;
+  allowGatewayActivation: boolean;
 }): Promise<UpdateRunResult> {
   const updateRoot = params.switchToGit ? resolveGitInstallDir() : params.root;
   const effectiveTimeout = params.timeoutMs ?? DEFAULT_UPDATE_STEP_TIMEOUT_MS;
@@ -1734,6 +2098,8 @@ async function runGitUpdate(params: {
     tag: params.tag,
     devTargetRef: params.devTargetRef,
     deferConfiguredPluginInstallRepair: true,
+    allowGatewayServiceRepair: params.allowGatewayServiceRepair,
+    allowGatewayActivation: params.allowGatewayActivation,
     beforeGitMutation: params.beforeGitMutation,
   });
   const steps = [...(cloneStep ? [cloneStep] : []), ...updateResult.steps];
@@ -1802,13 +2168,41 @@ export async function updatePluginsAfterCoreUpdate(params: {
     return invalid.result;
   }
 
-  const pluginLogger = params.opts.json
-    ? {}
-    : {
-        info: (msg: string) => defaultRuntime.log(msg),
-        warn: (msg: string) => defaultRuntime.log(theme.warn(msg)),
-        error: (msg: string) => defaultRuntime.log(theme.error(msg)),
-      };
+  const clawHubTrustNotices = new Set<string>();
+  const loggedPluginWarnings = new Set<string>();
+  const hasLoggedPluginWarning = (message: string): boolean =>
+    loggedPluginWarnings.has(stripAnsi(message));
+  const recordLoggedPluginWarning = (message: string): void => {
+    loggedPluginWarnings.add(stripAnsi(message));
+  };
+  const recordClawHubTrustNotice = (message: string): void => {
+    const shouldRecord = params.opts.json
+      ? isClawHubTrustNotice(message)
+      : isNonBlockingClawHubTrustNotice(message);
+    if (shouldRecord) {
+      clawHubTrustNotices.add(stripAnsi(message));
+    }
+  };
+  const pluginLogger = {
+    ...(params.opts.json ? { terminalLinks: false } : {}),
+    info: (msg: string) => {
+      if (!params.opts.json) {
+        defaultRuntime.log(msg);
+      }
+    },
+    warn: (msg: string) => {
+      recordLoggedPluginWarning(msg);
+      recordClawHubTrustNotice(msg);
+      if (!params.opts.json) {
+        defaultRuntime.log(formatPluginUpdateWarning(msg));
+      }
+    },
+    error: (msg: string) => {
+      if (!params.opts.json) {
+        defaultRuntime.log(theme.error(msg));
+      }
+    },
+  };
 
   if (!params.opts.json) {
     defaultRuntime.log("");
@@ -1816,6 +2210,21 @@ export async function updatePluginsAfterCoreUpdate(params: {
   }
 
   const warnings: PostUpdatePluginWarning[] = [];
+  const clawHubRiskAcknowledgementOptions = resolveUpdateClawHubRiskAcknowledgementOptions(
+    params.opts,
+    {
+      renderWarningBeforePrompt: (warning) => {
+        if (hasLoggedPluginWarning(warning)) {
+          return;
+        }
+        recordLoggedPluginWarning(warning);
+        recordClawHubTrustNotice(warning);
+        if (!params.opts.json) {
+          defaultRuntime.log(formatPluginUpdateWarning(warning));
+        }
+      },
+    },
+  );
   const pluginInstallRecords =
     params.pluginInstallRecords ?? (await loadInstalledPluginIndexInstallRecords());
   const pluginUpdateChannel = params.channel;
@@ -1832,6 +2241,7 @@ export async function updatePluginsAfterCoreUpdate(params: {
     externalizedBundledPluginBridges: await listPersistedBundledPluginLocationBridges({
       workspaceDir: params.root,
     }),
+    ...clawHubRiskAcknowledgementOptions,
     logger: pluginLogger,
   });
   for (const error of syncResult.summary.errors) {
@@ -1906,6 +2316,7 @@ export async function updatePluginsAfterCoreUpdate(params: {
       disableOnFailure: true,
       logger: pluginLogger,
       onIntegrityDrift: onPluginIntegrityDrift,
+      ...clawHubRiskAcknowledgementOptions,
     });
     pluginConfig = repairResult.config;
     pluginsChanged ||= repairResult.changed;
@@ -1914,25 +2325,32 @@ export async function updatePluginsAfterCoreUpdate(params: {
     return missingIds;
   };
 
-  const missingPayloadIds = await collectMissingPayloadWarnings(pluginInstallRecords);
+  const missingPayloadIdSet = new Set(await collectMissingPayloadWarnings(pluginInstallRecords));
 
   const npmResult = await updateNpmInstalledPlugins({
     config: pluginConfig,
     timeoutMs: params.timeoutMs,
     updateChannel: pluginUpdateChannel,
     coreVersion: coreVersion ?? undefined,
-    skipIds: new Set([...syncResult.summary.switchedToNpm, ...missingPayloadIds]),
+    skipIds: resolvePostSyncPluginUpdateSkipIds({
+      switchedToClawHub: syncResult.summary.switchedToClawHub,
+      switchedToNpm: syncResult.summary.switchedToNpm,
+      repairedMissingPayloadIds: missingPayloadIdSet,
+    }),
     skipDisabledPlugins: true,
     syncOfficialPluginInstalls: true,
     disableOnFailure: true,
     logger: pluginLogger,
     onIntegrityDrift: onPluginIntegrityDrift,
+    ...clawHubRiskAcknowledgementOptions,
   });
   pluginConfig = npmResult.config;
   pluginsChanged ||= npmResult.changed;
   npmPluginsChanged ||= npmResult.changed;
   for (const rawOutcome of npmResult.outcomes) {
-    const guided = createGuidedPostUpdatePluginOutcome(rawOutcome);
+    const includeWarningInReason =
+      params.opts.json || !rawOutcome.warning || !hasLoggedPluginWarning(rawOutcome.warning);
+    const guided = createGuidedPostUpdatePluginOutcome(rawOutcome, { includeWarningInReason });
     pluginUpdateOutcomes.push(guided.outcome);
     if (guided.warning) {
       warnings.push(guided.warning);
@@ -1947,7 +2365,7 @@ export async function updatePluginsAfterCoreUpdate(params: {
   });
   pluginUpdateOutcomes.push(
     ...remainingMissingPayloads
-      .filter((entry) => !missingPayloadIds.includes(entry.pluginId))
+      .filter((entry) => !missingPayloadIdSet.has(entry.pluginId))
       .map((entry): PluginUpdateOutcome => {
         const warning = createPostUpdatePluginWarning({
           pluginId: entry.pluginId,
@@ -1978,6 +2396,7 @@ export async function updatePluginsAfterCoreUpdate(params: {
     cfg: pluginConfig,
     env: process.env,
     baselineInstallRecords: convergenceBaselineRecords,
+    ...clawHubRiskAcknowledgementOptions,
   });
   for (const change of convergence.changes) {
     if (!params.opts.json) {
@@ -2032,6 +2451,17 @@ export async function updatePluginsAfterCoreUpdate(params: {
     });
   }
 
+  for (const notice of clawHubTrustNotices) {
+    if (warnings.some((warning) => warning.reason.includes(notice))) {
+      continue;
+    }
+    warnings.push({
+      reason: notice,
+      message: notice,
+      guidance: [],
+    });
+  }
+
   if (params.opts.json) {
     return {
       status: convergenceErrored ? "error" : warnings.length > 0 ? "warning" : "ok",
@@ -2072,7 +2502,9 @@ export async function updatePluginsAfterCoreUpdate(params: {
     );
   }
   for (const warning of syncResult.summary.warnings) {
-    defaultRuntime.log(theme.warn(warning));
+    if (!hasLoggedPluginWarning(warning)) {
+      defaultRuntime.log(formatPluginUpdateWarning(warning));
+    }
   }
   for (const error of syncResult.summary.errors) {
     defaultRuntime.log(theme.warn(createPostUpdatePluginWarning({ reason: error }).message));
@@ -2101,7 +2533,7 @@ export async function updatePluginsAfterCoreUpdate(params: {
   }
 
   for (const outcome of pluginUpdateOutcomes) {
-    if (outcome.status !== "error") {
+    if (outcome.status !== "error" && !isActionableSkippedPostUpdateOutcome(outcome)) {
       continue;
     }
     defaultRuntime.log(theme.warn(outcome.message));
@@ -2386,7 +2818,6 @@ async function maybeRestartService(params: {
             process.stdin.isTTY && !params.opts.json && params.opts.yes !== true;
           await doctorCommand(defaultRuntime, {
             nonInteractive: !interactiveDoctor,
-            crossStateDirImports: false,
           });
         } catch (err) {
           defaultRuntime.log(theme.warn(`Doctor failed: ${String(err)}`));
@@ -2573,7 +3004,6 @@ export async function updateFinalizeCommand(opts: UpdateFinalizeOptions): Promis
       nonInteractive: true,
       repair: true,
       yes: opts.yes === true,
-      crossStateDirImports: false,
     });
     configSnapshot = await readConfigFileSnapshot({ skipPluginValidation: true });
     if (requestedChannel) {
@@ -2605,6 +3035,7 @@ export async function updateFinalizeCommand(opts: UpdateFinalizeOptions): Promis
         timeout: opts.timeout,
         yes: opts.yes,
         restart: false,
+        acknowledgeClawHubRisk: opts.acknowledgeClawHubRisk,
       },
       timeoutMs: timeoutMs ?? DEFAULT_UPDATE_STEP_TIMEOUT_MS,
       pluginInstallRecords,
@@ -3014,7 +3445,11 @@ async function continuePostCoreUpdateInFreshProcess(params: {
   preUpdateConfig?: PreUpdateConfigRestoreInput;
   updateStartedAtMs: number;
   nodeRunner?: string;
-}): Promise<{ resumed: boolean; pluginUpdate?: PostCorePluginUpdateResult }> {
+}): Promise<{
+  resumed: boolean;
+  pluginUpdate?: PostCorePluginUpdateResult;
+  exitCode?: number;
+}> {
   const entryPath = await resolveGatewayInstallEntrypoint(params.root);
   if (!entryPath) {
     return { resumed: false };
@@ -3029,6 +3464,9 @@ async function continuePostCoreUpdateInFreshProcess(params: {
   }
   if (params.opts.yes) {
     argv.push("--yes");
+  }
+  if (params.opts.acknowledgeClawHubRisk) {
+    argv.push("--acknowledge-clawhub-risk");
   }
   if (params.opts.timeout) {
     argv.push("--timeout", params.opts.timeout);
@@ -3056,7 +3494,6 @@ async function continuePostCoreUpdateInFreshProcess(params: {
       env: {
         ...stripGatewayServiceMarkerEnv(disableUpdatedPackageCompileCacheEnv(process.env)),
         OPENCLAW_UPDATE_IN_PROGRESS: "1",
-        [DOCTOR_DISABLE_CROSS_STATE_DIR_IMPORTS_ENV]: "1",
         [POST_CORE_UPDATE_ENV]: "1",
         [POST_CORE_UPDATE_CHANNEL_ENV]: params.channel,
         ...(params.requestedChannel
@@ -3138,8 +3575,7 @@ async function continuePostCoreUpdateInFreshProcess(params: {
       if (pluginUpdate) {
         return { resumed: true, pluginUpdate };
       }
-      defaultRuntime.exit(exitCode);
-      throw new Error(`post-update process exited with code ${exitCode}`);
+      return { resumed: false, exitCode };
     }
     return { resumed: true, ...(pluginUpdate ? { pluginUpdate } : {}) };
   } finally {
@@ -3226,12 +3662,24 @@ async function withUpdateInProgressEnv<T>(run: () => Promise<T>): Promise<T> {
 }
 
 export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
+  const recoveryState: UpdateCommandRecoveryState = {};
   return await withUpdateInProgressEnv(async () => {
-    await updateCommandInternal(opts);
+    try {
+      await updateCommandInternal(opts, recoveryState);
+    } finally {
+      try {
+        await recoveryState.windowsTaskAutoStartRecovery?.restore();
+      } finally {
+        recoveryState.windowsTaskAutoStartRecovery?.complete();
+      }
+    }
   });
 }
 
-async function updateCommandInternal(opts: UpdateCommandOptions): Promise<void> {
+async function updateCommandInternal(
+  opts: UpdateCommandOptions,
+  recoveryState: UpdateCommandRecoveryState,
+): Promise<void> {
   suppressDeprecations();
   await cleanupStaleManagedServiceUpdateHandoffs().catch(() => undefined);
   const invocationCwd = tryResolveInvocationCwd();
@@ -3731,6 +4179,10 @@ async function updateCommandInternal(opts: UpdateCommandOptions): Promise<void> 
           shouldRestart,
           jsonMode: Boolean(opts.json),
         });
+        if (preManagedServiceStop.windowsTaskAutoStartRecovery) {
+          recoveryState.windowsTaskAutoStartRecovery =
+            preManagedServiceStop.windowsTaskAutoStartRecovery;
+        }
         if (
           preManagedServiceStop.stopped ||
           preManagedServiceStop.blockMessage ||
@@ -3743,6 +4195,9 @@ async function updateCommandInternal(opts: UpdateCommandOptions): Promise<void> 
         }
       }
     } catch (err) {
+      if (err instanceof UpdateCommandAbort) {
+        throw err;
+      }
       stop();
       defaultRuntime.error(`Failed to stop managed gateway service before update: ${String(err)}`);
       defaultRuntime.exit(1);
@@ -3795,6 +4250,11 @@ async function updateCommandInternal(opts: UpdateCommandOptions): Promise<void> 
             startedAt,
             progress,
             jsonMode: Boolean(opts.json),
+            allowGatewayServiceRepair: preManagedServiceStop?.serviceMatchesMutationRoot === true,
+            allowGatewayActivation:
+              shouldRestart &&
+              preManagedServiceStop?.stopped === true &&
+              preManagedServiceStop.serviceMatchesMutationRoot === true,
             managedServiceEnv: preManagedServiceStop?.serviceEnv,
             invocationCwd,
             honorPackageRoot:
@@ -3818,13 +4278,38 @@ async function updateCommandInternal(opts: UpdateCommandOptions): Promise<void> 
             devTargetRef,
             beforeGitMutation:
               updateInstallKind === "git"
-                ? () => stopManagedServiceBeforeMutableUpdate(gitMutationRoots ?? [root])
+                ? async () => {
+                    await stopManagedServiceBeforeMutableUpdate(gitMutationRoots ?? [root]);
+                    return {
+                      // Only a positively owned service may be rewritten. Activation
+                      // additionally requires this update to have stopped it.
+                      allowGatewayServiceRepair:
+                        preManagedServiceStop?.serviceMatchesMutationRoot === true,
+                      allowGatewayActivation:
+                        shouldRestart &&
+                        preManagedServiceStop?.stopped === true &&
+                        preManagedServiceStop.serviceMatchesMutationRoot === true,
+                    };
+                  }
                 : undefined,
+            allowGatewayServiceRepair: false,
+            allowGatewayActivation: false,
           });
   } catch (err) {
     stop();
     if (err instanceof UpdateCommandAbort) {
       return;
+    }
+    try {
+      await maybeResumeWindowsTaskAutoStartAfterPackageUpdate(preManagedServiceStop);
+    } catch (resumeErr) {
+      recoveryState.windowsTaskAutoStartRecovery?.complete();
+      recoveryState.windowsTaskAutoStartRecovery = undefined;
+      throw createAggregateErrorWithCause(
+        [err, resumeErr],
+        `Update failed (${String(err)}) and Windows Scheduled Task autostart could not be restored (${String(resumeErr)})`,
+        err,
+      );
     }
     await maybeRestartServiceAfterFailedMutableUpdate({
       preManagedServiceStop,
@@ -3839,6 +4324,9 @@ async function updateCommandInternal(opts: UpdateCommandOptions): Promise<void> 
   }
 
   if (result.status === "error") {
+    if (!(await restoreWindowsTaskAutoStartOrExit(preManagedServiceStop))) {
+      return;
+    }
     await writeControlPlaneUpdateRestartSentinelBestEffort({
       meta: controlPlaneUpdateSentinelMeta,
       result,
@@ -3853,6 +4341,9 @@ async function updateCommandInternal(opts: UpdateCommandOptions): Promise<void> 
   }
 
   if (result.status === "skipped") {
+    if (!(await restoreWindowsTaskAutoStartOrExit(preManagedServiceStop))) {
+      return;
+    }
     await writeControlPlaneUpdateRestartSentinelBestEffort({
       meta: controlPlaneUpdateSentinelMeta,
       result,
@@ -3947,6 +4438,13 @@ async function updateCommandInternal(opts: UpdateCommandOptions): Promise<void> 
           }
         : undefined,
     });
+    if (freshProcessResult.exitCode !== undefined) {
+      if (!(await restoreWindowsTaskAutoStartOrExit(preManagedServiceStop))) {
+        return;
+      }
+      defaultRuntime.exit(freshProcessResult.exitCode);
+      throw new Error(`post-update process exited with code ${freshProcessResult.exitCode}`);
+    }
     pluginsUpdatedInFreshProcess = freshProcessResult.resumed;
     postCorePluginUpdate = freshProcessResult.pluginUpdate;
   }
@@ -4019,6 +4517,9 @@ async function updateCommandInternal(opts: UpdateCommandOptions): Promise<void> 
     : result;
 
   if (postCorePluginUpdate?.status === "error") {
+    if (!(await restoreWindowsTaskAutoStartOrExit(preManagedServiceStop))) {
+      return;
+    }
     await writeControlPlaneUpdateRestartSentinelBestEffort({
       meta: controlPlaneUpdateSentinelMeta,
       result: resultWithPostUpdate,
@@ -4051,24 +4552,33 @@ async function updateCommandInternal(opts: UpdateCommandOptions): Promise<void> 
         }),
       });
       const serviceMatchesUpdateRoot =
-        resultWithPostUpdate.mode === "git"
-          ? ((await gatewayServiceCommandUsesRoot({
-              root: postUpdateRoot,
-              command: serviceState.command,
-            })) ?? undefined)
-          : undefined;
+        (await gatewayServiceCommandUsesRoot({
+          root: postUpdateRoot,
+          command: serviceState.command,
+        })) ?? undefined;
+      const serviceOwnershipConfirmed =
+        preManagedServiceStop?.serviceMatchesMutationRoot === true ||
+        serviceMatchesUpdateRoot === true;
+      const knownForeignService =
+        preManagedServiceStop?.serviceMatchesMutationRoot === false &&
+        serviceMatchesUpdateRoot !== true;
       skipLegacyServiceRestart =
-        resultWithPostUpdate.mode === "git" &&
-        serviceState.installed &&
-        serviceState.loaded &&
-        preManagedServiceStop?.stopped !== true &&
-        serviceMatchesUpdateRoot === false;
+        knownForeignService ||
+        (resultWithPostUpdate.mode === "git" &&
+          serviceState.installed &&
+          serviceState.loaded &&
+          preManagedServiceStop?.stopped !== true &&
+          serviceMatchesUpdateRoot === false);
       if (
+        !knownForeignService &&
         shouldPrepareUpdatedInstallRestart({
           updateMode: resultWithPostUpdate.mode,
           serviceInstalled: serviceState.installed,
           serviceLoaded: serviceState.loaded,
           serviceStoppedForUpdate: preManagedServiceStop?.stopped,
+          serviceMatchesMutationRoot: serviceOwnershipConfirmed
+            ? true
+            : preManagedServiceStop?.serviceMatchesMutationRoot,
           serviceMatchesUpdateRoot,
         })
       ) {
@@ -4079,7 +4589,9 @@ async function updateCommandInternal(opts: UpdateCommandOptions): Promise<void> 
           serviceEnv: gatewayServiceEnv,
         });
         restartScriptPath = await prepareRestartScript(serviceState.env, gatewayPort);
-        refreshGatewayServiceEnvLocal = true;
+        // An ambiguous wrapper may be stopped and restored, but only proven
+        // ownership authorizes rewriting the service definition.
+        refreshGatewayServiceEnvLocal = serviceOwnershipConfirmed;
       }
     } catch {
       // Ignore errors during pre-check; fallback to standard restart
@@ -4098,6 +4610,9 @@ async function updateCommandInternal(opts: UpdateCommandOptions): Promise<void> 
     jsonMode: Boolean(opts.json),
   });
 
+  if (!(await restoreWindowsTaskAutoStartOrExit(preManagedServiceStop))) {
+    return;
+  }
   const restartOk = await maybeRestartService({
     shouldRestart,
     result: resultWithPostUpdate,

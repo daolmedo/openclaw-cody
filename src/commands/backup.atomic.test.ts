@@ -13,6 +13,12 @@ import {
   tarCreateMock,
 } from "./backup.test-support.js";
 
+const sleepMock = vi.hoisted(() => vi.fn(async (_ms: number) => {}));
+
+vi.mock("../utils/sleep.js", () => ({
+  sleep: (ms: number) => sleepMock(ms),
+}));
+
 const { backupCreateCommand } = await import("./backup.js");
 
 describe("backupCreateCommand atomic archive write", () => {
@@ -26,6 +32,7 @@ describe("backupCreateCommand atomic archive write", () => {
     await resetBackupTempHome(tempHome);
     tarCreateMock.mockReset();
     backupVerifyCommandMock.mockReset();
+    sleepMock.mockClear();
   });
 
   afterEach(async () => {
@@ -83,6 +90,63 @@ describe("backupCreateCommand atomic archive write", () => {
       const remaining = await fs.readdir(archiveDir);
       expect(remaining).toStrictEqual([]);
     } finally {
+      await fs.rm(archiveDir, { recursive: true, force: true });
+    }
+  });
+
+  it("cleans intermediate retry temp archives after cleanup races", async () => {
+    const { archiveDir, outputPath, runtime } = await prepareAtomicBackupScenario({
+      archivePrefix: "openclaw-backup-retry-cleanup-",
+    });
+    const realRm = fs.rm.bind(fs);
+    const rmAttempts = new Map<string, number>();
+    const attemptFiles: string[] = [];
+    const rmSpy = vi.spyOn(fs, "rm").mockImplementation((async (
+      targetPath: Parameters<typeof fs.rm>[0],
+      options?: Parameters<typeof fs.rm>[1],
+    ) => {
+      const key = String(targetPath);
+      const attempt = (rmAttempts.get(key) ?? 0) + 1;
+      rmAttempts.set(key, attempt);
+      if (key.startsWith(`${outputPath}.`) && !attemptFiles.includes(key)) {
+        attemptFiles.push(key);
+      }
+      if (attemptFiles.length <= 2 && key === attemptFiles.at(-1) && attempt === 1) {
+        throw Object.assign(new Error("resource busy"), { code: "EBUSY" });
+      }
+      await realRm(targetPath, options);
+    }) as typeof fs.rm);
+    try {
+      let tarAttempt = 0;
+      tarCreateMock.mockImplementation(() => {
+        tarAttempt += 1;
+        return createMockTarStream({
+          contents: `archive-attempt-${tarAttempt}`,
+          ...(tarAttempt < 3
+            ? {
+                error: Object.assign(new Error("did not encounter expected EOF"), {
+                  path: path.join(tempHome.home, ".openclaw", "state.txt"),
+                }),
+              }
+            : {}),
+        });
+      });
+
+      const result = await backupCreateCommand(runtime, {
+        output: outputPath,
+      });
+
+      expect(result.archivePath).toBe(outputPath);
+      expect(sleepMock.mock.calls).toStrictEqual([[10_000], [20_000]]);
+      expect(attemptFiles).toStrictEqual([
+        attemptFiles[0],
+        `${attemptFiles[0]}.retry-2`,
+        `${attemptFiles[0]}.retry-3`,
+      ]);
+      expect(rmAttempts.get(attemptFiles[1])).toBeGreaterThanOrEqual(2);
+      expect((await fs.readdir(archiveDir)).toSorted()).toStrictEqual([path.basename(outputPath)]);
+    } finally {
+      rmSpy.mockRestore();
       await fs.rm(archiveDir, { recursive: true, force: true });
     }
   });

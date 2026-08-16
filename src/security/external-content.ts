@@ -247,16 +247,14 @@ function replaceMarkers(content: string): string {
     return content;
   }
   const replacements: Array<{ start: number; end: number; value: string }> = [];
-  // Match markers with or without id attribute (handles both legacy and spoofed
-  // markers). The id body is deliberately unbounded: any finite cap lets a
-  // forged marker with a longer id bypass sanitization.
+  // Match markers with or without id attribute (handles both legacy and spoofed markers)
   const patterns: Array<{ regex: RegExp; value: string }> = [
     {
-      regex: /<<<\s*EXTERNAL[\s_]+UNTRUSTED[\s_]+CONTENT(?:\s+id="[^"]*")?\s*>>>/gi,
+      regex: /<<<\s*EXTERNAL[\s_]+UNTRUSTED[\s_]+CONTENT(?:\s+id="[^"]{1,128}")?\s*>>>/gi,
       value: "[[MARKER_SANITIZED]]",
     },
     {
-      regex: /<<<\s*END[\s_]+EXTERNAL[\s_]+UNTRUSTED[\s_]+CONTENT(?:\s+id="[^"]*")?\s*>>>/gi,
+      regex: /<<<\s*END[\s_]+EXTERNAL[\s_]+UNTRUSTED[\s_]+CONTENT(?:\s+id="[^"]{1,128}")?\s*>>>/gi,
       value: "[[END_MARKER_SANITIZED]]",
     },
   ];

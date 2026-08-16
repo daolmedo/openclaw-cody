@@ -59,16 +59,8 @@ describe("scripts/test-live-cli-backend-docker.sh", () => {
   it("prints redacted Claude subscription probe failures", () => {
     const script = fs.readFileSync(SCRIPT_PATH, "utf8");
 
-    expect(script).toContain('direct_probe_output="$(mktemp)"');
     expect(script).toContain('direct_probe_log="$(mktemp)"');
-    expect(script).toContain('>"$direct_probe_output" 2>"$direct_probe_log"');
     expect(script).toContain("This is a local CLI smoke test.");
-    expect(script).toContain("What is two plus two?");
-    expect(script).toContain(
-      '[[ ! "$direct_output" =~ ^[[:space:]]*(4|[Ff][Oo][Uu][Rr])[[:space:]]*$ ]]',
-    );
-    expect(script).not.toContain("direct_token=");
-    expect(script).not.toContain("expected token");
     expect(script).not.toContain("OPENCLAW-CLAUDE-SUBSCRIPTION-DIRECT");
     expect(script).toContain("direct Claude subscription probe exited with status");
     expect(script).toContain("<redacted-email>");

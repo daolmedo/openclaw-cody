@@ -24,13 +24,13 @@ import {
   type RequestClient,
 } from "./internal/discord.js";
 import { parseAndResolveChannelRecipient } from "./recipient-resolution.js";
+import type { DiscordReplyReference } from "./reply-reference.js";
 import { loadOutboundMediaFromUrl } from "./runtime-api.js";
 import { sendMessageDiscord } from "./send.outbound.js";
 import { createDiscordSendResult } from "./send.receipt.js";
 import {
   buildDiscordSendError,
   createDiscordClient,
-  createDiscordMessageNonce,
   resolveChannelId,
   resolveDiscordChannelType,
   toDiscordFileBlob,
@@ -155,7 +155,7 @@ type DiscordComponentSendOpts = {
   token?: string;
   rest?: RequestClient;
   silent?: boolean;
-  replyTo?: string;
+  reply?: DiscordReplyReference;
   sessionKey?: string;
   agentId?: string;
   mediaUrl?: string;
@@ -168,6 +168,8 @@ type DiscordComponentSendOpts = {
   tableMode?: MarkdownTableMode;
   chunkMode?: ChunkMode;
   suppressEmbeds?: boolean;
+  /** Persist the concrete platform send before component bookkeeping can fail. */
+  onDeliveryResult?: (result: DiscordSendResult) => Promise<void> | void;
 };
 
 export function registerBuiltDiscordComponentMessage(params: {
@@ -200,8 +202,8 @@ async function buildDiscordComponentPayload(params: {
   body: ReturnType<typeof stripUndefinedFields>;
   buildResult: ReturnType<typeof buildDiscordComponentMessage>;
 }> {
-  const messageReference = params.opts.replyTo
-    ? { message_id: params.opts.replyTo, fail_if_not_exists: false }
+  const messageReference = params.opts.reply
+    ? { message_id: params.opts.reply.messageId, fail_if_not_exists: false }
     : undefined;
 
   let spec = params.spec;
@@ -280,12 +282,13 @@ export async function sendDiscordComponentMessage(
       mediaLocalRoots: opts.mediaLocalRoots,
       mediaReadFile: opts.mediaReadFile,
       mediaAccess: opts.mediaAccess,
-      replyTo: opts.replyTo,
+      reply: opts.reply,
       silent: opts.silent,
       textLimit: opts.textLimit,
       maxLinesPerMessage: opts.maxLinesPerMessage,
       tableMode: opts.tableMode,
       chunkMode: opts.chunkMode,
+      onDeliveryResult: opts.onDeliveryResult,
       ...(opts.suppressEmbeds === undefined ? {} : { suppressEmbeds: opts.suppressEmbeds }),
     });
   }
@@ -302,17 +305,11 @@ export async function sendDiscordComponentMessage(
     throw new Error("Discord components are not supported in forum-style channels");
   }
 
-  const { body: componentBody, buildResult } = await buildDiscordComponentPayload({
+  const { body, buildResult } = await buildDiscordComponentPayload({
     spec,
     opts,
     accountId: accountInfo.accountId,
   });
-  // Nonce enforcement belongs to Create Message; the shared builder also serves edits.
-  const body = {
-    ...componentBody,
-    nonce: createDiscordMessageNonce(),
-    enforce_nonce: true,
-  };
 
   let result: { id: string; channel_id: string };
   try {
@@ -322,7 +319,6 @@ export async function sendDiscordComponentMessage(
           body,
         }),
       "components",
-      { safety: "nonce-protected-create" },
     )) as { id: string; channel_id: string };
   } catch (err) {
     throw await buildDiscordSendError(err, {
@@ -333,6 +329,14 @@ export async function sendDiscordComponentMessage(
       hasMedia: Boolean(opts.mediaUrl),
     });
   }
+
+  const deliveryResult = createDiscordSendResult({
+    result,
+    fallbackChannelId: channelId,
+    kind: "card",
+    ...(opts.reply ? { reply: opts.reply } : {}),
+  });
+  await opts.onDeliveryResult?.(deliveryResult);
 
   registerBuiltDiscordComponentMessage({
     buildResult,
@@ -346,12 +350,7 @@ export async function sendDiscordComponentMessage(
     direction: "outbound",
   });
 
-  return createDiscordSendResult({
-    result,
-    fallbackChannelId: channelId,
-    kind: "card",
-    ...(opts.replyTo ? { replyToId: opts.replyTo } : {}),
-  });
+  return deliveryResult;
 }
 
 export async function editDiscordComponentMessage(
@@ -409,6 +408,6 @@ export async function editDiscordComponentMessage(
     },
     fallbackChannelId: channelId,
     kind: "card",
-    ...(opts.replyTo ? { replyToId: opts.replyTo } : {}),
+    ...(opts.reply ? { reply: opts.reply } : {}),
   });
 }

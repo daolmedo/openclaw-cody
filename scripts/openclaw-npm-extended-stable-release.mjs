@@ -3,7 +3,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { appendFileSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { classifyReleaseTrain, parseReleaseVersion } from "./lib/npm-publish-plan.mjs";
+import { parseReleaseVersion } from "./lib/npm-publish-plan.mjs";
 
 const SUPPORTED_DIST_TAGS = new Set(["alpha", "beta", "latest", "extended-stable"]);
 
@@ -38,15 +38,14 @@ export function validateNpmPublishBoundary(
   if (parsed === null) {
     throw new Error(`Unsupported release version "${packageVersion}".`);
   }
-  const releaseTrain = classifyReleaseTrain(parsed);
 
-  if (releaseTrain === "alpha") {
+  if (parsed.channel === "alpha") {
     if (npmDistTag !== "alpha") {
       throw new Error("Alpha prereleases must publish to the alpha npm dist-tag.");
     }
     return parsed;
   }
-  if (releaseTrain === "beta") {
+  if (parsed.channel === "beta") {
     if (npmDistTag !== "beta") {
       throw new Error("Beta prereleases must publish to the beta npm dist-tag.");
     }
@@ -57,15 +56,12 @@ export function validateNpmPublishBoundary(
     if (parsed.correctionNumber !== undefined) {
       throw new Error("Extended-stable npm publication does not allow correction suffixes.");
     }
-    if (!bypassExtendedStableGuard && releaseTrain !== "extended-stable") {
+    if (!bypassExtendedStableGuard && parsed.patch < 33) {
       throw new Error("Extended-stable npm publication requires release patch 33 or above.");
     }
     return parsed;
   }
-  if (
-    releaseTrain === "extended-stable" ||
-    releaseTrain === "unsupported-extended-stable-correction"
-  ) {
+  if (parsed.patch >= 33) {
     throw new Error(
       `Final or correction release patch 33 and above must publish to the extended-stable npm dist-tag; got ${npmDistTag}.`,
     );
@@ -163,7 +159,7 @@ export function validateExtendedStableNpmReleaseRequest(request) {
       `Protected main must be in a later calendar month than ${taggedVersion.year}.${taggedVersion.month}; got ${request.mainPackageVersion}.`,
     );
   }
-  if (classifyReleaseTrain(mainVersion) !== "stable") {
+  if (mainVersion.patch >= 33) {
     throw new Error("Protected main must remain on a daily patch below 33.");
   }
   return { extendedStable: true, releaseVersion, extendedStableBranch };
@@ -243,15 +239,6 @@ export function validateFullReleaseValidationManifest({
   if (npmDistTag === "extended-stable" && manifest.workflowRef !== expectedWorkflowRef) {
     throw new Error(
       `Full release validation workflow ref mismatch: expected ${expectedWorkflowRef}, got ${manifest.workflowRef ?? "<missing>"}.`,
-    );
-  }
-  if (
-    npmDistTag === "extended-stable" &&
-    manifest.releaseProfile !== "stable" &&
-    manifest.releaseProfile !== "full"
-  ) {
-    throw new Error(
-      `Extended-stable npm publication requires stable or full release validation; got ${manifest.releaseProfile ?? "<missing>"}.`,
     );
   }
   return manifest;

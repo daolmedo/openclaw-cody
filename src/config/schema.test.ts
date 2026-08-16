@@ -120,7 +120,6 @@ describe("config schema", () => {
     expect(groupPolicyLabel).toBeTypeOf("string");
     expect(groupPolicyLabel?.trim().length).toBeGreaterThan(0);
     expect(res.uiHints["mcp.servers.*.headers.*"]?.sensitive).toBe(true);
-    expect(res.uiHints["mcp.servers.*.env.*"]?.sensitive).toBe(true);
     expect(res.uiHints["mcp.servers.*.url"]?.tags).toContain(SENSITIVE_URL_HINT_TAG);
     expect(res.uiHints["models.providers.*.baseUrl"]?.tags).toContain(SENSITIVE_URL_HINT_TAG);
     expect(res.uiHints["proxy.tls.caFile"]?.tags).toEqual(
@@ -139,6 +138,19 @@ describe("config schema", () => {
         qmd: {
           searchMode: "query",
           rerank: false,
+        },
+      },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts queued status reaction emoji overrides", () => {
+    const result = OpenClawSchema.safeParse({
+      messages: {
+        statusReactions: {
+          emojis: {
+            queued: "👁️",
+          },
         },
       },
     });

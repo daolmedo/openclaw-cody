@@ -1,5 +1,4 @@
 import type { FastMode } from "@openclaw/normalization-core/string-coerce";
-import type { ReplyToMode } from "../config/types.js";
 /** Public option types for reply generation callbacks, streaming, and delivery policy. */
 import type { ImageContent } from "../llm/types.js";
 import type { PromptImageOrderEntry } from "../media/prompt-image-order.js";
@@ -15,7 +14,7 @@ export type BlockReplyContext = {
 };
 
 /** Context passed to onModelSelected callback with actual model used. */
-export type ModelSelectedContext = {
+type ModelSelectedContext = {
   provider: string;
   model: string;
   thinkLevel: string | undefined;
@@ -44,7 +43,14 @@ export type QueuedReplyDeliveryCorrelation = {
 
 /** Lifecycle hooks for queued follow-up replies. */
 export type QueuedReplyLifecycle = {
-  onEnqueued?: () => void;
+  /** Stable cancellation owner used to keep collect-mode batches authorization-safe. */
+  ownerKey?: string;
+  /** Return false when the external owner rejects this queue identity. */
+  onEnqueued?: () => boolean | void;
+  /** Retires this source's cancellation ownership while retaining its live identity. */
+  onCancellationRetired?: () => void;
+  /** Called after the queued turn owns the reply lane, before model/tool execution. */
+  onAdmitted?: () => void | Promise<void>;
   onComplete?: () => void;
 };
 
@@ -52,6 +58,17 @@ export type QueuedReplyLifecycle = {
 export type PartialReplyPayload = Pick<ReplyPayload, "text" | "mediaUrls"> & {
   delta?: string;
   replace?: true;
+};
+
+type ReasoningStreamPayload = Pick<
+  ReplyPayload,
+  "text" | "mediaUrls" | "isReasoning" | "isReasoningSnapshot"
+> & {
+  requiresReasoningProgressOptIn?: boolean;
+};
+
+type ReasoningProgressPayload = {
+  progressTokens: number;
 };
 
 /** Reply generation options shared by auto-reply, webchat, channels, and tests. */
@@ -68,7 +85,11 @@ export type GetReplyOptions = {
   imageOrder?: PromptImageOrderEntry[];
   /** Notifies when an agent run actually starts (useful for webchat command handling). */
   onAgentRunStart?: (runId: string) => void;
-  /** Called once restart-recovery delivery context has been persisted for the adopted turn. */
+  /**
+   * Called after the restart-recovery delivery-context persist attempt
+   * completes (context may be absent when source delivery is suppressed).
+   * Channels may complete ingress ownership here without waiting for settle.
+   */
   onTurnAdopted?: () => void | Promise<void>;
   /** Shared lifecycle owner for the current user-turn transcript append. */
   userTurnTranscriptRecorder?: UserTurnTranscriptRecorder;
@@ -76,6 +97,8 @@ export type GetReplyOptions = {
   /** Called when the typing controller cleans up (e.g., run ended with NO_REPLY). */
   onTypingCleanup?: () => void;
   onTypingController?: (typing: TypingController) => void;
+  /** If false, send only the initial typing signal without periodic keepalive refreshes. */
+  typingKeepalive?: boolean;
   isHeartbeat?: boolean;
   /** Policy-level typing control for run classes (user/system/internal/heartbeat). */
   typingPolicy?: TypingPolicy;
@@ -119,7 +142,9 @@ export type GetReplyOptions = {
    */
   onVerboseProgressVisibility?: (isActive: () => boolean) => void;
   onPartialReply?: (payload: PartialReplyPayload) => Promise<void> | void;
-  onReasoningStream?: (payload: ReplyPayload) => Promise<void> | void;
+  onReasoningStream?: (payload: ReasoningStreamPayload) => Promise<void> | void;
+  onReasoningProgress?: (payload: ReasoningProgressPayload) => Promise<void> | void;
+  streamReasoningInNonStreamModes?: boolean;
   /** Called when a thinking/reasoning block ends. */
   onReasoningEnd?: () => Promise<void> | void;
   /** Called when a new assistant message starts (e.g., after tool call or thinking block). */
@@ -156,6 +181,10 @@ export type GetReplyOptions = {
   }) => Promise<void> | void;
   /** In progress mode, classify Claude pre-tool text; true also renders it as commentary. */
   commentaryProgressEnabled?: boolean;
+  /** Deliver durable reasoning payloads to channels that own a separate reasoning lane. */
+  reasoningPayloadsEnabled?: boolean;
+  /** Deliver durable commentary (💬) payloads to channels that own a separate commentary lane. */
+  commentaryPayloadsEnabled?: boolean;
   /** Called when the agent emits a structured plan update. */
   onPlanUpdate?: (payload: {
     phase?: string;
@@ -223,14 +252,6 @@ export type GetReplyOptions = {
   queuedDeliveryCorrelations?: QueuedReplyDeliveryCorrelation[];
   /** Tracks ownership transfer when this turn later drains as a queued followup. */
   queuedFollowupLifecycle?: QueuedReplyLifecycle;
-  /** Applies source-channel delivery metadata when a queued follow-up later drains. */
-  queuedDeliveryPayloadTransform?: (payload: ReplyPayload) => ReplyPayload;
-  /** Preserves source-channel reply fan-out policy for queued delivery. */
-  queuedDeliveryReplyToMode?: ReplyToMode;
-  /** Commits source-channel delivery state after a queued payload is visibly routed. */
-  queuedDeliveryPayloadDidDeliver?: (payload: ReplyPayload) => void;
-  /** Re-establishes source-owned async context while a queued follow-up drains. */
-  queuedExecutionContext?: <T>(run: () => Promise<T>) => Promise<T>;
   /** Allow channel-owned progress UI while final/source reply delivery remains message-tool-only. */
   allowProgressCallbacksWhenSourceDeliverySuppressed?: boolean;
   /** Called when a suppressed source reply mode observes visible delivery through another path. */

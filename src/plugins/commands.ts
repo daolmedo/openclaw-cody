@@ -11,7 +11,6 @@ import { resolveConversationBindingContext } from "../channels/conversation-bind
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { ADMIN_SCOPE, isOperatorScope } from "../gateway/operator-scopes.js";
 import { logVerbose } from "../globals.js";
-import { truncateUtf16Safe } from "../utils.js";
 import {
   clearPluginCommands,
   clearPluginCommandsForPlugin,
@@ -123,9 +122,14 @@ function sanitizeArgs(args: string | undefined): string | undefined {
     return undefined;
   }
 
+  // Enforce length limit
+  if (args.length > MAX_ARGS_LENGTH) {
+    return args.slice(0, MAX_ARGS_LENGTH);
+  }
+
   // Remove control characters (except newlines and tabs which may be intentional)
   let sanitized = "";
-  for (const char of truncateUtf16Safe(args, MAX_ARGS_LENGTH)) {
+  for (const char of args) {
     const code = char.charCodeAt(0);
     const isControl = (code <= 0x1f && code !== 0x09 && code !== 0x0a) || code === 0x7f;
     if (!isControl) {
@@ -343,6 +347,7 @@ export async function executePluginCommand(params: {
     isAuthorizedSender,
     ...(senderIsOwnerForCommand === undefined ? {} : { senderIsOwner: senderIsOwnerForCommand }),
     gatewayClientScopes: params.gatewayClientScopes,
+    agentId: params.agentId,
     sessionKey: params.sessionKey,
     sessionId: params.sessionId,
     sessionFile: params.sessionFile,

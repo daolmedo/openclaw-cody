@@ -13,6 +13,7 @@ import {
 import {
   assertBrowserNavigationAllowed,
   assertBrowserNavigationResultAllowed,
+  withBrowserNavigationPolicy,
 } from "../navigation-guard.js";
 import { getBrowserProfileCapabilities } from "../profile-capabilities.js";
 import type { BrowserRouteContext, ProfileContext } from "../server-context.js";
@@ -23,6 +24,7 @@ import type { BrowserRequest, BrowserResponse, BrowserRouteRegistrar } from "./t
 import { asyncBrowserRoute, jsonError, toStringOrEmpty } from "./utils.js";
 
 const DEFAULT_TAB_REACHABILITY_TIMEOUT_MS = 300;
+const TAB_REACHABILITY_RETRY_DELAY_MS = 250;
 
 function handleTabsRouteError(
   ctx: BrowserRouteContext,
@@ -87,7 +89,18 @@ async function ensureBrowserRunning(
   res: BrowserResponse,
   signal?: AbortSignal,
 ) {
-  if (!(await checkTabReachability(ctx, profileCtx, signal))) {
+  let isReachable = await checkTabReachability(ctx, profileCtx, signal);
+  // A running browser can outlive one short CDP probe; retry once before
+  // rejecting a tab mutation and leaving session-owned tabs behind.
+  if (!isReachable && !signal?.aborted) {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, TAB_REACHABILITY_RETRY_DELAY_MS);
+    });
+    // Keep false reserved for paths where jsonError already wrote a response.
+    signal?.throwIfAborted();
+    isReachable = await checkTabReachability(ctx, profileCtx, signal);
+  }
+  if (!isReachable) {
     jsonError(
       res,
       new BrowserProfileUnavailableError("browser not running").status,
@@ -100,9 +113,10 @@ async function ensureBrowserRunning(
 
 async function redactBlockedTabUrls(params: {
   tabs: Awaited<ReturnType<ProfileContext["listTabs"]>>;
-  navigationPolicy: ReturnType<typeof browserNavigationPolicyForProfile>;
+  ssrfPolicy: ReturnType<BrowserRouteContext["state"]>["resolved"]["ssrfPolicy"];
 }): Promise<Awaited<ReturnType<ProfileContext["listTabs"]>>> {
-  if (!params.navigationPolicy.ssrfPolicy) {
+  const ssrfPolicyOpts = withBrowserNavigationPolicy(params.ssrfPolicy);
+  if (!ssrfPolicyOpts.ssrfPolicy) {
     return params.tabs;
   }
 
@@ -111,7 +125,7 @@ async function redactBlockedTabUrls(params: {
     try {
       await assertBrowserNavigationResultAllowed({
         url: tab.url,
-        ...params.navigationPolicy,
+        ...ssrfPolicyOpts,
       });
       redactedTabs.push(tab);
     } catch {
@@ -211,7 +225,7 @@ export function registerBrowserTabRoutes(app: BrowserRouteRegistrar, ctx: Browse
           }
           const tabs = await redactBlockedTabUrls({
             tabs: await profileCtx.listTabs(),
-            navigationPolicy: browserNavigationPolicyForProfile(ctx, profileCtx),
+            ssrfPolicy: ctx.state().resolved.ssrfPolicy,
           });
           res.json({ running: true, tabs });
         },
@@ -321,7 +335,7 @@ export function registerBrowserTabRoutes(app: BrowserRouteRegistrar, ctx: Browse
             }
             const tabs = await redactBlockedTabUrls({
               tabs: await profileCtx.listTabs(),
-              navigationPolicy: browserNavigationPolicyForProfile(ctx, profileCtx),
+              ssrfPolicy: ctx.state().resolved.ssrfPolicy,
             });
             return res.json({ ok: true, tabs });
           }

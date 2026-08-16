@@ -15,7 +15,6 @@ import {
   normalizeProviderId,
   type ProviderPlugin,
 } from "openclaw/plugin-sdk/provider-model-shared";
-import { fetchCodexUsage } from "openclaw/plugin-sdk/provider-usage";
 import {
   normalizeLowercaseStringOrEmpty,
   readStringValue,
@@ -43,9 +42,9 @@ import {
   cloneFirstTemplateModel,
   findCatalogTemplate,
   matchesExactOrPrefix,
-  OPENAI_DEFAULT_RUNTIME_CONTEXT_TOKENS,
 } from "./shared.js";
 import { resolveOpenAICodexThinkingProfile } from "./thinking-policy.js";
+import { fetchOpenAIUsage, resolveOpenAIUsageAuth } from "./usage.js";
 
 const PROVIDER_ID = "openai";
 const OPENAI_CODEX_BASE_URL = OPENAI_CODEX_RESPONSES_BASE_URL;
@@ -64,7 +63,7 @@ const OPENAI_CODEX_GPT_54_LEGACY_MODEL_ID = "gpt-5.4-codex";
 const OPENAI_CODEX_GPT_54_MINI_MODEL_ID = "gpt-5.4-mini";
 const OPENAI_CODEX_GPT_54_PRO_MODEL_ID = "gpt-5.4-pro";
 const OPENAI_CODEX_GPT_53_SPARK_MODEL_ID = "gpt-5.3-codex-spark";
-const OPENAI_CODEX_GPT_56_NATIVE_CONTEXT_TOKENS = 372_000;
+const OPENAI_CODEX_GPT_56_CONTEXT_TOKENS = 372_000;
 const OPENAI_CODEX_GPT_55_CODEX_CONTEXT_TOKENS = 400_000;
 const OPENAI_CODEX_GPT_55_DEFAULT_RUNTIME_CONTEXT_TOKENS = 272_000;
 const OPENAI_CODEX_GPT_55_PRO_NATIVE_CONTEXT_TOKENS = 1_000_000;
@@ -242,8 +241,8 @@ function resolveCodexForwardCompatModel(ctx: ProviderResolveDynamicModelContext)
       | undefined;
     const registeredModel = withDefaultCodexContextMetadata({
       model: withCodexTransport(model, synthBaseUrl),
-      contextWindow: OPENAI_CODEX_GPT_56_NATIVE_CONTEXT_TOKENS,
-      contextTokens: OPENAI_DEFAULT_RUNTIME_CONTEXT_TOKENS,
+      contextWindow: OPENAI_CODEX_GPT_56_CONTEXT_TOKENS,
+      contextTokens: OPENAI_CODEX_GPT_56_CONTEXT_TOKENS,
     });
     if (registeredModel) {
       return normalizeModelCompat({
@@ -263,8 +262,8 @@ function resolveCodexForwardCompatModel(ctx: ProviderResolveDynamicModelContext)
       reasoning: true,
       input: ["text", "image"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: OPENAI_CODEX_GPT_56_NATIVE_CONTEXT_TOKENS,
-      contextTokens: OPENAI_DEFAULT_RUNTIME_CONTEXT_TOKENS,
+      contextWindow: OPENAI_CODEX_GPT_56_CONTEXT_TOKENS,
+      contextTokens: OPENAI_CODEX_GPT_56_CONTEXT_TOKENS,
       maxTokens: OPENAI_CODEX_GPT_54_MAX_TOKENS,
       thinkingLevelMap: OPENAI_CODEX_GPT_56_THINKING_LEVEL_MAP,
     } as ProviderRuntimeModel);
@@ -633,7 +632,8 @@ export function buildOpenAICodexProviderHooks(): Pick<
   return {
     resolveDynamicModel: (ctx) => resolveCodexForwardCompatModel(ctx),
     buildAuthDoctorHint: (ctx) => buildOpenAICodexAuthDoctorHint(ctx),
-    resolveThinkingProfile: ({ modelId }) => resolveOpenAICodexThinkingProfile(modelId),
+    resolveThinkingProfile: ({ modelId, agentRuntime, compat }) =>
+      resolveOpenAICodexThinkingProfile(modelId, agentRuntime, compat),
     isModernModelRef: ({ modelId }) => matchesExactOrPrefix(modelId, OPENAI_CODEX_MODERN_MODEL_IDS),
     preferRuntimeResolvedModel: (ctx) => {
       if (!isOpenAIOrLegacyCodexProvider(ctx.provider)) {
@@ -674,9 +674,8 @@ export function buildOpenAICodexProviderHooks(): Pick<
       }
       return normalized;
     },
-    resolveUsageAuth: async (ctx) => await ctx.resolveOAuthToken(),
-    fetchUsageSnapshot: async (ctx) =>
-      await fetchCodexUsage(ctx.token, ctx.accountId, ctx.timeoutMs, ctx.fetchFn),
+    resolveUsageAuth: resolveOpenAIUsageAuth,
+    fetchUsageSnapshot: fetchOpenAIUsage,
     refreshOAuth: async (cred) => await refreshOpenAICodexOAuthCredential(cred),
     augmentModelCatalog: (ctx) => {
       const gpt54Template = findCatalogTemplate({

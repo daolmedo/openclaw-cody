@@ -210,6 +210,7 @@ describe("voice-call tunnels", () => {
     expect(tunnel?.publicUrl).toBe("https://dispatch.ngrok.io/hook");
     expect(tunnel?.provider).toBe("ngrok");
   });
+
   it("handles spawn errors on tailscale stop cleanup without crashing", async () => {
     mocks.getTailscaleDnsName.mockResolvedValue("host.tailnet.ts.net");
     // Start the tunnel — first spawn is tailscale serve (succeeds)

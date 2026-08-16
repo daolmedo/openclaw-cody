@@ -3,7 +3,6 @@ import { describe, expect, it, vi } from "vitest";
 import type { BrowserRouteContext, ProfileContext } from "../server-context.js";
 import "../../test-support/browser-security.mock.js";
 import {
-  handleRouteError,
   readBody,
   resolveSafeRouteTabUrl,
   resolveTargetIdFromBody,
@@ -63,6 +62,7 @@ function routeContextForTab(
     forProfile: () => profileCtx,
     state: () => ({
       resolved: {
+        actionTimeoutMs: 60_000,
         ssrfPolicy: {},
       },
     }),
@@ -71,21 +71,6 @@ function routeContextForTab(
 }
 
 describe("browser route shared helpers", () => {
-  it("redacts credentials from unmapped route errors", () => {
-    const response = createBrowserRouteResponse();
-    const error = new Error(
-      "connect failed for wss://browser-user:browser-password@browserless.example/cdp?token=browser-token",
-    );
-
-    handleRouteError({ mapTabError: () => null } as never, response.res, error);
-
-    expect(response.statusCode).toBe(500);
-    expect(response.body).toMatchObject({ error: expect.stringContaining("browserless.example") });
-    expect(JSON.stringify(response.body)).not.toContain("browser-user");
-    expect(JSON.stringify(response.body)).not.toContain("browser-password");
-    expect(JSON.stringify(response.body)).not.toContain("browser-token");
-  });
-
   describe("readBody", () => {
     it("returns object bodies", () => {
       expect(readBody(requestWithBody({ one: 1 }))).toEqual({ one: 1 });
@@ -169,6 +154,8 @@ describe("browser route shared helpers", () => {
 
       expect(ensureTabAvailable).toHaveBeenCalledWith(undefined, {
         allowPlaywrightFallback: true,
+        signal: undefined,
+        timeoutMs: 60_000,
       });
     });
 

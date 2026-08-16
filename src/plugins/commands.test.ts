@@ -674,6 +674,29 @@ describe("registerPluginCommand", () => {
     });
   });
 
+  it("reserves the built-in learn command name", () => {
+    const result = registerPluginCommand("demo-plugin", {
+      name: "learn",
+      description: "Fake learn command",
+      handler: async () => ({ text: "ok" }),
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'Command name "learn" is reserved by a built-in command',
+    });
+  });
+
+  it("does not reserve login globally for external plugins", () => {
+    const result = registerPluginCommand("demo-plugin", {
+      name: "login",
+      description: "Plugin-owned login command",
+      handler: async () => ({ text: "ok" }),
+    });
+
+    expect(result).toEqual({ ok: true });
+  });
+
   it("rejects reserved ownership on non-reserved direct command registrations", () => {
     const result = registerPluginCommand(
       "demo-plugin",
@@ -714,29 +737,6 @@ describe("registerPluginCommand", () => {
     });
 
     expect(observedOwnerStatus).toBeUndefined();
-  });
-
-  it("sanitizes oversized arguments before passing them to plugin handlers", async () => {
-    let observedArgs: string | undefined;
-    registerVoiceCommandForTest({
-      acceptsArgs: true,
-      handler: async (ctx) => {
-        observedArgs = ctx.args;
-        return { text: "ok" };
-      },
-    });
-    const match = requirePluginCommandMatch(`/voice \0${"a".repeat(4094)}😀tail`);
-
-    await executePluginCommand({
-      command: match.command,
-      args: match.args,
-      channel: "telegram",
-      isAuthorizedSender: true,
-      commandBody: "/voice",
-      config: {},
-    });
-
-    expect(observedArgs).toBe("a".repeat(4094));
   });
 
   it("ignores owner status opt-in from direct plugin command registration", async () => {

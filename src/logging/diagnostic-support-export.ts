@@ -6,7 +6,6 @@ import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { parseConfigJson5 } from "../config/io.js";
 import { resolveConfigPath, resolveStateDir } from "../config/paths.js";
 import { redactConfigObject } from "../config/redact-snapshot.js";
-import { buildConfigSchema } from "../config/schema.js";
 import { resolveHomeRelativePath } from "../infra/home-dir.js";
 import { VERSION } from "../version.js";
 import {
@@ -34,7 +33,7 @@ import {
 } from "./diagnostic-support-redaction.js";
 import { readConfiguredLogTail, type LogTailPayload } from "./log-tail.js";
 
-export const DIAGNOSTIC_SUPPORT_EXPORT_VERSION = 1;
+const DIAGNOSTIC_SUPPORT_EXPORT_VERSION = 1;
 
 const DEFAULT_LOG_LIMIT = 5000;
 const DEFAULT_LOG_MAX_BYTES = 1_000_000;
@@ -292,10 +291,7 @@ function sanitizeConfigShape(
 }
 
 function sanitizeConfigDetails(parsed: unknown, redaction: SupportRedactionContext): unknown {
-  return sanitizeSupportConfigValue(
-    redactConfigObject(parsed, buildConfigSchema().uiHints),
-    redaction,
-  );
+  return sanitizeSupportConfigValue(redactConfigObject(parsed), redaction);
 }
 
 function configShapeReadFailure(params: {
@@ -674,7 +670,7 @@ function resolveOutputPath(options: {
   return resolved;
 }
 
-export async function buildDiagnosticSupportExport(
+async function buildDiagnosticSupportExport(
   options: DiagnosticSupportExportOptions = {},
 ): Promise<DiagnosticSupportExportArtifact> {
   const env = options.env ?? process.env;

@@ -107,9 +107,7 @@ export async function deliverPrivateCommandReply(params: {
       }),
     ),
   );
-  return results.some(
-    (result) => result.status === "fulfilled" && (result.value.ok || result.value.delivered),
-  );
+  return results.some((result) => result.status === "fulfilled" && result.value.ok);
 }
 
 /** Reads the command message thread id from command context. */
@@ -127,6 +125,36 @@ export function readCommandDeliveryTarget(params: HandleCommandsParams): string 
     normalizeOptionalString(params.command.to) ??
     normalizeOptionalString(params.command.from)
   );
+}
+
+/**
+ * Resolves where an exec approval prompt for a command should be delivered:
+ * the private owner-DM target when one was resolved, else the originating
+ * command surface. Keeps the fallback ternaries in one place so private and
+ * origin routing cannot drift between command handlers.
+ */
+export function resolveCommandExecApprovalRoute(params: {
+  commandParams: HandleCommandsParams;
+  privateApprovalTarget?: PrivateCommandRouteTarget;
+}): {
+  messageProvider: string;
+  currentChannelId: string | undefined;
+  currentThreadTs: string | undefined;
+  accountId: string | undefined;
+} {
+  const target = params.privateApprovalTarget;
+  return {
+    messageProvider: target?.channel ?? params.commandParams.command.channel,
+    currentChannelId: target?.to ?? readCommandDeliveryTarget(params.commandParams),
+    currentThreadTs: target
+      ? target.threadId == null
+        ? undefined
+        : String(target.threadId)
+      : readCommandMessageThreadId(params.commandParams),
+    accountId: target
+      ? (target.accountId ?? undefined)
+      : (params.commandParams.ctx.AccountId ?? undefined),
+  };
 }
 
 function listPrivateCommandRouteCandidateChannels(originChannel: string) {

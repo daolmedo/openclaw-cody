@@ -125,7 +125,22 @@ function commitFile(repo: string, filePath: string, content: string, message: st
   return git(repo, ["rev-parse", "HEAD"]);
 }
 
-function createRepo(options: { pluginVersion?: string } = {}) {
+function plistFor(shortVersion: string, buildVersion: string): string {
+  return [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<plist version="1.0">',
+    "<dict>",
+    "    <key>CFBundleShortVersionString</key>",
+    `    <string>${shortVersion}</string>`,
+    "    <key>CFBundleVersion</key>",
+    `    <string>${buildVersion}</string>`,
+    "</dict>",
+    "</plist>",
+    "",
+  ].join("\n");
+}
+
+function createRepo(options: { plistBuildVersion?: string } = {}) {
   const origin = tempDirs.make("evidence-reuse-origin-");
   git(origin, ["init", "-q", "-b", "main"]);
   git(origin, ["config", "user.email", "test-user@example.invalid"]);
@@ -135,18 +150,10 @@ function createRepo(options: { pluginVersion?: string } = {}) {
     join(origin, "package.json"),
     `${JSON.stringify({ name: "x", version: "2026.7.1" }, null, 2)}\n`,
   );
-  mkdirSync(join(origin, "extensions/test-plugin"), { recursive: true });
+  mkdirSync(join(origin, "apps/macos/Sources/OpenClaw/Resources"), { recursive: true });
   writeFileSync(
-    join(origin, "extensions/test-plugin/package.json"),
-    `${JSON.stringify(
-      {
-        name: "@openclaw/test-plugin",
-        openclaw: { release: { publishToNpm: true } },
-        version: options.pluginVersion ?? "2026.7.1",
-      },
-      null,
-      2,
-    )}\n`,
+    join(origin, "apps/macos/Sources/OpenClaw/Resources/Info.plist"),
+    plistFor("2026.7.1", options.plistBuildVersion ?? "2026070100"),
   );
   mkdirSync(join(origin, "docs/install"), { recursive: true });
   writeFileSync(join(origin, "docs/install/updating.md"), "# Updating\n");
@@ -554,7 +561,6 @@ describe("scripts/github/find-reusable-release-validation.sh", () => {
       changed_path_count: "0",
       evidence_root_run_id: "111",
       evidence_run_id: "111",
-      evidence_policy: "exact-target-full-validation-v1",
       evidence_sha: priorSha,
       reuse: "true",
     });
@@ -585,7 +591,6 @@ describe("scripts/github/find-reusable-release-validation.sh", () => {
     expect(parseOutput(result.stdout)).toMatchObject({
       changed_path_count: "0",
       changed_paths: "[]",
-      evidence_policy: "exact-target-full-validation-v1",
       reuse: "true",
     });
   });
@@ -846,7 +851,7 @@ describe("scripts/github/find-reusable-release-validation.sh", () => {
   });
 
   it("rejects target version metadata that is internally inconsistent", () => {
-    const { origin, priorSha } = createRepo({ pluginVersion: "2026.7.0" });
+    const { origin, priorSha } = createRepo({ plistBuildVersion: "2026061000" });
     const clone = cloneHead(origin);
     const record = normalizedEvidence({ targetSha: priorSha });
     const { binDir, fixtures, validatorPath } = setUpFixtures([{ record, runId: "111" }]);
@@ -913,5 +918,9 @@ describe("scripts/github/find-reusable-release-validation.sh", () => {
     expect(workflow).toContain('--arg workflowSha "$GITHUB_SHA"');
     expect(workflow).toContain("workflowSha: $workflowSha");
     expect(workflow).toContain("ref: ${{ github.sha }}");
+    expect(workflow.match(/\bversion: 3,/gu)).toHaveLength(2);
+    expect(workflow).toContain(
+      "full-release-validation-${{ github.run_id }}-${{ github.run_attempt }}",
+    );
   });
 });

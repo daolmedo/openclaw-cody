@@ -56,8 +56,6 @@ const DEFAULT_FILE_MAX_BYTES = 1024 * 1024;
 const DEFAULT_FILE_TIMEOUT_MS = 5_000;
 const DEFAULT_EXEC_TIMEOUT_MS = 5_000;
 const DEFAULT_EXEC_MAX_OUTPUT_BYTES = 1024 * 1024;
-// Exec diagnostics cross CLI, RPC, and log boundaries; surface only canonical safe codes.
-const SAFE_EXEC_ERROR_CODES = new Set(["AMBIGUOUS_DUPLICATE_KEY", "NOT_FOUND"]);
 const WINDOWS_ABS_PATH_PATTERN = /^[A-Za-z]:[\\/]/;
 const WINDOWS_UNC_PATH_PATTERN = /^\\\\[^\\]+\\[^\\]+/;
 
@@ -80,7 +78,7 @@ type ProviderResolutionOutput = Map<string, unknown>;
 
 /** Error for failures that affect an entire configured secret provider. */
 /** Error emitted when a configured secret provider cannot resolve a ref. */
-export class SecretProviderResolutionError extends Error {
+class SecretProviderResolutionError extends Error {
   readonly scope = "provider" as const;
   readonly source: SecretRefSource;
   readonly provider: string;
@@ -99,7 +97,7 @@ export class SecretProviderResolutionError extends Error {
 }
 
 /** Error for failures limited to one SecretRef id under a provider. */
-export class SecretRefResolutionError extends Error {
+class SecretRefResolutionError extends Error {
   readonly scope = "ref" as const;
   readonly source: SecretRefSource;
   readonly provider: string;
@@ -668,18 +666,24 @@ function parseExecValues(params: {
   const responseErrors = isRecord(parsed.errors) ? parsed.errors : null;
   const out: Record<string, unknown> = {};
   for (const id of params.ids) {
-    if (responseErrors && Object.hasOwn(responseErrors, id)) {
+    if (responseErrors && id in responseErrors) {
       const entry = responseErrors[id];
-      const code = isRecord(entry) && typeof entry.code === "string" ? entry.code : null;
-      const safeCode = code && SAFE_EXEC_ERROR_CODES.has(code) ? code : null;
+      if (isRecord(entry) && typeof entry.message === "string" && entry.message.trim()) {
+        throw refResolutionError({
+          source: "exec",
+          provider: params.providerName,
+          refId: id,
+          message: `Exec provider "${params.providerName}" failed for id "${id}" (${entry.message.trim()}).`,
+        });
+      }
       throw refResolutionError({
         source: "exec",
         provider: params.providerName,
         refId: id,
-        message: `Exec provider "${params.providerName}" failed for id "${id}"${safeCode ? ` (${safeCode})` : ""}.`,
+        message: `Exec provider "${params.providerName}" failed for id "${id}".`,
       });
     }
-    if (!Object.hasOwn(responseValues, id)) {
+    if (!(id in responseValues)) {
       throw refResolutionError({
         source: "exec",
         provider: params.providerName,

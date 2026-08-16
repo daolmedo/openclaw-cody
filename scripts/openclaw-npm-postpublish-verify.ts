@@ -25,10 +25,10 @@ import {
 } from "node:path";
 import { pathToFileURL } from "node:url";
 import { formatErrorMessage } from "../src/infra/errors.ts";
+import { ALWAYS_ALLOWED_RUNTIME_DIR_NAMES } from "../src/plugin-sdk/facade-activation-contract.ts";
 import { BUNDLED_RUNTIME_SIDECAR_PATHS } from "../src/plugins/runtime-sidecar-paths.ts";
 import { readBoundedResponseText } from "./lib/bounded-response.ts";
 import { listBundledPluginPackArtifacts } from "./lib/bundled-plugin-build-entries.mjs";
-import { classifyReleaseTrain } from "./lib/npm-publish-plan.mjs";
 import { runNpmVerifyCommand } from "./lib/npm-verify-exec.ts";
 import {
   collectRuntimeDependencySpecs,
@@ -94,13 +94,13 @@ type DistJavaScriptFileListResult =
   | { files: string[]; limitExceeded: false }
   | { files: string[]; limit: number; limitExceeded: true };
 
-export type PublishedInstallScenario = {
+type PublishedInstallScenario = {
   name: string;
   installSpecs: string[];
   expectedVersion: string;
 };
 
-export type OpenClawNpmPostpublishVerifyArgs =
+type OpenClawNpmPostpublishVerifyArgs =
   | {
       help: false;
       version: string;
@@ -284,13 +284,9 @@ function resolveNpmProvenanceVerificationPolicy(
   const workflow = statement.predicate?.buildDefinition?.externalParameters?.workflow;
   const workflowRef = workflow?.ref;
   const expectedReleaseRef = `refs/heads/release/${parsedVersion.baseVersion}`;
-  const isExpectedExtendedStableRef =
-    classifyReleaseTrain(parsedVersion) === "extended-stable" &&
-    workflowRef === `refs/heads/extended-stable/${parsedVersion.year}.${parsedVersion.month}.33`;
   const isTrustedRef =
     workflowRef === "refs/heads/main" ||
     workflowRef === expectedReleaseRef ||
-    isExpectedExtendedStableRef ||
     (parsedVersion.channel === "alpha" &&
       /^refs\/heads\/tideclaw\/alpha\/[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}Z$/u.test(
         workflowRef ?? "",
@@ -414,11 +410,31 @@ export function collectInstalledPackageErrors(params: {
   }
 
   errors.push(...collectInstalledBundledExtensionManifestErrors(params.packageRoot));
+  errors.push(...collectInstalledAlwaysAllowedRuntimeFacadeErrors(params.packageRoot));
   errors.push(...collectInstalledContextEngineRuntimeErrors(params.packageRoot));
   errors.push(...collectInstalledPluginSdkZodArtifactErrors(params.packageRoot));
   errors.push(...collectInstalledPluginSdkDeclarationErrors(params.packageRoot));
   errors.push(...collectInstalledRootDependencyManifestErrors(params.packageRoot));
 
+  return errors;
+}
+
+export function collectInstalledAlwaysAllowedRuntimeFacadeErrors(packageRoot: string): string[] {
+  const errors: string[] = [];
+  const activationRuntimePath = "dist/facade-activation-check.runtime.js";
+  if (!existsSync(join(packageRoot, activationRuntimePath))) {
+    errors.push(
+      `installed package is missing required facade activation runtime: ${activationRuntimePath}`,
+    );
+  }
+  for (const dirName of ALWAYS_ALLOWED_RUNTIME_DIR_NAMES) {
+    const relativePath = `dist/extensions/${dirName}/runtime-api.js`;
+    if (!existsSync(join(packageRoot, relativePath))) {
+      errors.push(
+        `installed package allows bundled runtime facade ${dirName}/runtime-api.js but is missing required runtime sidecar: ${relativePath}.`,
+      );
+    }
+  }
   return errors;
 }
 
@@ -628,7 +644,7 @@ export function collectInstalledPluginSdkZodArtifactErrors(packageRoot: string):
   return [];
 }
 
-export function collectInstalledPluginSdkDeclarationErrors(packageRoot: string): string[] {
+function collectInstalledPluginSdkDeclarationErrors(packageRoot: string): string[] {
   const pluginSdkDistRoot = join(packageRoot, "dist", "plugin-sdk");
   const errors: string[] = [];
   const forbiddenPrivateWorkspaceSpecifiers = ["@openclaw/llm-core"];

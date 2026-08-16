@@ -3,15 +3,16 @@
 
 import { pathToFileURL } from "node:url";
 import {
+  assertPluginReleaseDependencyFreshness,
+  assertPluginReleaseVersionFloors,
   collectChangedExtensionIdsFromGitRange,
   collectPublishablePluginPackages,
-  assertPluginReleaseVersionFloors,
   parsePluginNpmReleaseArgs,
   resolveChangedPublishablePluginPackages,
   resolveSelectedPublishablePluginPackages,
 } from "./lib/plugin-npm-release.ts";
 
-export function runPluginNpmReleaseCheck(argv: string[]) {
+function runPluginNpmReleaseCheck(argv: string[]) {
   const { selection, selectionMode, npmDistTag, baseRef, headRef } =
     parsePluginNpmReleaseArgs(argv);
   const changedExtensionIds =
@@ -46,6 +47,7 @@ export function runPluginNpmReleaseCheck(argv: string[]) {
   if (selectionMode !== undefined || selection.length > 0) {
     assertPluginReleaseVersionFloors(selected, "plugin-npm-release-check");
   }
+  assertPluginReleaseDependencyFreshness(selected, "plugin-npm-release-check");
 
   console.log("plugin-npm-release-check: publishable plugin metadata looks OK.");
   if (baseRef && headRef && selected.length === 0) {

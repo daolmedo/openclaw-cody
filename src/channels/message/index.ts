@@ -61,7 +61,6 @@ export type {
   ChannelIngressQueue,
   ChannelIngressQueueClaim,
   ChannelIngressQueueClaimRef,
-  ChannelIngressQueueCorruptClaim,
   ChannelIngressQueueCompletedRecord,
   ChannelIngressQueueEnqueueResult,
   ChannelIngressQueueFailedRecord,

@@ -177,10 +177,23 @@ describe("browser client", () => {
           });
         }
         if (url.endsWith("/tabs/open")) {
-          return jsonResponse({ targetId: "t2", title: "N", url: "https://y" });
+          return jsonResponse({
+            targetId: "t2",
+            title: "N",
+            url: "https://y",
+          });
         }
         if (url.endsWith("/navigate")) {
-          return jsonResponse({ ok: true, targetId: "t1", url: "https://y" });
+          return jsonResponse({
+            ok: true,
+            targetId: "t1",
+            url: "https://y",
+            download: {
+              url: "https://y/report.csv",
+              suggestedFilename: "report.csv",
+              path: "/tmp/openclaw/downloads/report.csv",
+            },
+          });
         }
         if (url.endsWith("/act")) {
           return jsonResponse({
@@ -189,6 +202,13 @@ describe("browser client", () => {
             url: "https://x",
             result: 1,
             results: [{ ok: true }],
+            downloads: [
+              {
+                url: "https://x/report.pdf",
+                suggestedFilename: "report.pdf",
+                path: "/tmp/openclaw/downloads/report.pdf",
+              },
+            ],
           });
         }
         if (url.endsWith("/hooks/file-chooser")) {
@@ -198,7 +218,11 @@ describe("browser client", () => {
           return jsonResponse({ ok: true });
         }
         if (url.includes("/console?")) {
-          return jsonResponse({ ok: true, targetId: "t1", messages: [] });
+          return jsonResponse({
+            ok: true,
+            targetId: "t1",
+            messages: [],
+          });
         }
         if (url.endsWith("/pdf")) {
           return jsonResponse({
@@ -231,7 +255,11 @@ describe("browser client", () => {
             profile: "openclaw",
             transport: "cdp",
             checks: [],
-            status: { enabled: true, running: true, cdpPort: 18792 },
+            status: {
+              enabled: true,
+              running: true,
+              cdpPort: 18792,
+            },
           });
         }
         return jsonResponse({
@@ -282,11 +310,23 @@ describe("browser client", () => {
     });
     expect(navigation.ok).toBe(true);
     expect(navigation.targetId).toBe("t1");
+    expect(navigation.download).toEqual({
+      url: "https://y/report.csv",
+      suggestedFilename: "report.csv",
+      path: "/tmp/openclaw/downloads/report.csv",
+    });
 
     const act = await browserAct("http://127.0.0.1:18791", { kind: "click", ref: "1" });
     expect(act.ok).toBe(true);
     expect(act.targetId).toBe("t1");
     expect(act.results).toEqual([{ ok: true }]);
+    expect(act.downloads).toEqual([
+      {
+        url: "https://x/report.pdf",
+        suggestedFilename: "report.pdf",
+        path: "/tmp/openclaw/downloads/report.pdf",
+      },
+    ]);
 
     const fileChooser = await browserArmFileChooser("http://127.0.0.1:18791", {
       paths: ["/tmp/a.txt"],

@@ -2,7 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { createMatrixQaClient, type MatrixQaRoomObserver } from "../../substrate/client.js";
 import type { MatrixQaObservedEvent } from "../../substrate/events.js";
-import type { MatrixQaFaultProxy } from "../../substrate/fault-proxy.js";
+import type { MatrixQaFaultProxyObserver } from "../../substrate/fault-proxy.js";
 import { createMatrixQaRoomObserver } from "../../substrate/sync.js";
 import type { MatrixQaProvisionedTopology } from "../../substrate/topology.js";
 import { resolveMatrixQaScenarioRoomId } from "./scenario-catalog.js";
@@ -24,6 +24,8 @@ export type MatrixQaScenarioContext = {
   driverDeviceId?: string;
   driverPassword?: string;
   driverUserId: string;
+  faultProxyObserver?: MatrixQaFaultProxyObserver;
+  faultProxyTargetBaseUrl?: string;
   observedEvents: MatrixQaObservedEvent[];
   observerAccessToken: string;
   observerDeviceId?: string;
@@ -37,7 +39,6 @@ export type MatrixQaScenarioContext = {
     params?: Record<string, unknown>,
     opts?: { expectFinal?: boolean; timeoutMs?: number },
   ) => Promise<unknown>;
-  faultProxy?: Pick<MatrixQaFaultProxy, "hits" | "installRule" | "removeRule">;
   outputDir?: string;
   registrationToken?: string;
   restartGateway?: () => Promise<void>;
@@ -96,9 +97,9 @@ export function buildMatrixPartialStreamingPrompt(sutUserId: string, text: strin
 }
 
 export const MATRIX_QA_TOOL_PROGRESS_TASK_FILENAME = "QA_KICKOFF_TASK.md";
-export const MATRIX_QA_TOOL_PROGRESS_COMMAND = "printf 'matrix-command-progress-start\\n'; sleep 2";
-export const MATRIX_QA_TOOL_PROGRESS_MENTION_COMMAND =
-  "printf '@room @alice:matrix-qa.test !room:matrix-qa.test\\n'; sleep 2";
+const MATRIX_QA_TOOL_PROGRESS_MENTION_FILENAME =
+  "matrix-progress-@room-@alice:matrix-qa.test-!room:matrix-qa.test.txt";
+const MATRIX_QA_TOOL_PROGRESS_COMMAND = "printf 'matrix-command-progress-start\\n'; sleep 2";
 
 export function buildMatrixToolProgressTaskContent(text: string) {
   return [
@@ -135,10 +136,10 @@ export function buildMatrixToolProgressErrorPrompt(sutUserId: string, text: stri
 
 export function buildMatrixToolProgressMentionSafetyPrompt(sutUserId: string, text: string) {
   return [
-    `${sutUserId} Tool progress QA check: call the exec tool exactly once with this exact command before answering: \`${MATRIX_QA_TOOL_PROGRESS_MENTION_COMMAND}\`.`,
-    "The QA harness must observe that command in a Matrix tool-progress preview with all mention-looking text inert.",
-    "Do not guess or send any marker before the tool result returns.",
-    `After that command completes or fails, reply exactly \`${text}\`.`,
+    `${sutUserId} Tool progress QA check: read the missing workspace file \`${MATRIX_QA_TOOL_PROGRESS_MENTION_FILENAME}\` before answering.`,
+    `The QA harness must observe that failed read in a Matrix tool-progress preview.`,
+    `Do not guess or send any marker before the tool result returns.`,
+    `After that read fails, reply exactly \`${text}\`.`,
   ].join(" ");
 }
 
@@ -194,14 +195,6 @@ export function buildMatrixReplyArtifact(
     relatesTo: event.relatesTo,
     sender: event.sender,
     ...(token ? { tokenMatched: doesMatrixQaReplyBodyMatchToken(event, token) } : {}),
-  };
-}
-
-export function buildMatrixNoticeArtifact(event: MatrixQaObservedEvent) {
-  return {
-    bodyPreview: event.body?.trim().slice(0, 200),
-    eventId: event.eventId,
-    sender: event.sender,
   };
 }
 
@@ -418,7 +411,7 @@ export async function assertNoSutReplyWindow(params: {
   };
 }
 
-export async function runConfigurableTopLevelScenario(params: {
+async function runConfigurableTopLevelScenario(params: {
   accessToken: string;
   actorId: MatrixQaActorId;
   baseUrl: string;

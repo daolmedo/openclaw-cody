@@ -59,9 +59,13 @@ export function useAutoCleanupTempDirTracker(
   registerCleanup: RegisterTempDirCleanup,
 ): AutoCleanupTempDirTracker {
   const tracker = createTempDirTracker();
-  registerCleanup(() => tracker.cleanup());
+  registerCleanup(() => {
+    tracker.cleanup();
+  });
   return {
     dirs: tracker.dirs,
-    make: (prefix) => tracker.make(prefix),
+    make(prefix: string): string {
+      return tracker.make(prefix);
+    },
   };
 }

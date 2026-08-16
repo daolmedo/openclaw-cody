@@ -138,7 +138,7 @@ describe("openclaw npm publish wrapper", () => {
     const tarballVersion = `${packageVersion}-mismatch`;
     const tarball = makePackageTarball(tempRoot, JSON.stringify({ version: tarballVersion }));
     const result = runPublishWrapper(["--publish", tarball], {
-      OPENCLAW_NPM_PUBLISH_TAG: "extended-stable",
+      OPENCLAW_NPM_PUBLISH_TAG: "beta",
     });
 
     expect(result.status).toBe(2);
@@ -155,19 +155,21 @@ describe("openclaw npm publish wrapper", () => {
     const tempRoot = makeTempDir("openclaw-npm-publish-");
     const tarball = makePackageTarball(tempRoot, packageJson);
     const result = runPublishWrapper(["--publish", tarball], {
-      OPENCLAW_NPM_PUBLISH_TAG: "extended-stable",
+      OPENCLAW_NPM_PUBLISH_TAG: "beta",
     });
 
     expect(result.status).toBe(2);
     expect(result.stderr).toContain(expectedError);
   });
 
-  it("rejects a pre-.33 final version on extended-stable", () => {
+  it("rejects publishing the current pre-.33 final version to extended-stable", () => {
     const tempRoot = makeTempDir("openclaw-npm-publish-");
     const checkout = makeReleaseCheckout(tempRoot, "2026.5.32");
     const result = runPublishWrapper(
       ["--publish"],
-      { OPENCLAW_NPM_PUBLISH_TAG: "extended-stable" },
+      {
+        OPENCLAW_NPM_PUBLISH_TAG: "extended-stable",
+      },
       checkout,
     );
 
@@ -177,11 +179,10 @@ describe("openclaw npm publish wrapper", () => {
     );
   });
 
-  it("routes the prepared 2026.6.33 tarball only to extended-stable", () => {
+  it("publishes a pre-.33 final version to extended-stable with the explicit bypass", () => {
     const tempRoot = makeTempDir("openclaw-npm-publish-");
     const binDir = path.join(tempRoot, "bin");
-    const checkout = makeReleaseCheckout(tempRoot, "2026.6.33");
-    const tarball = makePackageTarball(tempRoot, JSON.stringify({ version: "2026.6.33" }));
+    const checkout = makeReleaseCheckout(tempRoot, "2026.5.32");
     const npmLog = path.join(tempRoot, "npm.log");
     mkdirSync(binDir);
     writeFileSync(path.join(binDir, "npm"), `#!/bin/sh\nprintf '%s\\n' "$*" > "${npmLog}"\n`, {
@@ -189,8 +190,9 @@ describe("openclaw npm publish wrapper", () => {
     });
 
     const result = runPublishWrapper(
-      ["--publish", tarball],
+      ["--publish"],
       {
+        BYPASS_EXTENDED_STABLE_GUARD: "true",
         OPENCLAW_NPM_PUBLISH_TAG: "extended-stable",
         PATH: `${binDir}:${process.env.PATH}`,
       },
@@ -199,10 +201,27 @@ describe("openclaw npm publish wrapper", () => {
 
     expect(result.status).toBe(0);
     expect(readFileSync(npmLog, "utf8")).toContain(
-      `publish ${tarball} --access public --tag extended-stable --provenance`,
+      "publish --access public --tag extended-stable --provenance",
     );
     expect(result.stdout).toContain("Resolved publish tag: extended-stable");
-    expect(result.stdout).not.toContain("Resolved publish tag: beta");
+  });
+
+  it.each([
+    ["malformed bypass", "extended-stable", "sometimes", 'must be "true" or "false"'],
+    [
+      "non-extended-stable bypass",
+      "beta",
+      "true",
+      "only be used with the extended-stable npm dist-tag",
+    ],
+  ])("rejects %s before npm publish", (_label, distTag, bypass, expectedError) => {
+    const result = runPublishWrapper(["--publish"], {
+      BYPASS_EXTENDED_STABLE_GUARD: bypass,
+      OPENCLAW_NPM_PUBLISH_TAG: distTag,
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(expectedError);
   });
 
   it("rejects unknown requested dist-tags instead of falling back to beta", () => {

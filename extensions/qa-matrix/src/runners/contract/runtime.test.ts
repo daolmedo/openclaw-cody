@@ -4,20 +4,11 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { MAX_TIMER_TIMEOUT_MS } from "openclaw/plugin-sdk/number-runtime";
 import { renderQaMarkdownReport } from "openclaw/plugin-sdk/qa-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
-const { startMatrixQaFaultProxy } = vi.hoisted(() => ({
-  startMatrixQaFaultProxy: vi.fn(),
-}));
-
-vi.mock("../../substrate/fault-proxy.js", () => ({
-  startMatrixQaFaultProxy,
-}));
-
 import { testing as liveTesting } from "./runtime.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.useRealTimers();
-  startMatrixQaFaultProxy.mockReset();
 });
 
 type MatrixQaSummaryInput = Parameters<typeof liveTesting.buildMatrixQaSummary>[0];
@@ -46,6 +37,7 @@ function buildMatrixQaSummaryInput(
     artifactPaths: {
       observedEvents: "/tmp/observed.json",
       report: "/tmp/report.md",
+      routeStateManifest: "/tmp/route-state.json",
       summary: "/tmp/summary.json",
     },
     checks: [{ name: "Matrix harness ready", status: "pass" }],
@@ -61,6 +53,11 @@ function buildMatrixQaSummaryInput(
         },
       }),
       scenarios: [],
+    },
+    differentialProbe: {
+      profile: "matrix-qa-v1",
+      steps: [],
+      sync: { continuity: true, incrementalStatus: 200, initialStatus: 200 },
     },
     finishedAt: "2026-04-10T10:05:00.000Z",
     harness: {
@@ -87,22 +84,23 @@ function buildMatrixQaSummaryInput(
 }
 
 describe("matrix live qa runtime", () => {
-  it("stops the Matrix harness when fault proxy startup fails", async () => {
-    const proxyError = new Error("fault proxy bind failed");
-    const harnessStop = vi.fn().mockResolvedValue(undefined);
-    startMatrixQaFaultProxy.mockRejectedValue(proxyError);
-
-    await expect(
-      liveTesting.startMatrixQaFaultProxyForHarness({
-        harness: {
-          baseUrl: "http://127.0.0.1:28008/",
-          stop: harnessStop,
-          stopCommand: "docker compose down --volumes",
-        },
+  it("preserves a failed differential probe check without a probe payload", () => {
+    const summary = liveTesting.buildMatrixQaSummary(
+      buildMatrixQaSummaryInput({
+        checks: [
+          { name: "Matrix harness ready", status: "pass" },
+          {
+            details: "missing-state response did not return M_NOT_FOUND",
+            name: "Matrix differential probe",
+            status: "fail",
+          },
+        ],
+        differentialProbe: undefined,
       }),
-    ).rejects.toBe(proxyError);
+    );
 
-    expect(harnessStop).toHaveBeenCalledOnce();
+    expect(summary.differentialProbe).toBeUndefined();
+    expect(summary.counts).toEqual({ failed: 1, passed: 1, total: 2 });
   });
 
   it("uses unique default artifact directories", () => {
@@ -238,7 +236,7 @@ describe("matrix live qa runtime", () => {
       (scenario) => scenario.id === "matrix-room-block-streaming",
     );
     const threadScenario = liveTesting.MATRIX_QA_SCENARIOS.find(
-      (scenario) => scenario.id === "matrix-thread-follow-up",
+      (scenario) => scenario.id === "matrix-thread-root-preservation",
     );
     expect(blockStreamingScenario).toBeDefined();
     expect(threadScenario).toBeDefined();
@@ -415,6 +413,7 @@ describe("matrix live qa runtime", () => {
       artifactPaths: {
         observedEvents: "/tmp/observed.json",
         report: "/tmp/report.md",
+        routeStateManifest: "/tmp/route-state.json",
         summary: "/tmp/summary.json",
       },
       checks: [{ name: "Matrix harness ready", status: "pass" }],
@@ -445,13 +444,13 @@ describe("matrix live qa runtime", () => {
         }),
         scenarios: [
           {
-            id: "matrix-room-thread-reply-override",
-            title: "Matrix threadReplies always keeps room replies threaded",
+            id: "matrix-room-block-streaming",
+            title: "Matrix block streaming",
             config: liveTesting.buildMatrixQaConfigSnapshot({
               driverUserId: "@driver:matrix-qa.test",
               observerUserId: "@observer:matrix-qa.test",
               overrides: {
-                threadReplies: "always",
+                blockStreaming: true,
               },
               sutUserId: "@sut:matrix-qa.test",
               topology: {
@@ -476,6 +475,11 @@ describe("matrix live qa runtime", () => {
             }),
           },
         ],
+      },
+      differentialProbe: {
+        profile: "matrix-qa-v1",
+        steps: [],
+        sync: { continuity: true, incrementalStatus: 200, initialStatus: 200 },
       },
       finishedAt: "2026-04-10T10:05:00.000Z",
       harness: {
@@ -513,53 +517,8 @@ describe("matrix live qa runtime", () => {
     expect(config.default.replyToMode).toBe("off");
     expect(config.default.threadReplies).toBe("inbound");
     expect(config.scenarios).toHaveLength(1);
-    expect(config.scenarios[0]?.id).toBe("matrix-room-thread-reply-override");
-    expect(config.scenarios[0]?.config.threadReplies).toBe("always");
-  });
-
-  it("preserves negative-scenario artifacts in the Matrix summary", () => {
-    const summary = liveTesting.buildMatrixQaSummary(
-      buildMatrixQaSummaryInput({
-        scenarios: [
-          {
-            id: "matrix-mention-gating",
-            title: "Matrix room message without mention does not trigger",
-            status: "pass",
-            details: "no reply",
-            artifacts: {
-              actorUserId: "@driver:matrix-qa.test",
-              driverEventId: "$driver",
-              expectedNoReplyWindowMs: 8_000,
-              token: "MATRIX_QA_NOMENTION_TOKEN",
-              triggerBody: "reply with only this exact marker: MATRIX_QA_NOMENTION_TOKEN",
-            },
-          },
-        ],
-        timings: {
-          scenarios: [
-            {
-              durationMs: 80,
-              gatewayBootMs: 0,
-              gatewayRestartMs: 0,
-              id: "matrix-mention-gating",
-              title: "Matrix room message without mention does not trigger",
-              transportInterruptMs: 0,
-            },
-          ],
-          totalMs: 905,
-        },
-      }),
-    );
-    expect(summary.counts.total).toBe(2);
-    expect(summary.counts.passed).toBe(2);
-    expect(summary.counts.failed).toBe(0);
-    expect(summary.scenarios[0]?.id).toBe("matrix-mention-gating");
-    expect(summary.scenarios[0]?.artifacts?.actorUserId).toBe("@driver:matrix-qa.test");
-    expect(summary.scenarios[0]?.artifacts?.expectedNoReplyWindowMs).toBe(8_000);
-    expect(summary.scenarios[0]?.artifacts?.triggerBody).toBe(
-      "reply with only this exact marker: MATRIX_QA_NOMENTION_TOKEN",
-    );
-    expect(summary.timings.totalMs).toBe(905);
+    expect(config.scenarios[0]?.id).toBe("matrix-room-block-streaming");
+    expect(config.scenarios[0]?.config.blockStreaming).toBe(true);
   });
 
   it("keeps failing Matrix scenario details and timings complete in summary + report output", () => {
@@ -624,9 +583,9 @@ describe("matrix live qa runtime", () => {
 
   it("groups Matrix scenario execution by gateway config while preserving tail scenarios", () => {
     const scenarios = liveTesting.findMatrixQaScenarios([
-      "matrix-thread-follow-up",
+      "matrix-thread-root-preservation",
       "matrix-e2ee-cli-encryption-setup-multi-account",
-      "matrix-thread-isolation",
+      "matrix-reaction-notification",
       "matrix-e2ee-cli-setup-then-gateway-reply",
       "matrix-e2ee-cli-self-verification",
       "matrix-e2ee-wrong-account-recovery-key",
@@ -637,8 +596,8 @@ describe("matrix live qa runtime", () => {
         .scheduleMatrixQaScenariosInCatalogOrder(scenarios)
         .map(({ scenario }) => scenario.id),
     ).toEqual([
-      "matrix-thread-follow-up",
-      "matrix-thread-isolation",
+      "matrix-thread-root-preservation",
+      "matrix-reaction-notification",
       "matrix-e2ee-cli-self-verification",
       "matrix-e2ee-cli-encryption-setup-multi-account",
       "matrix-e2ee-cli-setup-then-gateway-reply",

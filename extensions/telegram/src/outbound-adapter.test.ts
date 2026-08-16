@@ -138,55 +138,6 @@ describe("telegramOutbound", () => {
     expect(result).toEqual({ channel: "telegram", messageId: "tg-2", chatId: "12345" });
   });
 
-  it("marks later payload media failures as partial delivery", async () => {
-    const error = new Error("second media send failed");
-    sendMessageTelegramMock
-      .mockResolvedValueOnce({ messageId: "tg-1", chatId: "12345" })
-      .mockRejectedValueOnce(error);
-
-    await expect(
-      telegramOutbound.sendPayload!({
-        cfg: {} as never,
-        to: "12345",
-        text: "",
-        payload: {
-          text: "Album",
-          mediaUrls: ["https://example.com/1.jpg", "https://example.com/2.jpg"],
-        },
-        deps: { sendTelegram: sendMessageTelegramMock },
-      }),
-    ).rejects.toMatchObject({ sentBeforeError: true, visibleReplySent: true });
-
-    expect(sendMessageTelegramMock).toHaveBeenCalledTimes(2);
-  });
-
-  it("consumes implicit single-use replies across standard payload media", async () => {
-    sendMessageTelegramMock
-      .mockResolvedValueOnce({ messageId: "tg-1", chatId: "12345" })
-      .mockResolvedValueOnce({ messageId: "tg-2", chatId: "12345" });
-
-    await telegramOutbound.sendPayload!({
-      cfg: {} as never,
-      to: "12345",
-      text: "",
-      payload: {
-        text: "Peer reply",
-        mediaUrls: ["https://example.com/1.jpg", "https://example.com/2.jpg"],
-        channelData: { telegram: { standardMessage: true } },
-      },
-      replyToId: "900",
-      replyToIdSource: "implicit",
-      replyToMode: "first",
-      deps: { sendTelegram: sendMessageTelegramMock },
-    });
-
-    expect(callOptionsAt(sendMessageTelegramMock, 0, "12345", "Peer reply")).toMatchObject({
-      replyToMessageId: 900,
-      replyToMode: "first",
-    });
-    expect(callOptionsAt(sendMessageTelegramMock, 1, "12345", "").replyToMessageId).toBeUndefined();
-  });
-
   it("uses interactive button labels as fallback text for button-only payloads", async () => {
     sendMessageTelegramMock.mockResolvedValueOnce({ messageId: "tg-buttons", chatId: "12345" });
 
@@ -205,6 +156,29 @@ describe("telegramOutbound", () => {
     const options = callOptionsAt(sendMessageTelegramMock, 0, "12345", "- Retry");
     expect(options.buttons).toEqual([[{ text: "Retry", callback_data: "cmd:retry" }]]);
     expect(result).toEqual({ channel: "telegram", messageId: "tg-buttons", chatId: "12345" });
+  });
+
+  it("forwards prompt-context timestamps on durable payload sends", async () => {
+    sendMessageTelegramMock.mockResolvedValueOnce({ messageId: "tg-final", chatId: "12345" });
+
+    const result = await telegramOutbound.sendPayload!({
+      cfg: {} as never,
+      to: "12345",
+      text: "",
+      payload: {
+        text: "Final answer",
+        channelData: {
+          telegram: {
+            promptContextTimestampMs: 1_779_394_740_123,
+          },
+        },
+      },
+      deps: { sendTelegram: sendMessageTelegramMock },
+    });
+
+    const options = callOptionsAt(sendMessageTelegramMock, 0, "12345", "Final answer");
+    expect(options.promptContextTimestampMs).toBe(1_779_394_740_123);
+    expect(result).toEqual({ channel: "telegram", messageId: "tg-final", chatId: "12345" });
   });
 
   it("applies reaction-only payloads without sending empty Telegram text", async () => {

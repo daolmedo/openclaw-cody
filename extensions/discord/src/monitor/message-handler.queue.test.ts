@@ -1,5 +1,4 @@
 // Discord tests cover message handler.queue plugin behavior.
-import { getEventListeners } from "node:events";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DiscordRetryableInboundError } from "./inbound-dedupe.js";
@@ -220,6 +219,34 @@ describe("createDiscordMessageHandler queue behavior", () => {
     expect(replyTypingFeedback.onReplyStart).toHaveBeenCalledTimes(1);
     expect(replyTypingFeedback.onReplyStart.mock.invocationCallOrder[0]).toBeLessThan(
       processDiscordMessageMock.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("keeps the configured typing cadence for prestarted feedback", async () => {
+    preflightDiscordMessageMock.mockReset();
+    processDiscordMessageMock.mockReset();
+    preflightDiscordMessageMock.mockImplementation(async () =>
+      createAcceptedDmPreflightContext({
+        cfg: {
+          ...createPreflightContext().cfg,
+          agents: { defaults: { typingIntervalSeconds: 7 } },
+          session: { typingIntervalSeconds: 5 },
+        },
+      }),
+    );
+    processDiscordMessageMock.mockResolvedValue(undefined);
+    const replyTypingFeedback = createReplyTypingFeedbackMock("dm-1");
+    const createReplyTypingFeedback = vi.fn(() => replyTypingFeedback);
+
+    const handler = createDiscordMessageHandler({
+      ...createDiscordHandlerParams(),
+      testing: { createReplyTypingFeedback },
+    });
+    await handler(createMessageData("m-typing-cadence", "dm-1") as never, {} as never);
+    await flushQueueWork();
+
+    expect(createReplyTypingFeedback).toHaveBeenCalledWith(
+      expect.objectContaining({ keepaliveIntervalMs: 7_000 }),
     );
   });
 
@@ -687,22 +714,6 @@ describe("createDiscordMessageHandler queue behavior", () => {
 
     await finish();
     expect(setStatus.mock.calls.length).toBe(callsBeforeStop);
-  });
-
-  it("removes lifecycle abort listeners after handler deactivation", () => {
-    const abortController = new AbortController();
-    const initialListenerCount = getEventListeners(abortController.signal, "abort").length;
-    const handler = createDiscordMessageHandler(
-      createDiscordHandlerParams({ abortSignal: abortController.signal }),
-    );
-
-    expect(getEventListeners(abortController.signal, "abort")).toHaveLength(
-      initialListenerCount + 2,
-    );
-
-    handler.deactivate();
-
-    expect(getEventListeners(abortController.signal, "abort")).toHaveLength(initialListenerCount);
   });
 
   it("skips queued runs that have not started yet after deactivation", async () => {

@@ -935,6 +935,46 @@ describe("CodexNativeSubagentMonitor", () => {
     expect(runtime.deliverAgentHarnessTaskCompletion).not.toHaveBeenCalled();
   });
 
+  it("waits again when an interrupted child starts another turn before cleanup is deferred", async () => {
+    const client = createClient();
+    const runtime = createRuntime();
+    const monitor = new CodexNativeSubagentMonitor(client, runtime);
+    const cleanup = vi.fn();
+    monitor.registerParent({
+      parentThreadId: "parent-thread",
+      requesterSessionKey: "agent:main:main",
+      taskRuntimeScope: createTaskScope("agent:main:main"),
+      agentId: "main",
+    });
+
+    await notifyChildStarted(client);
+    await client.notify(childTurnCompletedNotification({ status: "interrupted" }));
+    await client.notify({
+      method: "turn/started",
+      params: {
+        threadId: "child-thread",
+        turn: {
+          id: "resumed-child-turn",
+          status: "inProgress",
+          items: [],
+          error: null,
+        },
+      },
+    });
+    monitor.deferUntilParentSettles("parent-thread", cleanup);
+    expect(cleanup).not.toHaveBeenCalled();
+
+    await client.notify(
+      nativeCompletionNotification({
+        agentPath: "child-thread",
+        statusLabel: "completed",
+        result: "resumed child final result",
+      }),
+    );
+
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
   it("reconciles transcript final text before delivering empty Codex completion notifications", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-subagent-"));
     const codexHome = path.join(tempDir, "codex-home");

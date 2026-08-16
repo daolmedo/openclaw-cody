@@ -6,7 +6,7 @@ export type ExecAutoReviewDecision =
   | {
       decision: "allow-once";
       rationale: string;
-      risk: "low";
+      risk: "low" | "medium" | "high";
     }
   | {
       decision: "ask";
@@ -21,7 +21,6 @@ export type ExecAutoReviewHost = "gateway" | "node" | "codex-app-server";
 export type ExecAutoReviewInput = {
   command: string;
   argv?: readonly string[];
-  resolvedPath?: string | null;
   cwd?: string | null;
   envKeys?: readonly string[];
   host: ExecAutoReviewHost;

@@ -33,12 +33,9 @@ vi.mock("../config/config.js", () => ({
 }));
 
 import "./test-helpers/fast-openclaw-tools-sessions.js";
-import { setDiagnosticsEnabledForProcess } from "../infra/diagnostic-events.js";
-import { resetDiagnosticRunActivityForTest } from "../logging/diagnostic-run-activity.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
 import {
   testing as embeddedRunsTesting,
-  clearActiveEmbeddedRun,
   setActiveEmbeddedRun,
 } from "./embedded-agent-runner/runs.js";
 import { testing as agentStepTesting } from "./tools/agent-step.js";
@@ -239,8 +236,6 @@ describe("sessions tools", () => {
   beforeEach(() => {
     callGatewayMock.mockClear();
     embeddedRunsTesting.resetActiveEmbeddedRuns();
-    resetDiagnosticRunActivityForTest();
-    setDiagnosticsEnabledForProcess(false);
     loadSessionEntryByKeyMock.mockReset();
     loadSessionEntryByKeyMock.mockReturnValue(undefined);
     installMessagingTestRegistry();
@@ -501,6 +496,7 @@ describe("sessions tools", () => {
       params: {
         activeMinutes: undefined,
         agentId: "main",
+        archived: false,
         includeDerivedTitles: false,
         includeLastMessage: false,
         includeGlobal: true,
@@ -636,6 +632,10 @@ describe("sessions tools", () => {
           channel: "unknown",
           origin: undefined,
           spawnedBy: undefined,
+          archived: false,
+          archivedAt: undefined,
+          pinned: false,
+          pinnedAt: undefined,
           label: undefined,
           displayName: undefined,
           derivedTitle: "Visible project kickoff",
@@ -1701,6 +1701,7 @@ describe("sessions tools", () => {
 
   it("sessions_send falls back from stranded cron run key to durable cron parent", async () => {
     const calls: Array<{ method?: string; params?: unknown }> = [];
+    const requesterKey = "agent:main:cron:source-job:run:source-run";
     const runScopedCallerKey = "agent:leasing-ops:cron:monthly-utility:run:run-fast";
     const durableCronCallerKey = "agent:leasing-ops:cron:monthly-utility";
     const queueMessage = vi.fn(async () => {});
@@ -1719,14 +1720,33 @@ describe("sessions tools", () => {
     callGatewayMock.mockImplementation(async (opts: unknown) => {
       const request = opts as { method?: string; params?: unknown };
       calls.push(request);
+      if (request.method === "chat.history") {
+        const params = request.params as { sessionKey?: string } | undefined;
+        const text =
+          params?.sessionKey === durableCronCallerKey
+            ? "existing durable reply"
+            : "existing run reply";
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [{ type: "text", text }],
+              timestamp: 20,
+            },
+          ],
+        };
+      }
       if (request.method === "agent") {
         return { runId: "durable-fallback-run", status: "accepted", acceptedAt: 2000 };
+      }
+      if (request.method === "agent.wait") {
+        return { runId: "durable-fallback-run", status: "ok" };
       }
       return {};
     });
 
     const tool = createOpenClawTools({
-      agentSessionKey: "agent:re-portal:main",
+      agentSessionKey: requesterKey,
       agentChannel: "telegram",
       config: {
         ...TEST_CONFIG,
@@ -1757,71 +1777,25 @@ describe("sessions tools", () => {
     expect(params.sessionKey).toBe(durableCronCallerKey);
     expect(params.message).toContain("[Inter-session message]");
     expect(params.message).toContain("[TASK-COMPLETE] re-portal occupancy ready");
-  });
-
-  it("sessions_send falls back from a stale cron run to its durable parent", async () => {
-    vi.useFakeTimers();
-    try {
-      setDiagnosticsEnabledForProcess(true);
-      const calls: Array<{ method?: string; params?: unknown }> = [];
-      const runScopedCallerKey = "agent:leasing-ops:cron:monthly-utility:run:run-stale";
-      const durableCronCallerKey = "agent:leasing-ops:cron:monthly-utility";
-      const queueMessage = vi.fn(async () => {});
-      const abort = vi.fn(() => {
-        clearActiveEmbeddedRun("caller-stale-session", handle, runScopedCallerKey);
-      });
-      const handle: Parameters<typeof setActiveEmbeddedRun>[1] = {
-        queueMessage,
-        isStreaming: () => true,
-        isCompacting: () => false,
-        supportsTranscriptCommitWait: true,
-        sourceReplyDeliveryMode: "message_tool_only",
-        abort,
-      };
-      setActiveEmbeddedRun("caller-stale-session", handle, runScopedCallerKey);
-      vi.advanceTimersByTime(10 * 60_000 + 1);
-      callGatewayMock.mockImplementation(async (opts: unknown) => {
-        const request = opts as { method?: string; params?: unknown };
-        calls.push(request);
-        if (request.method === "agent") {
-          return { runId: "durable-stale-fallback", status: "accepted", acceptedAt: 2000 };
-        }
-        return {};
-      });
-
-      const tool = createOpenClawTools({
-        agentSessionKey: "agent:re-portal:main",
-        agentChannel: "telegram",
-        config: {
-          ...TEST_CONFIG,
-          session: {
-            ...TEST_CONFIG.session,
-            agentToAgent: { maxPingPongTurns: 0 },
-          },
-        },
-      }).find((candidate) => candidate.name === "sessions_send");
-      if (!tool) {
-        throw new Error("missing sessions_send tool");
-      }
-
-      const result = await tool.execute("call-stale-run-scoped-caller", {
-        sessionKey: runScopedCallerKey,
-        message: "[TASK-COMPLETE] stale cron result",
-        timeoutSeconds: 0,
-      });
-
-      const details = sessionsSendDetails(result.details);
-      expect(details.status).toBe("accepted");
-      expect(details.runId).toBe("durable-stale-fallback");
-      expect(queueMessage).not.toHaveBeenCalled();
-      expect(abort).toHaveBeenCalledOnce();
-      const agentCalls = calls.filter((call) => call.method === "agent");
-      expect(agentCalls).toHaveLength(1);
-      expect(agentParams(agentCalls[0] ?? {}).sessionKey).toBe(durableCronCallerKey);
-    } finally {
-      vi.useRealTimers();
-      setDiagnosticsEnabledForProcess(false);
-    }
+    await waitForCalls(
+      () =>
+        countMatching(
+          calls,
+          (call) =>
+            call.method === "chat.history" &&
+            (call.params as { sessionKey?: string } | undefined)?.sessionKey ===
+              durableCronCallerKey,
+        ),
+      2,
+    );
+    const firstFallbackHistoryIndex = calls.findIndex(
+      (call) =>
+        call.method === "chat.history" &&
+        (call.params as { sessionKey?: string } | undefined)?.sessionKey === durableCronCallerKey,
+    );
+    const fallbackAgentIndex = calls.findIndex((call) => call.method === "agent");
+    expect(firstFallbackHistoryIndex).toBeLessThan(fallbackAgentIndex);
+    expect(calls.filter((call) => call.method === "agent")).toHaveLength(1);
   });
 
   it("sessions_send rejects non-cron run-looking keys without durable-session fallback", async () => {

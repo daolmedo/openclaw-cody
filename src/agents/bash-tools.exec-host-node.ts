@@ -14,6 +14,7 @@ import {
   resolveExecApprovalUnavailableDecisions,
 } from "../infra/exec-approvals.js";
 import { defaultExecAutoReviewer, type ExecAutoReviewInput } from "../infra/exec-auto-review.js";
+import { tail } from "./bash-process-registry.js";
 import {
   buildExecApprovalRequesterContext,
   buildExecApprovalTurnSourceContext,
@@ -102,7 +103,6 @@ export async function executeNodeHostCommand(
     host: "node",
   });
   const target = await resolveNodeExecutionTarget(params);
-  params.signal?.throwIfAborted();
   if (
     shouldSkipNodeApprovalPrepare({
       hostSecurity,
@@ -121,7 +121,6 @@ export async function executeNodeHostCommand(
     hostSecurity,
     hostAsk,
   });
-  params.signal?.throwIfAborted();
   const {
     analysisOk,
     allowlistSatisfied,
@@ -242,9 +241,7 @@ export async function executeNodeHostCommand(
           sessionKey: prepared.sessionKey,
         },
       });
-      params.signal?.throwIfAborted();
-      const autoReviewAllowed = decision.decision === "allow-once" && decision.risk === "low";
-      if (autoReviewAllowed) {
+      if (decision.decision === "allow-once") {
         const approvalId = randomUUID();
         await registerNodeApproval(approvalId, {
           requireDeliveryRoute: false,
@@ -260,7 +257,7 @@ export async function executeNodeHostCommand(
         inlineApprovalDecision = "allow-once";
         inlineApprovalId = approvalId;
       }
-      if (!autoReviewAllowed) {
+      if (decision.decision !== "allow-once") {
         autoReviewRequiresHumanApproval = true;
         params.warnings.push(
           `Exec auto-review deferred to human approval (risk=${decision.risk}): ${decision.rationale}`,
@@ -434,7 +431,7 @@ export async function executeNodeHostCommand(
             const combined = [payload.stdout, payload.stderr, payload.error]
               .filter(Boolean)
               .join("\n");
-            const output = normalizeNotifyOutput(combined.slice(-DEFAULT_NOTIFY_TAIL_CHARS));
+            const output = normalizeNotifyOutput(tail(combined, DEFAULT_NOTIFY_TAIL_CHARS));
             const exitLabel = payload.timedOut ? "timeout" : `code ${payload.exitCode ?? "?"}`;
             const summary = output
               ? `Exec finished (node=${target.nodeId} id=${approvalId}, ${exitLabel})\n${output}`
@@ -467,7 +464,6 @@ export async function executeNodeHostCommand(
   }
 
   const startedAt = Date.now();
-  params.signal?.throwIfAborted();
   const invoke = buildNodeSystemRunInvoke({
     target,
     command: prepared.argv,
@@ -487,5 +483,10 @@ export async function executeNodeHostCommand(
           scopes: APPROVED_NODE_INVOKE_SCOPES,
         })
       : await callGatewayTool("node.invoke", { timeoutMs: target.invokeTimeoutMs }, invoke);
-  return formatNodeRunToolResult({ raw, startedAt, cwd: params.workdir });
+  return formatNodeRunToolResult({
+    raw,
+    startedAt,
+    cwd: params.workdir,
+    warnings: [...params.warnings, ...(params.foregroundWarnings ?? [])],
+  });
 }

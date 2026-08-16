@@ -554,6 +554,33 @@ describe("Twilio SMS helpers", () => {
     expect(release).toHaveBeenCalledTimes(1);
   });
 
+  it("rejects malformed JSON from Twilio Messaging Service lookup", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(
+      async () => new Response("NOT JSON {{{", { status: 200, headers: { "content-type": "application/json" } }),
+    );
+
+    await expect(
+      retrieveTwilioMessagingService({
+        account: createAccount({ messagingServiceSid: "MG123", fromNumber: "" }),
+        serviceSid: "MG123",
+        fetchImpl,
+      }),
+    ).rejects.toThrow("Twilio Messaging Service lookup returned malformed JSON.");
+  });
+
+  it("returns empty list on malformed JSON from Twilio incoming phone number list", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(
+      async () => new Response("NOT JSON {{{", { status: 200, headers: { "content-type": "application/json" } }),
+    );
+
+    const result = await listTwilioIncomingPhoneNumbers({
+      account: createAccount(),
+      fetchImpl,
+    });
+
+    expect(result).toEqual([]);
+  });
+
   it("bounds and cancels oversized guarded Twilio success bodies", async () => {
     const release = vi.fn(async () => {});
     const tracked = cancelTrackedTextResponse("x".repeat(1024 * 1024 + 1), { status: 201 });
@@ -603,29 +630,29 @@ describe("Twilio SMS helpers", () => {
     ).rejects.toThrow("Twilio SMS send response did not include a Message SID.");
   });
 
-  it("excludes a connection override fragment when adding a request query", () => {
+  it("preserves the configured public webhook path when adding a request query", () => {
     expect(
       resolveTwilioWebhookSignatureUrl({
         req: { url: "/webhooks/sms?foo=bar" } as never,
-        publicWebhookUrl: "https://gateway.example.com/base#rp=4xx",
+        publicWebhookUrl: "https://gateway.example.com/base",
       }),
     ).toBe("https://gateway.example.com/base?foo=bar");
   });
 
-  it("keeps an explicit configured query but excludes its connection override fragment", () => {
+  it("keeps an explicit configured public webhook query", () => {
     expect(
       resolveTwilioWebhookSignatureUrl({
         req: { url: "/webhooks/sms?foo=request" } as never,
-        publicWebhookUrl: "https://gateway.example.com/base?foo=configured#rp=all",
+        publicWebhookUrl: "https://gateway.example.com/base?foo=configured",
       }),
     ).toBe("https://gateway.example.com/base?foo=configured");
   });
 
-  it("strips a connection override fragment without reserializing the configured URL", () => {
+  it("does not reserialize the configured public webhook URL", () => {
     expect(
       resolveTwilioWebhookSignatureUrl({
         req: { url: "/webhooks/sms" } as never,
-        publicWebhookUrl: "https://gateway.example.com:443/webhooks/sms#rp=4xx",
+        publicWebhookUrl: "https://gateway.example.com:443/webhooks/sms",
       }),
     ).toBe("https://gateway.example.com:443/webhooks/sms");
   });

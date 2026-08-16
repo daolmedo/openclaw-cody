@@ -287,7 +287,7 @@ describe("scripts/lib/plugin-prerelease-test-plan.mjs", () => {
           with: {
             "fetch-depth": 1,
             "fetch-tags": false,
-            "persist-credentials": false,
+            "persist-credentials": true,
             ref: "${{ needs.preflight.outputs.checkout_revision }}",
             submodules: false,
           },
@@ -343,6 +343,8 @@ describe("scripts/lib/plugin-prerelease-test-plan.mjs", () => {
         "${{ github.event_name == 'workflow_dispatch' && 'true' || steps.changed_scope.outputs.run_ios_build || 'false' }}",
       OPENCLAW_CI_RUN_MACOS:
         "${{ github.event_name == 'workflow_dispatch' && 'true' || steps.changed_scope.outputs.run_macos || 'false' }}",
+      OPENCLAW_CI_RUN_NATIVE_I18N:
+        "${{ github.event_name == 'workflow_dispatch' && 'true' || steps.changed_scope.outputs.run_native_i18n || 'false' }}",
       OPENCLAW_CI_RUN_NODE:
         "${{ github.event_name == 'workflow_dispatch' && 'true' || steps.changed_scope.outputs.run_node || 'false' }}",
       OPENCLAW_CI_RUN_NODE_FAST_CI_ROUTING:
@@ -372,12 +374,8 @@ describe("scripts/lib/plugin-prerelease-test-plan.mjs", () => {
       workflow.jobs["check-shard"].steps.find((step) => step.name === "Run check shard").run,
     ).toContain("pnpm deadcode:ci");
     expect(normalCiScript).toContain(
-      'args=(-f target_ref="$TARGET_SHA" -f include_android=true -f dispatch_id="$dispatch_id")',
+      'dispatch_and_wait ci.yml "$dispatch_run_name" -f target_ref="$TARGET_SHA" -f include_android=true -f dispatch_id="$dispatch_id"',
     );
-    expect(normalCiScript).toContain('args+=(-f historical_target_tag="$TARGET_REF")');
-    expect(normalCiScript).toContain('args+=(-f historical_target_tag="$TARGET_CONTEXT_REF")');
-    expect(normalCiScript).toContain('args+=(-f release_candidate_ref="$TARGET_CONTEXT_REF")');
-    expect(normalCiScript).toContain('dispatch_and_wait ci.yml "$dispatch_run_name" "${args[@]}"');
     expect(normalCiScript).not.toContain("full_release_validation=true");
     expect(pluginPrereleaseScript).toContain(
       'dispatch_and_wait plugin-prerelease.yml "$dispatch_run_name" -f target_ref="$TARGET_SHA" -f expected_sha="$TARGET_SHA" -f full_release_validation=true -f dispatch_id="$dispatch_id"',
@@ -489,7 +487,7 @@ describe("scripts/lib/plugin-prerelease-test-plan.mjs", () => {
       permissions: {
         actions: "read",
         contents: "read",
-        packages: "read",
+        packages: "write",
         "pull-requests": "read",
       },
       uses: "./.github/workflows/openclaw-live-and-e2e-checks-reusable.yml",
@@ -500,9 +498,8 @@ describe("scripts/lib/plugin-prerelease-test-plan.mjs", () => {
         include_release_path_suites: false,
         include_repo_e2e: false,
         live_models_only: false,
+        allow_unreleased_changelog: true,
         ref: "${{ needs.preflight.outputs.checkout_revision }}",
-        shared_image_artifact_namespace: "plugin-prerelease",
-        shared_image_policy: "no-push-artifact",
         targeted_docker_lane_group_size: 4,
       },
     });
@@ -534,7 +531,7 @@ describe("scripts/lib/plugin-prerelease-test-plan.mjs", () => {
     expect(fullReleaseWorkflow.concurrency).toEqual({
       group: "full-release-validation-${{ inputs.ref }}-${{ inputs.rerun_group }}",
       "cancel-in-progress":
-        "${{ (inputs.ref == 'main' && inputs.rerun_group == 'all') || startsWith(inputs.ref, 'tideclaw/alpha/') }}",
+        "${{ (inputs.ref == 'main' && inputs.rerun_group == 'all') || startsWith(inputs.ref, 'tideclaw/alpha/') || startsWith(inputs.ref, 'release/') }}",
     });
     expect(releaseChecksWorkflow.jobs.resolve_target["runs-on"]).toBe("ubuntu-24.04");
     expect(releaseChecksWorkflow.jobs.prepare_release_package["runs-on"]).toBe("ubuntu-24.04");

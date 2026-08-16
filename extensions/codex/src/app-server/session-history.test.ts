@@ -32,6 +32,9 @@ async function writeSession(records: unknown[]): Promise<string> {
   return sessionFile;
 }
 
+// Fixtures keep legacy string content on purpose: session ingest normalizes
+// assistant strings into [{ type: "text" }] blocks, so expectations below
+// assert the canonical block-array shape for assistant rows.
 function messageEntry(params: {
   id: string;
   parentId: string | null;
@@ -108,7 +111,7 @@ describe("readCodexMirroredSessionHistoryMessages", () => {
       readCodexMirroredSessionHistoryMessages(mirroredTarget(sessionFile)),
     ).resolves.toMatchObject([
       { role: "user", content: "root prompt" },
-      { role: "assistant", content: "active answer" },
+      { role: "assistant", content: [{ type: "text", text: "active answer" }] },
     ]);
   });
 
@@ -162,7 +165,7 @@ describe("readCodexMirroredSessionHistoryMessages", () => {
       readCodexMirroredSessionHistoryMessages(mirroredTarget(sessionFile)),
     ).resolves.toMatchObject([
       { role: "user", content: "visible prompt" },
-      { role: "assistant", content: "continued answer" },
+      { role: "assistant", content: [{ type: "text", text: "continued answer" }] },
     ]);
   });
 
@@ -193,7 +196,7 @@ describe("readCodexMirroredSessionHistoryMessages", () => {
       readCodexMirroredSessionHistoryMessages(mirroredTarget(sessionFile)),
     ).resolves.toMatchObject([
       { role: "user", content: "visible prompt" },
-      { role: "assistant", content: "continued answer" },
+      { role: "assistant", content: [{ type: "text", text: "continued answer" }] },
     ]);
   });
 });

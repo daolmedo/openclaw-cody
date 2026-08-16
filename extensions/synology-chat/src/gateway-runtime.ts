@@ -174,12 +174,11 @@ export function validateSynologyGatewayAccountStartup(params: {
 }
 
 export function registerSynologyWebhookRoute(params: {
-  cfg: OpenClawConfig;
   account: ResolvedSynologyChatAccount;
   accountId: string;
   log?: SynologyGatewayLog;
 }): () => void {
-  const { cfg, account, log } = params;
+  const { account, log } = params;
   const routeKey = getRouteKey(account);
   const prevUnregister = activeRouteUnregisters.get(routeKey);
   if (prevUnregister) {
@@ -190,8 +189,6 @@ export function registerSynologyWebhookRoute(params: {
 
   const handler = createWebhookHandler({
     account,
-    trustedProxies: cfg.gateway?.trustedProxies,
-    allowRealIpFallback: cfg.gateway?.allowRealIpFallback === true,
     deliver: async (msg) =>
       await dispatchSynologyChatInboundEvent({
         account,

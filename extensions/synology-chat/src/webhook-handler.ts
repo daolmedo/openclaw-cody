@@ -6,12 +6,12 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import * as querystring from "node:querystring";
 import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import {
   beginWebhookRequestPipelineOrReject,
   createWebhookInFlightLimiter,
   isRequestBodyLimitError,
   readRequestBodyWithLimit,
-  resolveRequestClientIp,
   requestBodyErrorToText,
 } from "openclaw/plugin-sdk/webhook-ingress";
 import * as synologyClient from "./client.js";
@@ -131,26 +131,15 @@ export function clearSynologyWebhookRateLimiterStateForTest(): void {
   webhookInFlightLimiter.clear();
 }
 
-function getSynologyWebhookInvalidTokenRateLimitKey(params: {
-  req: IncomingMessage;
-  trustedProxies?: string[];
-  allowRealIpFallback?: boolean;
-}): string {
-  return (
-    resolveRequestClientIp(
-      params.req,
-      params.trustedProxies,
-      params.allowRealIpFallback === true,
-    ) ??
-    params.req.socket?.remoteAddress ??
-    "unknown"
-  );
+function getSynologyWebhookInvalidTokenRateLimitKey(req: IncomingMessage): string {
+  return req.socket?.remoteAddress ?? "unknown";
 }
 
 function getSynologyWebhookInFlightKey(account: ResolvedSynologyChatAccount): string {
-  // Keep concurrent pre-auth body reads as a per-account pressure budget. The
-  // invalid-token limiter handles client identity; this guard only bounds work
-  // already accepted for the Synology account route.
+  // Synology webhook ingress is typically a single upstream per account, and this
+  // handler does not have a trusted-proxy-aware client IP config. Keep the shared
+  // pre-auth concurrency budget scoped per account instead of keying on a fragile
+  // remoteAddress value that can collapse behind proxies or to "unknown".
   return account.accountId;
 }
 
@@ -358,8 +347,6 @@ function respondNoContent(res: ServerResponse) {
 export interface WebhookHandlerDeps {
   account: ResolvedSynologyChatAccount;
   deliver: (msg: import("./inbound-context.js").SynologyInboundMessage) => Promise<string | null>;
-  trustedProxies?: string[];
-  allowRealIpFallback?: boolean;
   log?: {
     info: (...args: unknown[]) => void;
     warn: (...args: unknown[]) => void;
@@ -425,15 +412,9 @@ async function authorizeSynologyWebhook(params: {
   payload: SynologyWebhookPayload;
   invalidTokenRateLimiter: InvalidTokenRateLimiter;
   rateLimiter: RateLimiter;
-  trustedProxies?: string[];
-  allowRealIpFallback?: boolean;
   log?: WebhookHandlerDeps["log"];
 }): Promise<SynologyWebhookAuthorization> {
-  const invalidTokenRateLimitKey = getSynologyWebhookInvalidTokenRateLimitKey({
-    req: params.req,
-    trustedProxies: params.trustedProxies,
-    allowRealIpFallback: params.allowRealIpFallback,
-  });
+  const invalidTokenRateLimitKey = getSynologyWebhookInvalidTokenRateLimitKey(params.req);
   // Once a source has exhausted its invalid-token budget, reject all requests in the window.
   if (params.invalidTokenRateLimiter.isLocked(invalidTokenRateLimitKey)) {
     params.log?.warn(`Rate limit exceeded for remote IP: ${invalidTokenRateLimitKey}`);
@@ -497,8 +478,6 @@ async function parseAndAuthorizeSynologyWebhook(params: {
   account: ResolvedSynologyChatAccount;
   invalidTokenRateLimiter: InvalidTokenRateLimiter;
   rateLimiter: RateLimiter;
-  trustedProxies?: string[];
-  allowRealIpFallback?: boolean;
   log?: WebhookHandlerDeps["log"];
   bodyTimeoutMs?: number;
 }): Promise<{ ok: false } | { ok: true; message: AuthorizedSynologyWebhook }> {
@@ -513,8 +492,6 @@ async function parseAndAuthorizeSynologyWebhook(params: {
     payload: parsed.payload,
     invalidTokenRateLimiter: params.invalidTokenRateLimiter,
     rateLimiter: params.rateLimiter,
-    trustedProxies: params.trustedProxies,
-    allowRealIpFallback: params.allowRealIpFallback,
     log: params.log,
   });
   if (!authorized.ok) {
@@ -527,7 +504,7 @@ async function parseAndAuthorizeSynologyWebhook(params: {
     respondNoContent(params.res);
     return { ok: false };
   }
-  const preview = cleanText.length > 100 ? `${cleanText.slice(0, 100)}...` : cleanText;
+  const preview = cleanText.length > 100 ? `${truncateUtf16Safe(cleanText, 100)}...` : cleanText;
   return {
     ok: true,
     message: {
@@ -598,7 +575,7 @@ async function processAuthorizedSynologyWebhook(params: {
       deliveryUserId,
       params.account.allowInsecureSsl,
     );
-    const replyPreview = reply.length > 100 ? `${reply.slice(0, 100)}...` : reply;
+    const replyPreview = reply.length > 100 ? `${truncateUtf16Safe(reply, 100)}...` : reply;
     params.log?.info?.(
       `Reply sent to ${params.message.payload.username} (${deliveryUserId}): ${replyPreview}`,
     );
@@ -645,8 +622,6 @@ export function createWebhookHandler(deps: WebhookHandlerDeps) {
         account,
         invalidTokenRateLimiter,
         rateLimiter,
-        trustedProxies: deps.trustedProxies,
-        allowRealIpFallback: deps.allowRealIpFallback,
         log,
         bodyTimeoutMs: deps.bodyTimeoutMs,
       });

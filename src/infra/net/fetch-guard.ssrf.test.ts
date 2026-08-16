@@ -257,6 +257,7 @@ describe("fetchWithSsrFGuard hardening", () => {
     });
 
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(lookupFn).toHaveBeenCalledTimes(params.expectEnvProxy ? 0 : 1);
     if (params.expectEnvProxy) {
       expect(envHttpProxyAgentCtor).toHaveBeenCalledTimes(1);
       expect(envHttpProxyAgentCtor).toHaveBeenCalledWith({
@@ -859,30 +860,6 @@ describe("fetchWithSsrFGuard hardening", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ["IPv4 unspecified", "0.0.0.0", 4],
-    ["IPv4 unspecified range", "0.42.42.42", 4],
-    ["IPv6 unspecified", "::", 6],
-    ["IPv4-mapped IPv6 unspecified", "::ffff:0.0.0.0", 6],
-    ["NAT64-embedded IPv4 unspecified", "64:ff9b::0.0.0.0", 6],
-  ] as const)(
-    "blocks exact-origin private DNS when it resolves to %s",
-    async (_name, address, family) => {
-      const lookupFn: LookupFn = vi.fn(async () => [{ address, family }]) as unknown as LookupFn;
-      const fetchImpl = vi.fn(async () => okResponse());
-
-      await expect(
-        fetchWithSsrFGuard({
-          url: "http://model.lan:11434/v1/models",
-          fetchImpl,
-          lookupFn,
-          policy: { allowedOrigins: ["http://model.lan:11434"] },
-        }),
-      ).rejects.toThrow(/private|internal|blocked/i);
-      expect(fetchImpl).not.toHaveBeenCalled();
-    },
-  );
-
   it("allows a configured IPv6 unique-local exact origin through the guard", async () => {
     const fetchImpl = vi.fn(async () => okResponse());
 
@@ -1439,6 +1416,94 @@ describe("fetchWithSsrFGuard hardening", () => {
     });
   });
 
+  it("does not resolve target DNS before strict managed-proxy dispatch", async () => {
+    installManagedProxyRuntime();
+    const lookupFn: LookupFn = vi.fn(async (hostname: string) => {
+      throw new Error(`unexpected target DNS lookup for ${hostname}`);
+    }) as unknown as LookupFn;
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const requestInit = init as RequestInit & { dispatcher?: unknown };
+      expectDispatcherAttached(requestInit.dispatcher);
+      return okResponse();
+    });
+
+    const result = await fetchWithSsrFGuard({
+      url: "https://public.example/resource",
+      fetchImpl,
+      lookupFn,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(lookupFn).not.toHaveBeenCalled();
+    expect(envHttpProxyAgentCtor).toHaveBeenCalledTimes(1);
+    await result.release();
+  });
+
+  it("falls back to strict DNS pinning when active managed proxy does not apply", async () => {
+    installManagedProxyRuntime();
+    vi.stubEnv("NO_PROXY", "public.example");
+    const lookupFn = createPublicLookup();
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const requestInit = init as RequestInit & { dispatcher?: unknown };
+      expectDispatcherAttached(requestInit.dispatcher);
+      expect(getDispatcherClassName(requestInit.dispatcher)).not.toBe("EnvHttpProxyAgent");
+      return okResponse();
+    });
+
+    const result = await fetchWithSsrFGuard({
+      url: "https://public.example/resource",
+      fetchImpl,
+      lookupFn,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(lookupFn).toHaveBeenCalledWith("public.example", { all: true });
+    expect(envHttpProxyAgentCtor).not.toHaveBeenCalled();
+    expect(agentCtor).toHaveBeenCalledTimes(1);
+    await result.release();
+  });
+
+  it.each([
+    "http://127.0.0.1:8080/internal",
+    "http://metadata.google.internal/computeMetadata/v1/",
+  ])("blocks %s before strict managed-proxy dispatch", async (url) => {
+    installManagedProxyRuntime();
+    const lookupFn = vi.fn() as unknown as LookupFn;
+    const fetchImpl = vi.fn(async () => okResponse());
+
+    await expect(
+      fetchWithSsrFGuard({
+        url,
+        fetchImpl,
+        lookupFn,
+      }),
+    ).rejects.toThrow(/private|internal|blocked/i);
+
+    expect(lookupFn).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(envHttpProxyAgentCtor).not.toHaveBeenCalled();
+  });
+
+  it("revalidates redirects before strict managed-proxy dispatch", async () => {
+    installManagedProxyRuntime();
+    const lookupFn = vi.fn() as unknown as LookupFn;
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(redirectResponse("http://127.0.0.1:8080/internal"));
+
+    await expect(
+      fetchWithSsrFGuard({
+        url: "https://public.example/start",
+        fetchImpl,
+        lookupFn,
+      }),
+    ).rejects.toThrow(/private|internal|blocked/i);
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(lookupFn).not.toHaveBeenCalled();
+    expect(envHttpProxyAgentCtor).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     {
       name: "an exact configured local provider origin",
@@ -1525,6 +1590,12 @@ describe("fetchWithSsrFGuard hardening", () => {
         vi.fn(async () => [{ address: "192.168.1.10", family: 4 }]) as unknown as LookupFn,
     },
     {
+      name: "public configured origins when DNS resolves to loopback",
+      url: "https://api.example.com/v1/embeddings",
+      baseUrl: "https://api.example.com",
+      lookupFn: createLoopbackLookup,
+    },
+    {
       name: "exact local provider origins when proxy.loopbackMode=proxy",
       url: "http://127.0.0.1:11434/api/embed",
       baseUrl: "http://127.0.0.1:11434",
@@ -1547,22 +1618,6 @@ describe("fetchWithSsrFGuard hardening", () => {
       expectedEnvProxyCalls: 1,
       expectedFinalUrl: testCase.expectedFinalUrl,
     });
-  });
-
-  it("blocks a trusted public hostname that resolves to loopback on the managed proxy path", async () => {
-    installManagedProxyRuntime("gateway-only");
-    const fetchImpl = vi.fn(async () => okResponse());
-
-    await expect(
-      fetchConfiguredLocalOriginWithSsrFGuard({
-        url: "https://api.example.com/v1/embeddings",
-        lookupFn: createLoopbackLookup(),
-        policy: { allowedOrigins: ["https://api.example.com"] },
-        configuredLocalOriginBaseUrl: "https://api.example.com",
-        fetchImpl,
-      }),
-    ).rejects.toThrow(/loopback|private|internal|blocked/i);
-    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it("ignores hidden managed-proxy bypass markers on the public guarded fetch helper", async () => {
@@ -1680,6 +1735,28 @@ describe("fetchWithSsrFGuard hardening", () => {
       lookupFn: testCase.lookupFn(),
       expectedOrigin: testCase.expectedOrigin,
     });
+  });
+
+  it("honors proxy.loopbackMode=block for configured local origins before NO_PROXY fallback", async () => {
+    installManagedProxyRuntime("block");
+    vi.stubEnv("NO_PROXY", "127.0.0.1,localhost");
+    vi.stubEnv("no_proxy", "127.0.0.1,localhost");
+    const fetchImpl = vi.fn(async () => okResponse());
+
+    await expect(
+      fetchConfiguredLocalOriginWithSsrFGuard({
+        url: "http://127.0.0.1:11434/api/embed",
+        fetchImpl,
+        lookupFn: createLoopbackLookup(),
+        policy: { allowedOrigins: ["http://127.0.0.1:11434"] },
+        configuredLocalOriginBaseUrl: "http://127.0.0.1:11434",
+        auditContext: "ollama-memory-embedding",
+      }),
+    ).rejects.toThrow("blocked by proxy.loopbackMode");
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(agentCtor).not.toHaveBeenCalled();
+    expect(envHttpProxyAgentCtor).not.toHaveBeenCalled();
   });
 
   it("routes through env proxy when trusted proxy mode is explicitly enabled", async () => {

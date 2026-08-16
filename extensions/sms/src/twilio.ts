@@ -129,26 +129,28 @@ function requestSearch(req: IncomingMessage): string {
   }
 }
 
-function stripUrlFragment(url: string): string {
+function configuredUrlHasQuery(url: string): boolean {
   const hashIndex = url.indexOf("#");
-  return hashIndex === -1 ? url : url.slice(0, hashIndex);
+  const beforeHash = hashIndex === -1 ? url : url.slice(0, hashIndex);
+  return beforeHash.includes("?");
 }
 
 export function resolveTwilioWebhookSignatureUrl(params: {
   req: IncomingMessage;
   publicWebhookUrl: string;
 }): string {
-  // Twilio connection overrides live in the fragment but are excluded from its
-  // signature input. Strip without URL reserialization so exact port/path bytes survive.
-  const signatureBaseUrl = stripUrlFragment(params.publicWebhookUrl);
-  if (signatureBaseUrl.includes("?")) {
-    return signatureBaseUrl;
+  if (configuredUrlHasQuery(params.publicWebhookUrl)) {
+    return params.publicWebhookUrl;
   }
   const search = requestSearch(params.req);
   if (!search) {
-    return signatureBaseUrl;
+    return params.publicWebhookUrl;
   }
-  return `${signatureBaseUrl}${search}`;
+  const hashIndex = params.publicWebhookUrl.indexOf("#");
+  if (hashIndex === -1) {
+    return `${params.publicWebhookUrl}${search}`;
+  }
+  return `${params.publicWebhookUrl.slice(0, hashIndex)}${search}${params.publicWebhookUrl.slice(hashIndex)}`;
 }
 
 export class TwilioSmsApiError extends Error {
@@ -422,7 +424,12 @@ function parseTwilioListPayload<T>(
   if (!text.trim()) {
     return [];
   }
-  const parsed: unknown = JSON.parse(text);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return [];
+  }
   if (!parsed || typeof parsed !== "object") {
     return [];
   }
@@ -480,7 +487,12 @@ export async function retrieveTwilioMessagingService(params: {
   if (!response.ok) {
     throw new TwilioSmsApiError(response.status, response.text, "messaging-service lookup");
   }
-  const parsed: unknown = JSON.parse(response.text);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(response.text);
+  } catch {
+    throw new Error("Twilio Messaging Service lookup returned malformed JSON.");
+  }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("Twilio Messaging Service lookup returned malformed JSON.");
   }

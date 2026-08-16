@@ -49,12 +49,11 @@ function firstSentGatewayPayload(send: ReturnType<typeof attachOpenSocket>): unk
 
 function presenceUpdate(
   status: PresenceUpdateStatus.Online | PresenceUpdateStatus.Idle = PresenceUpdateStatus.Online,
-  since: number | null = null,
 ): GatewaySendPayload {
   return {
     op: GatewayOpcodes.PresenceUpdate,
     d: {
-      since,
+      since: null,
       activities: [],
       status,
       afk: false,
@@ -71,14 +70,16 @@ class FakeSocket extends EventEmitter {
 class TestGatewayPlugin extends GatewayPlugin {
   sockets: FakeSocket[] = [];
   connectCalls: boolean[] = [];
+  urls: string[] = [];
 
   override connect(resume = false): void {
     this.connectCalls.push(resume);
     super.connect(resume);
   }
 
-  protected override createWebSocket(): never {
+  protected override createWebSocket(url: string): never {
     const socket = new FakeSocket();
+    this.urls.push(url);
     this.sockets.push(socket);
     return socket as never;
   }
@@ -212,7 +213,7 @@ describe("GatewayPlugin", () => {
     originalSocket?.emit("close", 1006);
 
     await vi.advanceTimersByTimeAsync(2_000);
-    expect(gateway.connectCalls).toEqual([false, true]);
+    expect(gateway.connectCalls).toEqual([false, false]);
     const replacementSocket = gateway.sockets[1];
     replacementSocket?.emit("open");
 
@@ -348,6 +349,7 @@ describe("GatewayPlugin", () => {
     };
     gateway.isConnected = false;
     (gateway as unknown as { reconnectAttempts: number }).reconnectAttempts = 7;
+    (gateway as unknown as { consecutiveResumeFailures: number }).consecutiveResumeFailures = 2;
 
     await (
       gateway as unknown as {
@@ -360,6 +362,9 @@ describe("GatewayPlugin", () => {
 
     expect(gateway.isConnected).toBe(true);
     expect((gateway as unknown as { reconnectAttempts: number }).reconnectAttempts).toBe(0);
+    expect(
+      (gateway as unknown as { consecutiveResumeFailures: number }).consecutiveResumeFailures,
+    ).toBe(0);
   });
 
   it("queues outbound gateway events when the connection window is exhausted", () => {
@@ -379,7 +384,6 @@ describe("GatewayPlugin", () => {
       resetTime: 60_000,
       currentEventCount: 120,
       queuedEvents: 1,
-      droppedEvents: 0,
     });
 
     vi.advanceTimersByTime(59_999);
@@ -392,41 +396,7 @@ describe("GatewayPlugin", () => {
       resetTime: 120_000,
       currentEventCount: 1,
       queuedEvents: 0,
-      droppedEvents: 0,
     });
-  });
-
-  it("drops the oldest queued events and warns once per saturation episode", () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
-    const gateway = new GatewayPlugin({ autoInteractions: false });
-    const send = attachOpenSocket(gateway);
-    const warningSpy = vi.fn();
-    gateway.emitter.on("warning", warningSpy);
-
-    for (let index = 0; index < 242; index += 1) {
-      gateway.send(presenceUpdate(PresenceUpdateStatus.Online, index));
-    }
-
-    expect(gateway.getRateLimitStatus()).toEqual({
-      remainingEvents: 0,
-      resetTime: 60_000,
-      currentEventCount: 120,
-      queuedEvents: 120,
-      droppedEvents: 2,
-    });
-    expect(warningSpy).toHaveBeenCalledTimes(1);
-    expect(warningSpy).toHaveBeenCalledWith(
-      "Gateway outbound queue overflow policy=drop-oldest droppedEvents=1 queuedEvents=120 maxQueuedEvents=120",
-    );
-
-    vi.advanceTimersByTime(60_000);
-
-    const flushedSinceValues = send.mock.calls.slice(120).map(([serialized]) => {
-      const payload = JSON.parse(String(serialized)) as { d?: { since?: number } };
-      return payload.d?.since;
-    });
-    expect(flushedSinceValues).toEqual(Array.from({ length: 120 }, (_, index) => index + 122));
   });
 
   it("sends critical gateway events immediately even when regular sends are queued", () => {
@@ -451,7 +421,6 @@ describe("GatewayPlugin", () => {
       resetTime: 60_000,
       currentEventCount: 121,
       queuedEvents: 1,
-      droppedEvents: 0,
     });
   });
 
@@ -499,22 +468,133 @@ describe("GatewayPlugin", () => {
     clearInterval(heartbeat);
   });
 
-  it("reconnects after active remote normal closes", async () => {
+  it("logs and re-identifies after a resumable close without session state", async () => {
     vi.useFakeTimers();
     const gateway = new TestGatewayPlugin({
       autoInteractions: false,
       url: "wss://gateway.example.test",
     });
+    const debugSpy = vi.fn();
+    gateway.emitter.on("debug", debugSpy);
 
     gateway.connect(false);
     gateway.sockets[0]?.emit("open");
     gateway.sockets[0]?.emit("close", 1000);
 
     expect(gateway.sockets).toHaveLength(1);
+    expect(debugSpy).toHaveBeenCalledWith(
+      "Gateway reconnect scheduled in 2000ms (close, resume=false)",
+    );
     await vi.advanceTimersByTimeAsync(2_000);
 
-    expect(gateway.connectCalls).toEqual([false, true]);
+    expect(gateway.connectCalls).toEqual([false, false]);
     expect(gateway.sockets).toHaveLength(2);
+    const reconnectSocket = gateway.sockets[1];
+    reconnectSocket?.emit("open");
+    reconnectSocket?.emit(
+      "message",
+      JSON.stringify({
+        op: GatewayOpcodes.Hello,
+        d: { heartbeat_interval: 45_000 },
+        s: null,
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sentGatewayOpcodes(reconnectSocket?.send ?? vi.fn())).toContain(GatewayOpcodes.Identify);
+    expect(sentGatewayOpcodes(reconnectSocket?.send ?? vi.fn())).not.toContain(
+      GatewayOpcodes.Resume,
+    );
+  });
+
+  it("falls back to a fresh IDENTIFY after three failed resume attempts", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const gateway = new TestGatewayPlugin({
+      autoInteractions: false,
+      url: "wss://gateway.example.test",
+    });
+    const debugSpy = vi.fn();
+    gateway.emitter.on("debug", debugSpy);
+    (gateway as unknown as { client: unknown }).client = {
+      options: { token: "token" },
+      dispatchGatewayEvent: vi.fn(async () => {}),
+    };
+
+    gateway.connect(false);
+    const initialSocket = gateway.sockets[0];
+    initialSocket?.emit("open");
+    initialSocket?.emit(
+      "message",
+      JSON.stringify({
+        op: GatewayOpcodes.Hello,
+        d: { heartbeat_interval: 45_000 },
+        s: null,
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sentGatewayOpcodes(initialSocket?.send ?? vi.fn())).toContain(GatewayOpcodes.Identify);
+    initialSocket?.emit(
+      "message",
+      JSON.stringify({
+        op: GatewayOpcodes.Dispatch,
+        t: GatewayDispatchEvents.Ready,
+        s: 42,
+        d: {
+          session_id: "session-1",
+          resume_gateway_url: "wss://resume.example.test",
+        },
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+
+    for (const delayMs of [2_000, 4_000, 8_000]) {
+      gateway.sockets.at(-1)?.emit("close", 1006);
+      await vi.advanceTimersByTimeAsync(delayMs);
+      const resumeSocket = gateway.sockets.at(-1);
+      expect(gateway.urls.at(-1)).toMatch(/^wss:\/\/resume\.example\.test\//);
+      resumeSocket?.emit("open");
+      resumeSocket?.emit(
+        "message",
+        JSON.stringify({
+          op: GatewayOpcodes.Hello,
+          d: { heartbeat_interval: 45_000 },
+          s: null,
+        }),
+      );
+      expect(sentGatewayOpcodes(resumeSocket?.send ?? vi.fn())).toContain(GatewayOpcodes.Resume);
+      expect(debugSpy).toHaveBeenCalledWith(
+        `Gateway reconnect scheduled in ${delayMs}ms (close, resume=true)`,
+      );
+    }
+
+    gateway.sockets.at(-1)?.emit("close", 1006);
+    expect(debugSpy).toHaveBeenCalledWith(
+      "Gateway forcing fresh IDENTIFY after 3 failed resume attempts",
+    );
+    expect(debugSpy).toHaveBeenCalledWith(
+      "Gateway reconnect scheduled in 16000ms (close, resume=false)",
+    );
+
+    await vi.advanceTimersByTimeAsync(16_000);
+    const freshSocket = gateway.sockets.at(-1);
+    expect(gateway.urls.at(-1)).toMatch(/^wss:\/\/gateway\.example\.test\//);
+    freshSocket?.emit("open");
+    freshSocket?.emit(
+      "message",
+      JSON.stringify({
+        op: GatewayOpcodes.Hello,
+        d: { heartbeat_interval: 45_000 },
+        s: null,
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(sentGatewayOpcodes(freshSocket?.send ?? vi.fn())).toContain(GatewayOpcodes.Identify);
+    expect(sentGatewayOpcodes(freshSocket?.send ?? vi.fn())).not.toContain(GatewayOpcodes.Resume);
+    const sessionState = gatewaySessionState(gateway);
+    expect(sessionState.sessionId).toBeNull();
+    expect(sessionState.resumeGatewayUrl).toBeNull();
+    expect(sessionState.sequence).toBeNull();
   });
 
   it.each([GatewayCloseCodes.InvalidSeq, GatewayCloseCodes.AlreadyAuthenticated])(
@@ -583,7 +663,7 @@ describe("GatewayPlugin", () => {
     expect(gateway.connectCalls).toEqual([false]);
 
     await vi.advanceTimersByTimeAsync(1);
-    expect(gateway.connectCalls).toEqual([false, true]);
+    expect(gateway.connectCalls).toEqual([false, false]);
   });
 
   it("includes close code details when reconnect attempts are exhausted", async () => {

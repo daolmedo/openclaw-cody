@@ -129,8 +129,8 @@ const OPENCODE_GO_MODELS = (
       maxTokens: 131_072,
     },
     {
-      id: "hy3",
-      name: "Hy3",
+      id: "hy3-preview",
+      name: "HY3 Preview",
       api: "openai-completions",
       provider: PROVIDER_ID,
       baseUrl: OPENCODE_GO_OPENAI_BASE_URL,
@@ -390,7 +390,7 @@ const OPENCODE_GO_MODELS = (
   ] satisfies OpencodeGoModelDefinition[]
 ).map((model) => normalizeModelCompat(model) as OpencodeGoModelDefinition);
 
-export type FetchOpencodeGoLiveModelIdsParams = {
+type FetchOpencodeGoLiveModelIdsParams = {
   apiKey?: string;
   discoveryApiKey?: string;
   fetchGuard?: LiveModelCatalogFetchGuard;

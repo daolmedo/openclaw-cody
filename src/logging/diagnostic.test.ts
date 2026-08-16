@@ -11,7 +11,6 @@ import {
 } from "../infra/diagnostic-events.js";
 import { withDiagnosticPhase } from "./diagnostic-phase.js";
 import {
-  BLOCKED_TOOL_CALL_ABORT_FLOOR_MS,
   getDiagnosticSessionActivitySnapshot,
   markDiagnosticEmbeddedRunEnded,
   markDiagnosticEmbeddedRunStarted,
@@ -719,7 +718,7 @@ describe("stuck session diagnostics threshold", () => {
     );
   });
 
-  it("keeps quiet native tools alive until the blocked-tool floor", async () => {
+  it("recovers stale native tool calls through the active-run abort path", async () => {
     const events: DiagnosticEventPayload[] = [];
     const recoverStuckSession = vi.fn();
     const stuckSessionWarnMs = 30_000;
@@ -748,7 +747,7 @@ describe("stuck session diagnostics threshold", () => {
         toolCallId: "cmd-1",
       });
 
-      vi.advanceTimersByTime(BLOCKED_TOOL_CALL_ABORT_FLOOR_MS - 30_000);
+      vi.advanceTimersByTime(stuckSessionAbortMs - 30_000);
       expect(recoverStuckSession).not.toHaveBeenCalled();
 
       vi.advanceTimersByTime(30_000);
@@ -989,7 +988,7 @@ describe("stuck session diagnostics threshold", () => {
     );
   });
 
-  it("does not recover stale model calls without active embedded-run ownership", async () => {
+  it("recovers stale model calls without active embedded-run ownership", async () => {
     const events: DiagnosticEventPayload[] = [];
     const recoverStuckSession = vi.fn();
     const stuckSessionWarnMs = 30_000;
@@ -1034,7 +1033,11 @@ describe("stuck session diagnostics threshold", () => {
         lastProgressReason: "model_call:started",
       },
     );
-    expect(recoverStuckSession).not.toHaveBeenCalled();
+    expectRecoveryCall(
+      recoverStuckSession,
+      { sessionId: "s1", sessionKey: "main", queueDepth: 0, allowActiveAbort: true },
+      ["ageMs", "stateGeneration"],
+    );
   });
 
   it("does not recover a recent native tool call just because the session is old", async () => {
@@ -1063,7 +1066,7 @@ describe("stuck session diagnostics threshold", () => {
       toolCallId: "cmd-1",
     });
 
-    vi.advanceTimersByTime(BLOCKED_TOOL_CALL_ABORT_FLOOR_MS - 30_000);
+    vi.advanceTimersByTime(60_000);
     expect(recoverStuckSession).not.toHaveBeenCalled();
 
     vi.advanceTimersByTime(30_000);

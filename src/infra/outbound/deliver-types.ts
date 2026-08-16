@@ -68,7 +68,6 @@ export class OutboundDeliveryError extends Error {
       cause: unknown;
       results?: readonly OutboundDeliveryResult[];
       payloadOutcomes?: readonly OutboundPayloadDeliveryOutcome[];
-      sentBeforeError?: boolean;
       stage?: OutboundDeliveryFailureStage;
     },
   ) {
@@ -76,7 +75,7 @@ export class OutboundDeliveryError extends Error {
     this.name = "OutboundDeliveryError";
     this.results = [...(options.results ?? [])];
     this.payloadOutcomes = [...(options.payloadOutcomes ?? [])];
-    this.sentBeforeError = this.results.length > 0 || options.sentBeforeError === true;
+    this.sentBeforeError = this.results.length > 0;
     this.stage = options.stage ?? "unknown";
   }
 }

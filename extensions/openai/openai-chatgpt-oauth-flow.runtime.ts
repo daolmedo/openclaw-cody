@@ -5,6 +5,7 @@
  * It is only intended for CLI use, not browser environments.
  */
 
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
 import {
   parseOAuthAuthorizationInput,
   resolveOAuthTokenExpiresAt,
@@ -58,7 +59,12 @@ type TokenRequestOptions = {
   timeoutMs?: number;
 };
 
-let nodeOAuthRuntimePromise: Promise<NodeOAuthRuntime> | null = null;
+const loadNodeOAuthModules = createLazyRuntimeModule(() =>
+  Promise.all([import("node:crypto"), import("node:http")]).then(([cryptoModule, httpModule]) => ({
+    randomBytes: cryptoModule.randomBytes,
+    http: httpModule,
+  })),
+);
 
 function loadNodeOAuthRuntime(): Promise<NodeOAuthRuntime> {
   if (typeof process === "undefined" || (!process.versions?.node && !process.versions?.bun)) {
@@ -66,13 +72,7 @@ function loadNodeOAuthRuntime(): Promise<NodeOAuthRuntime> {
       new Error("OpenAI Codex OAuth is only available in Node.js environments"),
     );
   }
-  nodeOAuthRuntimePromise ??= Promise.all([import("node:crypto"), import("node:http")]).then(
-    ([cryptoModule, httpModule]) => ({
-      randomBytes: cryptoModule.randomBytes,
-      http: httpModule,
-    }),
-  );
-  return nodeOAuthRuntimePromise;
+  return loadNodeOAuthModules();
 }
 
 function resolveCallbackHost(env: NodeJS.ProcessEnv = process.env): string {

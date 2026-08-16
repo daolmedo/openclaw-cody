@@ -8,7 +8,6 @@ import {
   normalizeProviderId,
 } from "@openclaw/model-catalog-core/provider-id";
 import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
-import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { resolveProviderIdForAuth } from "../provider-auth-aliases.js";
 import { normalizeAuthProfileCredential } from "./credential-normalize.js";
 import { dedupeProfileIds, listProfilesForProvider } from "./profile-list.js";
@@ -23,8 +22,6 @@ export {
   listProfilesForProvider,
   resolveSubscriptionAuthModeForProfiles,
 } from "./profile-list.js";
-
-const authProfileProfilesLog = createSubsystemLogger("agent/embedded");
 
 // Auth profile order/lastGood keys may be stored as aliases. Resolve through
 // auth provider normalization before updating per-provider state.
@@ -289,15 +286,11 @@ export async function markAuthProfileSuccess(params: {
     store.usageStats = updated.usageStats;
     return;
   }
-  if (updated === null) {
-    authProfileProfilesLog.warn(
-      "dropped auth profile bookkeeping after locked store update failed",
-      {
-        event: "auth_profile_bookkeeping_dropped",
-        kind: "success",
-        profileId,
-        tags: ["auth_profiles", "persistence"],
-      },
-    );
+  const profile = store.profiles[profileId];
+  if (!profile || resolveProviderIdForAuth(profile.provider) !== providerKey) {
+    return;
   }
+  store.lastGood = { ...store.lastGood, [providerKey]: profileId };
+  updateSuccessfulUsageStatsEntry(store, profileId, lastUsed);
+  saveAuthProfileStore(store, agentDir);
 }

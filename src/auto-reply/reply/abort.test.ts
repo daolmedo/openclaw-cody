@@ -1,11 +1,11 @@
 // Tests abort request handling, cutoff persistence, and active run cleanup.
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SubagentRunRecord } from "../../agents/subagent-registry.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import type { SessionAbortTargetResult } from "../../config/sessions/session-accessor.js";
+import { createSuiteTempRootTracker } from "../../test-helpers/temp-dir.js";
 import {
   testing as abortTesting,
   formatAbortReplyText,
@@ -84,7 +84,17 @@ vi.mock("../../acp/control-plane/manager.js", () => ({
   }),
 }));
 
+const suiteTempDirs = createSuiteTempRootTracker({ prefix: "openclaw-abort-" });
+
 describe("abort detection", () => {
+  beforeAll(async () => {
+    await suiteTempDirs.setup();
+  });
+
+  afterAll(async () => {
+    await suiteTempDirs.cleanup();
+  });
+
   async function writeSessionStore(
     storePath: string,
     sessionIdsByKey: Record<string, string>,
@@ -104,7 +114,7 @@ describe("abort detection", () => {
     sessionIdsByKey?: Record<string, string>;
     nowMs?: number;
   }) {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-abort-"));
+    const root = await suiteTempDirs.make("case");
     const storePath = path.join(root, "sessions.json");
     const cfg = {
       session: { store: storePath },
@@ -228,7 +238,6 @@ describe("abort detection", () => {
       "stop",
       "esc",
       "abort",
-      "wait",
       "exit",
       "interrupt",
       "stop openclaw",
@@ -277,6 +286,8 @@ describe("abort detection", () => {
     }
 
     expect(isAbortTrigger("hello")).toBe(false);
+    expect(isAbortTrigger("wait")).toBe(false);
+    expect(isAbortTrigger("please wait")).toBe(false);
     expect(isAbortTrigger("please do not do that")).toBe(false);
     // /stop is NOT matched by isAbortTrigger - it's handled separately.
     expect(isAbortTrigger("/stop")).toBe(false);
@@ -304,6 +315,8 @@ describe("abort detection", () => {
     expect(isAbortRequestText("/Stop@openclaw_bot", { botUsername: "openclaw_bot" })).toBe(true);
 
     expect(isAbortRequestText("/status")).toBe(false);
+    expect(isAbortRequestText("wait")).toBe(false);
+    expect(isAbortRequestText("please wait")).toBe(false);
     expect(isAbortRequestText("do not do that")).toBe(true);
     expect(isAbortRequestText("please do not do that")).toBe(false);
     expect(isAbortRequestText("/abort")).toBe(false);
@@ -671,6 +684,7 @@ describe("abort detection", () => {
       childSessionKey: childKey,
       reason: "killed",
       runId: "slow-child-run",
+      suppressTaskDelivery: true,
     });
     expect(getFollowupQueueDepth(sessionKey)).toBe(0);
     expectSessionLaneCleared(sessionKey);
@@ -1195,6 +1209,43 @@ describe("abort detection", () => {
     expectSessionLaneCleared(childKey);
   });
 
+  it("continues stopping siblings when one termination persistence write fails", () => {
+    subagentRegistryMocks.markSubagentRunTerminated.mockClear();
+    const sessionKey = "telegram:persistence-failure-parent";
+    const firstChildKey = "agent:main:subagent:persistence-failure-first";
+    const secondChildKey = "agent:main:subagent:persistence-failure-second";
+    const run = (runId: string, childSessionKey: string): SubagentRunRecord => ({
+      runId,
+      childSessionKey,
+      requesterSessionKey: sessionKey,
+      requesterDisplayKey: sessionKey,
+      task: "stop despite persistence failure",
+      cleanup: "keep",
+      createdAt: Date.now(),
+    });
+    subagentRegistryMocks.listSubagentRunsForRequester
+      .mockReturnValueOnce([
+        run("run-persistence-failure-first", firstChildKey),
+        run("run-persistence-failure-second", secondChildKey),
+      ])
+      .mockReturnValue([]);
+    subagentRegistryMocks.markSubagentRunTerminated
+      .mockImplementationOnce(() => {
+        throw new Error("sqlite busy");
+      })
+      .mockReturnValue(1);
+
+    expect(
+      stopSubagentsForRequester({
+        cfg: {} as OpenClawConfig,
+        requesterSessionKey: sessionKey,
+      }),
+    ).toEqual({ stopped: 2 });
+    expect(subagentRegistryMocks.markSubagentRunTerminated).toHaveBeenCalledTimes(2);
+    expectSessionLaneCleared(firstChildKey);
+    expectSessionLaneCleared(secondChildKey);
+  });
+
   it("cascade stop kills depth-2 children when stopping depth-1 agent", async () => {
     const sessionKey = "telegram:parent";
     const depth1Key = "agent:main:subagent:child-1";
@@ -1249,6 +1300,43 @@ describe("abort detection", () => {
     expect(result.stoppedSubagents).toBe(2);
     expectSessionLaneCleared(depth1Key);
     expectSessionLaneCleared(depth2Key);
+  });
+
+  it("stops a subagent that is paused after yielding", () => {
+    subagentRegistryMocks.listSubagentRunsForRequester.mockClear();
+    subagentRegistryMocks.markSubagentRunTerminated.mockClear();
+    const sessionKey = "telegram:yield-parent";
+    const childKey = "agent:main:subagent:yield-child";
+    const now = Date.now();
+    subagentRegistryMocks.listSubagentRunsForRequester
+      .mockReturnValueOnce([
+        {
+          runId: "run-yield-child",
+          childSessionKey: childKey,
+          requesterSessionKey: sessionKey,
+          requesterDisplayKey: sessionKey,
+          task: "paused worker",
+          cleanup: "keep",
+          createdAt: now - 1_000,
+          endedAt: now - 500,
+          pauseReason: "sessions_yield",
+        },
+      ])
+      .mockReturnValueOnce([]);
+
+    const result = stopSubagentsForRequester({
+      cfg: {} as OpenClawConfig,
+      requesterSessionKey: sessionKey,
+    });
+
+    expect(result).toEqual({ stopped: 1 });
+    expectSessionLaneCleared(childKey);
+    expect(subagentRegistryMocks.markSubagentRunTerminated).toHaveBeenCalledWith({
+      runId: "run-yield-child",
+      childSessionKey: childKey,
+      reason: "killed",
+      suppressTaskDelivery: true,
+    });
   });
 
   it("cascade stop traverses ended depth-1 parents to stop active depth-2 children", async () => {

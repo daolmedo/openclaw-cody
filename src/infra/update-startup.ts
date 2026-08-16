@@ -9,6 +9,7 @@ import {
 } from "@openclaw/normalization-core/number-coercion";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { formatCliCommand } from "../cli/command-format.js";
+import { getRuntimeConfig } from "../config/config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { runCommandWithTimeout } from "../process/exec.js";
 import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
@@ -24,7 +25,10 @@ import {
   getNodeSqliteKysely,
 } from "./kysely-sync.js";
 import { resolveOpenClawPackageRoot } from "./openclaw-root.js";
-import { scheduleGatewaySigusr1Restart } from "./restart.js";
+import {
+  resolveGatewayRestartDeferralTimeoutMs,
+  scheduleGatewaySigusr1Restart,
+} from "./restart.js";
 import { detectRespawnSupervisor, type RespawnSupervisor } from "./supervisor-markers.js";
 import {
   channelToNpmTag,
@@ -67,7 +71,6 @@ type AutoUpdateRunResult = {
   reason?: string;
   command?: string;
   logPath?: string;
-  restartDelayMs?: number;
 };
 
 export type UpdateAvailable = {
@@ -369,6 +372,7 @@ function resolveManagedAutoUpdateRestartDelayMs(supervisor: RespawnSupervisor): 
 async function startManagedServiceAutoUpdateHandoff(params: {
   channel: "stable" | "beta";
   timeoutMs: number;
+  restartDrainTimeoutMs: number | undefined;
   root?: string;
   supervisor: RespawnSupervisor;
 }): Promise<AutoUpdateRunResult> {
@@ -378,6 +382,7 @@ async function startManagedServiceAutoUpdateHandoff(params: {
     const started = await startManagedServiceUpdateHandoff({
       root: resolveAutoUpdateHandoffRoot(params.root),
       timeoutMs: params.timeoutMs,
+      restartDrainTimeoutMs: params.restartDrainTimeoutMs,
       channel: params.channel,
       restartDelayMs,
       supervisor: params.supervisor,
@@ -387,13 +392,20 @@ async function startManagedServiceAutoUpdateHandoff(params: {
         note: "background auto-update",
       },
     });
+    // Pair helper creation with restart scheduling before any state persistence
+    // can fail and leave an indefinite handoff waiting on a live parent.
+    scheduleGatewaySigusr1Restart({
+      delayMs: restartDelayMs,
+      reason: "update.auto",
+      skipCooldown: true,
+      skipDeferral: true,
+    });
     return {
       ok: true,
       code: 0,
       reason: CONTROL_PLANE_UPDATE_HANDOFF_STARTED_REASON,
       command: started.command,
       logPath: started.logPath,
-      restartDelayMs,
     };
   } catch (err) {
     return {
@@ -407,6 +419,7 @@ async function startManagedServiceAutoUpdateHandoff(params: {
 async function runAutoUpdateCommand(params: {
   channel: "stable" | "beta";
   timeoutMs: number;
+  restartDrainTimeoutMs: number | undefined;
   root?: string;
 }): Promise<AutoUpdateRunResult> {
   const supervisor = detectRespawnSupervisor(process.env, process.platform, {
@@ -416,6 +429,7 @@ async function runAutoUpdateCommand(params: {
     return await startManagedServiceAutoUpdateHandoff({
       channel: params.channel,
       timeoutMs: params.timeoutMs,
+      restartDrainTimeoutMs: params.restartDrainTimeoutMs,
       root: params.root,
       supervisor,
     });
@@ -509,6 +523,7 @@ export async function runGatewayUpdateCheck(params: {
   runAutoUpdate?: (params: {
     channel: "stable" | "beta";
     timeoutMs: number;
+    restartDrainTimeoutMs: number | undefined;
     root?: string;
   }) => Promise<AutoUpdateRunResult>;
 }): Promise<void> {
@@ -590,8 +605,6 @@ export async function runGatewayUpdateCheck(params: {
     ...state,
     lastCheckedAt: resolveUpdateCheckTimestamp(now),
   };
-  let pendingAutoUpdateRestartDelayMs: number | null = null;
-
   if (status.installKind !== "package") {
     delete nextState.lastAvailableVersion;
     delete nextState.lastAvailableTag;
@@ -699,10 +712,12 @@ export async function runGatewayUpdateCheck(params: {
         const outcome = await runAuto({
           channel,
           timeoutMs: AUTO_UPDATE_COMMAND_TIMEOUT_MS,
+          restartDrainTimeoutMs: resolveGatewayRestartDeferralTimeoutMs(
+            getRuntimeConfig().gateway?.reload?.deferralTimeoutMs,
+          ),
           root: root ?? status.root ?? undefined,
         });
         if (outcome.ok && outcome.reason === CONTROL_PLANE_UPDATE_HANDOFF_STARTED_REASON) {
-          pendingAutoUpdateRestartDelayMs = outcome.restartDelayMs ?? 0;
           params.log.info("auto-update handoff started", {
             channel,
             version: resolved.version,
@@ -746,14 +761,6 @@ export async function runGatewayUpdateCheck(params: {
   }
 
   await writeState(nextState);
-  if (pendingAutoUpdateRestartDelayMs !== null) {
-    scheduleGatewaySigusr1Restart({
-      delayMs: pendingAutoUpdateRestartDelayMs,
-      reason: "update.auto",
-      skipCooldown: true,
-      skipDeferral: true,
-    });
-  }
 }
 
 export function scheduleGatewayUpdateCheck(params: {
