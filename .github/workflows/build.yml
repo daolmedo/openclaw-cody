@@ -6,20 +6,77 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      OPENCLAW_RELEASE_VERSION: 2026.7.1-2
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
-        with: { node-version: '22' }
-      - run: pnpm install
-      - run: pnpm ui:build
-      - run: pnpm build
-      - run: npm pack
+        with: { node-version: '24.15.0' }
+      - name: Download the official stable package
+        id: package
+        run: |
+          set -euo pipefail
+          repo_version="$(node -p "require('./package.json').version")"
+          release_base="${OPENCLAW_RELEASE_VERSION%%-*}"
+          if [[ "$repo_version" != "$release_base" ]]; then
+            echo "Repository version ${repo_version} does not match release ${OPENCLAW_RELEASE_VERSION}." >&2
+            exit 1
+          fi
+
+          package_dir="$RUNNER_TEMP/openclaw-package"
+          mkdir -p "$package_dir"
+          npm pack "openclaw@${OPENCLAW_RELEASE_VERSION}" \
+            --ignore-scripts \
+            --json \
+            --pack-destination "$package_dir" > "$package_dir/pack.json"
+          package_name="$(jq -r '.[0].filename' "$package_dir/pack.json")"
+          package_path="$package_dir/$package_name"
+          if [[ -z "$package_name" || "$package_name" != "$(basename "$package_name")" || ! -f "$package_path" ]]; then
+            echo "npm pack did not produce one safe package path." >&2
+            exit 1
+          fi
+          echo "path=$package_path" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the installable package
+        env:
+          PACKAGE_PATH: ${{ steps.package.outputs.path }}
+        run: |
+          set -euo pipefail
+          packed_version="$(tar -xOf "$PACKAGE_PATH" package/package.json | jq -r '.version')"
+          workspace_dependencies="$(tar -xOf "$PACKAGE_PATH" package/package.json | jq -r '[.dependencies // {}, .optionalDependencies // {}] | add | to_entries[] | select(.value | startswith("workspace:")) | .key')"
+          if [[ "$packed_version" != "$OPENCLAW_RELEASE_VERSION" ]]; then
+            echo "Packed version ${packed_version} does not match ${OPENCLAW_RELEASE_VERSION}." >&2
+            exit 1
+          fi
+          if [[ -n "$workspace_dependencies" ]]; then
+            echo "Package contains non-installable workspace dependencies: ${workspace_dependencies}" >&2
+            exit 1
+          fi
+
+          smoke_prefix="$RUNNER_TEMP/openclaw-smoke"
+          npm install -g --prefix "$smoke_prefix" "$PACKAGE_PATH" --no-audit --no-fund
+          installed_version="$($smoke_prefix/bin/openclaw --version)"
+          if [[ "$installed_version" != *"$OPENCLAW_RELEASE_VERSION"* ]]; then
+            echo "Installed CLI reports unexpected version: ${installed_version}" >&2
+            exit 1
+          fi
+
       - name: Upload to S3
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: eu-west-2
+          PACKAGE_PATH: ${{ steps.package.outputs.path }}
         run: |
-          aws s3 cp openclaw-*.tgz s3://cody-openclaw-builds/openclaw-cody.tgz \
+          set -euo pipefail
+          expected_sha="$(sha256sum "$PACKAGE_PATH" | awk '{print $1}')"
+          aws s3 cp "$PACKAGE_PATH" s3://cody-openclaw-builds/openclaw-cody.tgz \
             --acl public-read
+          deployed_path="$RUNNER_TEMP/openclaw-cody-deployed.tgz"
+          curl -fLsS \
+            "https://cody-openclaw-builds.s3.eu-west-2.amazonaws.com/openclaw-cody.tgz?run=${GITHUB_RUN_ID}" \
+            -o "$deployed_path"
+          deployed_sha="$(sha256sum "$deployed_path" | awk '{print $1}')"
+          deployed_version="$(tar -xOf "$deployed_path" package/package.json | jq -r '.version')"
+          test "$deployed_sha" = "$expected_sha"
+          test "$deployed_version" = "$OPENCLAW_RELEASE_VERSION"
