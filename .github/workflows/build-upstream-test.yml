@@ -14,12 +14,17 @@ jobs:
       - run: pnpm install
       - run: pnpm ui:build
       - run: pnpm build
-      - run: npm pack
+      - run: >-
+          node scripts/package-openclaw-for-docker.mjs
+          --skip-build
+          --allow-unreleased-changelog
+          --output-name openclaw-current.tgz
       - name: Upload to S3
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: eu-west-2
         run: |
-          aws s3 cp openclaw-*.tgz s3://cody-openclaw-builds/openclaw-cody-test.tgz \
+          aws s3 cp .artifacts/docker-e2e-package/openclaw-current.tgz \
+            s3://cody-openclaw-builds/openclaw-cody-test.tgz \
             --acl public-read
