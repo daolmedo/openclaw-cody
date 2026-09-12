@@ -5,6 +5,7 @@ import JSON5 from "json5";
 import type { HealthFinding } from "openclaw/plugin-sdk/health";
 import { normalizeAgentId } from "openclaw/plugin-sdk/routing";
 import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { readExecApprovalAllowlistRequirements } from "./doctor/exec-approval-rules.js";
 import {
   isPolicyValueAtLeastAsStrict,
   policyContainerShapeFindings,
@@ -12,6 +13,8 @@ import {
   type PolicyRuleMetadata,
   type PolicyScopeSelectorKind,
 } from "./doctor/register.js";
+import { ocPathSegment } from "./doctor/utils.js";
+import { getPolicyPath, scopedPolicyValue } from "./policy-value.js";
 
 const POLICY_CONFORMANCE_CHECK_IDS = {
   missing: "policy/policy-conformance-missing",
@@ -324,9 +327,9 @@ function conformanceFinding(
 function baselineRuleIsNoOp(metadata: PolicyRuleMetadata, baseline: unknown): boolean {
   switch (metadata.strictness) {
     case "allowlist-subset":
-      return metadata.emptyList === "disabled" && policyRuleListIsEmpty(baseline, metadata);
+      return metadata.emptyList === "disabled" && policyRuleListIsEmpty(baseline);
     case "denylist-superset":
-      return policyRuleListIsEmpty(baseline, metadata);
+      return policyRuleListIsEmpty(baseline);
     case "requires-true":
       return baseline !== true;
     case "requires-false":
@@ -334,6 +337,8 @@ function baselineRuleIsNoOp(metadata: PolicyRuleMetadata, baseline: unknown): bo
     case "exact-list":
     case "ordered-string":
       return false;
+    case "routing-probes":
+      return policyRuleListIsEmpty(baseline);
   }
   return false;
 }
@@ -360,7 +365,7 @@ function policyRuleValueIsValid(metadata: PolicyRuleMetadata, value: unknown): b
         return false;
       }
       if (isExecApprovalAllowlistExpectedRule(metadata)) {
-        return value.every(isExecApprovalAllowlistRequirement);
+        return readExecApprovalAllowlistRequirements(value, []) !== undefined;
       }
       return value.every(
         (entry) =>
@@ -368,35 +373,14 @@ function policyRuleValueIsValid(metadata: PolicyRuleMetadata, value: unknown): b
           entry.trim() !== "" &&
           policyStringIsAllowed(metadata, entry),
       );
+    case "routing-probes":
+      return Array.isArray(value);
   }
   return false;
 }
 
 function isExecApprovalAllowlistExpectedRule(metadata: PolicyRuleMetadata): boolean {
   return metadata.policyPath.join(".") === "execApprovals.agents.allowlist.expected";
-}
-
-function unsupportedPolicyKey(
-  value: Record<string, unknown>,
-  supported: readonly string[],
-): string | undefined {
-  return Object.keys(value).find((key) => !supported.includes(key));
-}
-
-function isExecApprovalAllowlistRequirement(value: unknown): boolean {
-  if (typeof value === "string") {
-    return value.trim() !== "";
-  }
-  if (!isRecord(value)) {
-    return false;
-  }
-  if (unsupportedPolicyKey(value, ["argPattern", "pattern"]) !== undefined) {
-    return false;
-  }
-  if (typeof value.pattern !== "string" || value.pattern.trim() === "") {
-    return false;
-  }
-  return value.argPattern === undefined || typeof value.argPattern === "string";
 }
 
 function policyStringIsAllowed(metadata: PolicyRuleMetadata, value: string): boolean {
@@ -419,14 +403,8 @@ function policyStringIsAllowed(metadata: PolicyRuleMetadata, value: string): boo
   return allowed.includes(normalized);
 }
 
-function policyRuleListIsEmpty(value: unknown, metadata: PolicyRuleMetadata): boolean {
-  if (!Array.isArray(value)) {
-    return false;
-  }
-  if (metadata.valueType === "channel-provider-deny-rules") {
-    return value.length === 0;
-  }
-  return value.length === 0;
+function policyRuleListIsEmpty(value: unknown): boolean {
+  return Array.isArray(value) && value.length === 0;
 }
 
 function missingConformanceFinding(
@@ -572,22 +550,6 @@ function normalizeSelectorValues(
     );
 }
 
-function scopedPolicyValue(overlay: Record<string, unknown>, path: readonly string[]): unknown {
-  const scopedRoot = path[0] === "agents" ? overlay.agents : overlay[path[0]];
-  return getPolicyPath(scopedRoot, path.slice(1));
-}
-
-function getPolicyPath(value: unknown, path: readonly string[]): unknown {
-  let current = value;
-  for (const part of path) {
-    if (!isRecord(current)) {
-      return undefined;
-    }
-    current = current[part];
-  }
-  return current;
-}
-
 async function readPolicyDocument(path: string): Promise<PolicyDocumentReadResult> {
   const displayName = basename(path);
   let raw: string;
@@ -617,11 +579,4 @@ async function readPolicyDocument(path: string): Promise<PolicyDocumentReadResul
 
 function resolvePolicyPath(path: string, cwd: string | undefined): string {
   return isAbsolute(path) ? path : resolve(cwd ?? process.cwd(), path);
-}
-
-function ocPathSegment(value: string): string {
-  if (/^(?:[A-Za-z0-9_-]+|#\d+)$/.test(value)) {
-    return value;
-  }
-  return JSON.stringify(value);
 }

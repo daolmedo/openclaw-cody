@@ -1,12 +1,12 @@
 // Discord tests cover rest plugin behavior.
 import { createServer, type Server } from "node:http";
 import { gzipSync } from "node:zlib";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { MAX_TIMER_TIMEOUT_MS } from "openclaw/plugin-sdk/number-runtime";
-import { fetch as undiciFetch } from "undici";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { serializeRequestBody } from "./rest-body.js";
 import { DiscordError, RateLimitError, RequestClient } from "./rest.js";
-import { createDeferred, createJsonResponse } from "./test-builders.test-support.js";
+import { createJsonResponse } from "./test-builders.test-support.js";
 
 async function expectRateLimitError(
   promise: Promise<unknown>,
@@ -845,19 +845,12 @@ describe("RequestClient", () => {
     expect(form.get("files[0]")).toBeInstanceOf(Blob);
   });
 
-  it("dispatches multipart uploads with a multipart/form-data content type", async () => {
+  it("passes multipart uploads to fetch as FormData", async () => {
+    const arrayBufferSpy = vi.spyOn(Blob.prototype, "arrayBuffer");
     const fetchSpy = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       expect(init?.headers).toBeInstanceOf(Headers);
-      expect((init!.headers as Headers).get("Content-Type")).toMatch(
-        /^multipart\/form-data; boundary=/,
-      );
-      expect(init?.body).not.toBeInstanceOf(FormData);
-      const request = new Request("https://discord.test/upload", {
-        method: "POST",
-        headers: init?.headers,
-        body: init?.body,
-      });
-      expect(request.headers.get("Content-Type")).toMatch(/^multipart\/form-data; boundary=/);
+      expect((init!.headers as Headers).get("Content-Type")).toBeNull();
+      expect(init?.body).toBeInstanceOf(FormData);
       return new Response(JSON.stringify({ id: "msg" }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -865,16 +858,21 @@ describe("RequestClient", () => {
     });
     const client = new RequestClient("test-token", { fetch: fetchSpy, queueRequests: false });
 
-    await expect(
-      client.post("/channels/c1/messages", {
-        body: {
-          content: "file",
-          files: [{ name: "a.txt", data: new Uint8Array([1]), contentType: "text/plain" }],
-        },
-      }),
-    ).resolves.toEqual({ id: "msg" });
+    try {
+      await expect(
+        client.post("/channels/c1/messages", {
+          body: {
+            content: "file",
+            files: [{ name: "a.txt", data: new Uint8Array([1]), contentType: "text/plain" }],
+          },
+        }),
+      ).resolves.toEqual({ id: "msg" });
 
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(arrayBufferSpy).not.toHaveBeenCalled();
+    } finally {
+      arrayBufferSpy.mockRestore();
+    }
   });
 
   it("dispatches multipart uploads through undici fetch with a multipart/form-data content type", async () => {
@@ -883,7 +881,8 @@ describe("RequestClient", () => {
         expect(req.headers["content-type"]).toMatch(/^multipart\/form-data; boundary=/);
         req.resume();
         req.on("end", () => {
-          res.writeHead(200, { "Content-Type": "application/json" });
+          // Retire the native fetch socket before a later test installs fake timers.
+          res.writeHead(200, { "Content-Type": "application/json", Connection: "close" });
           res.end(JSON.stringify({ id: "msg" }));
         });
       });
@@ -897,7 +896,6 @@ describe("RequestClient", () => {
       const client = new RequestClient("test-token", {
         baseUrl: `http://127.0.0.1:${address.port}`,
         apiVersion: 10,
-        fetch: undiciFetch as unknown as typeof fetch,
         queueRequests: false,
       });
 

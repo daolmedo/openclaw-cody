@@ -1,10 +1,12 @@
 // Sessions compact command tests cover non-zero exits on failure and param forwarding.
+
+import { expectDefined } from "@openclaw/normalization-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { sessionsCompactCommand } from "./sessions-compact.js";
 
 const callGatewayCli = vi.hoisted(() => vi.fn());
 
-vi.mock("../cli/gateway-cli/call.js", () => ({ callGatewayCli }));
+vi.mock("../cli/gateway-rpc.js", () => ({ callGatewayFromCliWithTransport: callGatewayCli }));
 
 function createRuntime() {
   return {
@@ -25,6 +27,16 @@ beforeEach(() => {
 });
 
 describe("sessionsCompactCommand", () => {
+  it("rejects a blank agent before calling the Gateway", async () => {
+    const runtime = createRuntime();
+
+    await expect(
+      sessionsCompactCommand({ key: "agent:main:main", agent: "" }, runtime),
+    ).rejects.toThrow("--agent must not be blank");
+
+    expect(callGatewayCli).not.toHaveBeenCalled();
+  });
+
   it("prints the token delta and does not exit on a successful compaction", async () => {
     callGatewayCli.mockResolvedValue({
       ok: true,
@@ -149,7 +161,12 @@ describe("sessionsCompactCommand", () => {
     await sessionsCompactCommand({ key: "agent:main:main", json: true }, runtime);
 
     expect(runtime.writeJson).toHaveBeenCalledTimes(1);
-    expect(runtime.writeJson.mock.calls[0][0]).toEqual(payload);
+    expect(
+      expectDefined(
+        runtime.writeJson.mock.calls[0],
+        "runtime.writeJson.mock.calls[0] test invariant",
+      )[0],
+    ).toEqual(payload);
     expect(runtime.exit).toHaveBeenCalledWith(1);
   });
 
@@ -165,7 +182,10 @@ describe("sessionsCompactCommand", () => {
     await sessionsCompactCommand({ key: "agent:work:main", agent: "work", maxLines: 200 }, runtime);
 
     expect(callGatewayCli).toHaveBeenCalledTimes(1);
-    const [method, , params] = callGatewayCli.mock.calls[0];
+    const [method, , params] = expectDefined(
+      callGatewayCli.mock.calls[0],
+      "callGatewayCli.mock.calls[0] test invariant",
+    );
     expect(method).toBe("sessions.compact");
     expect(params).toEqual({ key: "agent:work:main", agentId: "work", maxLines: 200 });
   });

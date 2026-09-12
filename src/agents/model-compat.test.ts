@@ -29,7 +29,7 @@ import {
   resolveHighSignalLiveModelLimit,
   selectHighSignalLiveItems,
   selectSmallLiveItems,
-} from "./live-model-filter.js";
+} from "./test-helpers/live-model-dynamic-candidates.js";
 
 const baseModel = (): Model =>
   ({
@@ -391,31 +391,33 @@ describe("isModernModelRef", () => {
   });
 
   it("includes plugin-advertised modern models", () => {
-    providerRuntimeMocks.resolveProviderModernModelRef.mockImplementation(({ provider, context }) =>
-      provider === "openai" &&
-      [
-        "gpt-5.6",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.5",
-        "gpt-5.5-pro",
-        "gpt-5.4",
-        "gpt-5.4-pro",
-        "gpt-5.4-mini",
-        "gpt-5.4-nano",
-      ].includes(context.modelId)
-        ? true
-        : provider === "openai" &&
-            ["gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini"].includes(
-              context.modelId,
-            )
+    providerRuntimeMocks.resolveProviderModernModelRef.mockImplementation(
+      ({ provider, context }) =>
+        provider === "openai" &&
+        [
+          "gpt-5.6",
+          "gpt-5.6-sol",
+          "gpt-5.6-terra",
+          "gpt-5.6-luna",
+          "gpt-5.5",
+          "gpt-5.5-pro",
+          "gpt-5.4",
+          "gpt-5.4-pro",
+          "gpt-5.4-mini",
+          "gpt-5.4-nano",
+        ].includes(context.modelId)
           ? true
-          : provider === "opencode" && ["claude-opus-4-6", "gemini-3-pro"].includes(context.modelId)
+          : provider === "openai" &&
+              ["gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini"].includes(
+                context.modelId,
+              )
             ? true
-            : provider === "opencode-go"
+            : provider === "opencode" &&
+                ["claude-opus-4-6", "gemini-3-pro"].includes(context.modelId)
               ? true
-              : undefined,
+              : provider === "opencode-go"
+                ? true
+                : undefined,
     );
 
     expect(isModernModelRef({ provider: "openai", id: "gpt-5.6" })).toBe(true);
@@ -439,8 +441,9 @@ describe("isModernModelRef", () => {
   });
 
   it("matches plugin-advertised modern models only for exact provider ids", () => {
-    providerRuntimeMocks.resolveProviderModernModelRef.mockImplementation(({ provider, context }) =>
-      provider === "z.ai" && context.modelId === "glm-5" ? true : undefined,
+    providerRuntimeMocks.resolveProviderModernModelRef.mockImplementation(
+      ({ provider, context }) =>
+        provider === "z.ai" && context.modelId === "glm-5" ? true : undefined,
     );
 
     expect(isModernModelRef({ provider: "z.ai", id: "glm-5" })).toBe(true);
@@ -448,8 +451,9 @@ describe("isModernModelRef", () => {
   });
 
   it("excludes provider-declined modern models", () => {
-    providerRuntimeMocks.resolveProviderModernModelRef.mockImplementation(({ provider, context }) =>
-      provider === "opencode" && context.modelId === "minimax-m2.7" ? false : undefined,
+    providerRuntimeMocks.resolveProviderModernModelRef.mockImplementation(
+      ({ provider, context }) =>
+        provider === "opencode" && context.modelId === "minimax-m2.7" ? false : undefined,
     );
 
     expect(isModernModelRef({ provider: "opencode", id: "minimax-m2.7" })).toBe(false);
@@ -458,10 +462,12 @@ describe("isModernModelRef", () => {
 
 describe("isHighSignalLiveModelRef", () => {
   it("keeps modern higher-signal Claude families", () => {
-    providerRuntimeMocks.resolveProviderModernModelRef.mockImplementation(({ provider, context }) =>
-      provider === "anthropic" && ["claude-sonnet-4-6", "claude-opus-4-6"].includes(context.modelId)
-        ? true
-        : undefined,
+    providerRuntimeMocks.resolveProviderModernModelRef.mockImplementation(
+      ({ provider, context }) =>
+        provider === "anthropic" &&
+        ["claude-sonnet-4-6", "claude-opus-4-6"].includes(context.modelId)
+          ? true
+          : undefined,
     );
 
     expect(isHighSignalLiveModelRef({ provider: "anthropic", id: "claude-sonnet-4-6" })).toBe(true);
@@ -489,8 +495,9 @@ describe("isHighSignalLiveModelRef", () => {
     expect(isHighSignalLiveModelRef({ provider: "openrouter", id: "google/gemini-2.5-pro" })).toBe(
       false,
     );
+    expect(isHighSignalLiveModelRef({ provider: "google", id: "gemini-3.5-flash" })).toBe(true);
     expect(isHighSignalLiveModelRef({ provider: "google", id: "gemini-3-flash-preview" })).toBe(
-      true,
+      false,
     );
     expect(isHighSignalLiveModelRef({ provider: "google", id: "gemini-3-pro-preview" })).toBe(
       false,
@@ -598,6 +605,12 @@ describe("isHighSignalLiveModelRef", () => {
     ).toBe(false);
     expect(
       isHighSignalLiveModelRef({ provider: "fireworks", id: "accounts/fireworks/models/glm-5p1" }),
+    ).toBe(false);
+    expect(
+      isHighSignalLiveModelRef({
+        provider: "fireworks",
+        id: "accounts/fireworks/routers/glm-5p2-fast",
+      }),
     ).toBe(true);
     expect(
       isHighSignalLiveModelRef({
@@ -633,7 +646,15 @@ describe("isHighSignalLiveModelRef", () => {
   it("keeps only curated xAI routes in the default live matrix", () => {
     providerRuntimeMocks.resolveProviderModernModelRef.mockReturnValue(true);
 
-    expect(isHighSignalLiveModelRef({ provider: "xai", id: "grok-4.3" })).toBe(true);
+    expect(
+      isHighSignalLiveModelRef({ provider: "xai", id: "grok-4.20-beta-latest-reasoning" }),
+    ).toBe(false);
+    expect(isHighSignalLiveModelRef({ provider: "xai", id: "grok-4.20-0309-reasoning" })).toBe(
+      true,
+    );
+    expect(isHighSignalLiveModelRef({ provider: "xai", id: "grok-4.6" })).toBe(true);
+    expect(isHighSignalLiveModelRef({ provider: "xai", id: "grok-4.5" })).toBe(true);
+    expect(isHighSignalLiveModelRef({ provider: "xai", id: "grok-4.3" })).toBe(false);
     expect(isHighSignalLiveModelRef({ provider: "xai", id: "grok-3" })).toBe(false);
     expect(isHighSignalLiveModelRef({ provider: "xai", id: "grok-4-1-fast-non-reasoning" })).toBe(
       false,
@@ -645,8 +666,9 @@ describe("isHighSignalLiveModelRef", () => {
   });
 
   it("keeps DeepSeek V4 models in the default live matrix when the provider marks them modern", () => {
-    providerRuntimeMocks.resolveProviderModernModelRef.mockImplementation(({ provider, context }) =>
-      provider === "deepseek" && context.modelId.startsWith("deepseek-v4") ? true : undefined,
+    providerRuntimeMocks.resolveProviderModernModelRef.mockImplementation(
+      ({ provider, context }) =>
+        provider === "deepseek" && context.modelId.startsWith("deepseek-v4") ? true : undefined,
     );
 
     expect(isHighSignalLiveModelRef({ provider: "deepseek", id: "deepseek-v4-flash" })).toBe(true);
@@ -674,13 +696,15 @@ describe("isPrioritizedHighSignalLiveModelRef", () => {
 
   it("lists priority refs as provider/id pairs", () => {
     expect(listPrioritizedHighSignalLiveModelRefs()).toStrictEqual([
+      { provider: "anthropic", id: "claude-opus-5" },
       { provider: "anthropic", id: "claude-opus-4-8" },
       { provider: "anthropic", id: "claude-sonnet-5" },
       { provider: "anthropic", id: "claude-sonnet-4-6" },
       { provider: "anthropic", id: "claude-opus-4-7" },
       { provider: "google", id: "gemini-3.1-pro-preview" },
-      { provider: "google", id: "gemini-3-flash-preview" },
-      { provider: "moonshot", id: "kimi-k2.7-code" },
+      { provider: "google", id: "gemini-3.5-flash" },
+      { provider: "cohere", id: "command-a-plus-05-2026" },
+      { provider: "moonshot", id: "kimi-k3" },
       { provider: "anthropic", id: "claude-opus-4-6" },
       { provider: "deepseek", id: "deepseek-v4-flash" },
       { provider: "deepseek", id: "deepseek-v4-pro" },
@@ -690,9 +714,11 @@ describe("isPrioritizedHighSignalLiveModelRef", () => {
       { provider: "openrouter", id: "minimax/minimax-m2.7" },
       { provider: "opencode-go", id: "glm-5" },
       { provider: "openrouter", id: "ai21/jamba-large-1.7" },
-      { provider: "xai", id: "grok-4.3" },
+      { provider: "xai", id: "grok-4.6" },
+      { provider: "xai", id: "grok-4.5" },
+      { provider: "xai", id: "grok-4.20-0309-reasoning" },
       { provider: "zai", id: "glm-5.1" },
-      { provider: "fireworks", id: "accounts/fireworks/models/glm-5p1" },
+      { provider: "fireworks", id: "accounts/fireworks/routers/glm-5p2-fast" },
       { provider: "minimax-portal", id: "minimax-m3" },
     ]);
   });
@@ -732,7 +758,7 @@ describe("selectHighSignalLiveItems", () => {
       { provider: "anthropic", id: "claude-opus-4-7" },
       { provider: "anthropic", id: "claude-opus-4-6" },
       { provider: "google", id: "gemini-3.1-pro-preview" },
-      { provider: "google", id: "gemini-3-flash-preview" },
+      { provider: "google", id: "gemini-3.5-flash" },
       { provider: "deepseek", id: "deepseek-v4-flash" },
       { provider: "openai", id: "gpt-5.5" },
       { provider: "opencode", id: "big-pickle" },
@@ -775,12 +801,13 @@ describe("selectHighSignalLiveItems", () => {
     ]);
   });
 
-  it("prioritizes supported Fireworks GLM 5 models over GLM 4.x fallback entries", () => {
+  it("selects the current Fireworks router instead of unavailable base models", () => {
     providerRuntimeMocks.resolveProviderModernModelRef.mockReturnValue(true);
     const items = [
       { provider: "fireworks", id: "accounts/fireworks/models/glm-4p7" },
       { provider: "fireworks", id: "accounts/fireworks/models/glm-5" },
       { provider: "fireworks", id: "accounts/fireworks/models/glm-5p1" },
+      { provider: "fireworks", id: "accounts/fireworks/routers/glm-5p2-fast" },
       { provider: "fireworks", id: "accounts/fireworks/models/gpt-oss-120b" },
     ].filter(isHighSignalLiveModelRef);
 
@@ -791,7 +818,7 @@ describe("selectHighSignalLiveItems", () => {
         (item) => item,
         (item) => item.provider,
       ),
-    ).toEqual([{ provider: "fireworks", id: "accounts/fireworks/models/glm-5p1" }]);
+    ).toEqual([{ provider: "fireworks", id: "accounts/fireworks/routers/glm-5p2-fast" }]);
   });
 });
 

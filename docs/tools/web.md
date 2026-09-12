@@ -37,6 +37,14 @@ xAI Responses.
     This stores the provider and any needed credential. For API-backed
     providers you can instead set the provider's env var (for example
     `BRAVE_API_KEY`) and skip this step.
+
+    You can also configure search by talking to
+    [OpenClaw](/cli/openclaw): say `configure web search` in `openclaw setup`
+    or in the Control UI's **Settings → Ask OpenClaw** chat. The hosted flow
+    owns provider choice and credential entry — API keys are masked in the
+    browser, and the terminal chat hands off to the masked wizard via
+    `open search wizard`.
+
   </Step>
   <Step title="Use it">
     ```javascript
@@ -121,6 +129,85 @@ xAI Responses.
 | [Perplexity](/tools/perplexity-search)           | Structured snippets                                            | Country, language, time, domains, content limits | `PERPLEXITY_API_KEY` / `OPENROUTER_API_KEY`                                             |
 | [SearXNG](/tools/searxng-search)                 | Structured snippets                                            | Categories, language                             | None (self-hosted)                                                                      |
 | [Tavily](/tools/tavily)                          | Structured snippets                                            | Via `tavily_search` tool                         | `TAVILY_API_KEY`                                                                        |
+
+## Result shape
+
+`web_search` normalizes every bundled and external plugin provider at the core
+tool boundary. Callers receive exactly one of these closed shapes:
+
+```typescript
+type WebSearchOutput =
+  | {
+      kind: "error";
+      provider: string;
+      error: "provider_error";
+      message: string;
+      docs?: string;
+    }
+  | {
+      kind: "results";
+      provider: string;
+      query: string;
+      count: number;
+      tookMs?: number;
+      results: Array<{
+        title: string;
+        url: string;
+        snippet?: string;
+        published?: string;
+        siteName?: string;
+      }>;
+      externalContent: {
+        untrusted: true;
+        source: "web_search";
+        wrapped: true;
+        provider: string;
+      };
+      cached?: true;
+    }
+  | {
+      kind: "answer";
+      provider: string;
+      query: string;
+      tookMs?: number;
+      content: string;
+      citations?: Array<{ url: string; title?: string }>;
+      externalContent: {
+        untrusted: true;
+        source: "web_search";
+        wrapped: true;
+        provider: string;
+      };
+      cached?: true;
+    }
+  | {
+      kind: "raw";
+      provider: string;
+      data: unknown;
+    };
+```
+
+Structured providers use `kind: "results"`; synthesized providers use
+`kind: "answer"`. External plugin providers whose payloads match neither shape
+pass through verbatim as `kind: "raw"` for compatibility. Provider-specific
+fields such as raw scores, excerpts, related searches, inline-citation
+offsets, model ids, or session metadata are not passed through on normalized
+branches. Use a provider's dedicated tool when its richer response is part of
+your workflow.
+
+`externalContent.wrapped: true` is a trust marker the boundary itself makes
+true: provider prose (`title`, `snippet`, `siteName`, `content`, citation
+titles, error `message`) is stripped of any pre-existing envelope lines and
+re-wrapped exactly once at the core boundary, so no provider metadata can spoof
+the marker. `query` is always the requested query, citation and result URLs
+must parse as http(s), `published` must be ISO-date shaped, URLs are emitted canonicalized, and a
+payload carrying an `error` key is always reported as `kind: "error"` with the
+raw provider code preserved inside the wrapped message. Raw passthrough
+payloads keep whatever markers the provider set.
+
+Perplexity, Tavily, and xAI HTTP errors retain the status code and bounded
+diagnostics, with reflected request credentials redacted. Review diagnostics
+before sharing them; redaction does not remove every kind of sensitive content.
 
 ## Auto-detection
 
@@ -211,8 +298,10 @@ namespace.
   search; other managed providers remain available
 - Restricting the Codex native tool surface also keeps managed `web_search`
   available
-- When `allowedDomains` is set, automatic managed fallback fails closed if
-  hosted search is unavailable so the native allowlist cannot be bypassed
+- When `allowedDomains` is set, it restricts both hosted `web_search` and
+  managed `web_fetch` on turns where native hosted search is active. Turns
+  using a managed search provider are unchanged. Automatic managed search
+  fallback also fails closed if hosted search is unavailable.
 - Tool-disabled LLM-only runs disable both native and managed search
 - `tools.web.search.enabled: false` disables both managed and native search
 
@@ -294,6 +383,11 @@ trusted proxy owns those synthetic ranges.
   },
 }
 ```
+
+`tools.web.search.cacheTtlMinutes` controls OpenClaw's local search-result
+caches. Set it to `0` to bypass reads and writes, even for previously cached
+queries. A shorter positive TTL limits reuse by entry age; a longer TTL does
+not extend an entry's original expiry. Provider-side caching is separate.
 
 Provider-specific config (API keys, base URLs, modes) lives under
 `plugins.entries.<plugin>.config.webSearch.*`. Gemini can also reuse
@@ -418,6 +512,11 @@ optional structured filters. OpenClaw constructs the built-in xAI `x_search`
 tool per request rather than keeping it permanently registered, so it is only
 active for the turn that actually calls it.
 
+<Warning>
+  `x_search` runs on xAI's servers. xAI bills $5 per 1,000 tool calls, plus the
+  model's input and output tokens.
+</Warning>
+
 <Note>
   xAI documents `x_search` as supporting keyword search, semantic search, user
   search, and thread fetch. For per-post engagement stats such as reposts,
@@ -429,6 +528,13 @@ active for the turn that actually calls it.
 
 ### x_search config
 
+With `enabled` omitted, `x_search` is exposed only when the active model's
+provider is `xai` and xAI credentials resolve. For an active model with a known
+non-xAI provider, set `plugins.entries.xai.config.xSearch.enabled` to `true` to
+opt in to cross-provider use. If the active model provider is missing or
+unresolved, the tool stays hidden. Set `enabled` to `false` to disable it for
+every provider. xAI credentials are always required.
+
 ```json5
 {
   plugins: {
@@ -436,8 +542,8 @@ active for the turn that actually calls it.
       xai: {
         config: {
           xSearch: {
-            enabled: true,
-            model: "grok-4-1-fast-non-reasoning",
+            enabled: true, // required for a known non-xAI model provider
+            model: "grok-4.3",
             baseUrl: "https://api.x.ai/v1", // optional, overrides webSearch.baseUrl
             inlineCitations: false,
             maxTurns: 2,
@@ -458,20 +564,26 @@ active for the turn that actually calls it.
 `x_search` posts to `<baseUrl>/responses` when
 `plugins.entries.xai.config.xSearch.baseUrl` is set. If that field is omitted,
 it falls back to `plugins.entries.xai.config.webSearch.baseUrl`, then the
-legacy `tools.web.search.grok.baseUrl`, and finally the public xAI endpoint
-(`https://api.x.ai/v1`).
+public xAI endpoint (`https://api.x.ai/v1`).
+
+`plugins.entries.xai.config.xSearch.cacheTtlMinutes` controls OpenClaw's local
+`x_search` result cache. Set it to `0` to bypass reads and writes. A shorter TTL
+limits reuse of existing entries; a longer TTL does not extend their original
+expiry.
 
 ### x_search parameters
 
 | Parameter                    | Description                                            |
 | ---------------------------- | ------------------------------------------------------ |
 | `query`                      | Search query (required)                                |
-| `allowed_x_handles`          | Restrict results to specific X handles                 |
-| `excluded_x_handles`         | Exclude specific X handles                             |
+| `allowed_x_handles`          | Restrict results to at most 20 X handles               |
+| `excluded_x_handles`         | Exclude at most 20 X handles                           |
 | `from_date`                  | Only include posts on or after this date (YYYY-MM-DD)  |
 | `to_date`                    | Only include posts on or before this date (YYYY-MM-DD) |
 | `enable_image_understanding` | Let xAI inspect images attached to matching posts      |
 | `enable_video_understanding` | Let xAI inspect videos attached to matching posts      |
+
+`allowed_x_handles` and `excluded_x_handles` are mutually exclusive.
 
 ### x_search example
 
@@ -535,3 +647,4 @@ If you use tool profiles or allowlists, add `web_search`, `x_search`, or `group:
 - [Web Browser](/tools/browser) -- full browser automation for JS-heavy sites
 - [Grok Search](/tools/grok-search) -- Grok as the `web_search` provider
 - [Ollama Web Search](/tools/ollama-search) -- key-free web search through your Ollama host
+- [Moonshot AI](/providers/moonshot) -- Kimi as the `web_search` provider

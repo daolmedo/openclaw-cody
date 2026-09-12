@@ -2,12 +2,14 @@ package ai.openclaw.app.node
 
 import ai.openclaw.app.LocationMode
 import android.content.Context
+import android.location.Location
 import android.location.LocationManager
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.test.runTest
-import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 class LocationHandlerTest : NodeHandlerRobolectricTest() {
@@ -58,7 +60,6 @@ class LocationHandlerTest : NodeHandlerRobolectricTest() {
           fineGranted = false,
           coarseGranted = true,
           backgroundGranted = true,
-          payload = LocationCaptureManager.Payload("""{"ok":true}"""),
         )
       val handler =
         LocationHandler.forTesting(
@@ -123,7 +124,6 @@ class LocationHandlerTest : NodeHandlerRobolectricTest() {
         FakeLocationDataSource(
           fineGranted = true,
           coarseGranted = true,
-          payload = LocationCaptureManager.Payload("""{"ok":true}"""),
         )
       val handler =
         LocationHandler.forTesting(
@@ -138,7 +138,6 @@ class LocationHandlerTest : NodeHandlerRobolectricTest() {
       assertEquals(listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER), source.lastDesiredProviders)
       assertEquals(1234L, source.lastMaxAgeMs)
       assertEquals(2000L, source.lastTimeoutMs)
-      assertTrue(source.lastIsPrecise)
     }
 
   @Test
@@ -148,7 +147,6 @@ class LocationHandlerTest : NodeHandlerRobolectricTest() {
         FakeLocationDataSource(
           fineGranted = false,
           coarseGranted = true,
-          payload = LocationCaptureManager.Payload("""{"ok":true}"""),
         )
       val handler =
         LocationHandler.forTesting(
@@ -161,7 +159,6 @@ class LocationHandlerTest : NodeHandlerRobolectricTest() {
 
       assertTrue(result.ok)
       assertEquals(listOf(LocationManager.NETWORK_PROVIDER, LocationManager.GPS_PROVIDER), source.lastDesiredProviders)
-      assertFalse(source.lastIsPrecise)
     }
 
   @Test
@@ -205,20 +202,40 @@ class LocationHandlerTest : NodeHandlerRobolectricTest() {
       assertEquals("LOCATION_UNAVAILABLE", result.error?.code)
       assertEquals("gps offline", result.error?.message)
     }
+
+  @Test
+  fun handleLocationGet_propagatesParentCancellation() =
+    runTest {
+      val handler =
+        LocationHandler.forTesting(
+          appContext = appContext(),
+          dataSource =
+            FakeLocationDataSource(
+              fineGranted = true,
+              coarseGranted = true,
+              failure = CancellationException("request retired"),
+            ),
+        )
+
+      try {
+        handler.handleLocationGet(null)
+        fail("expected cancellation to propagate")
+      } catch (err: CancellationException) {
+        assertEquals("request retired", err.message)
+      }
+    }
 }
 
 private class FakeLocationDataSource(
   private val fineGranted: Boolean,
   private val coarseGranted: Boolean,
   private val backgroundGranted: Boolean = false,
-  private val payload: LocationCaptureManager.Payload? = null,
   private val failure: Throwable? = null,
   private val timeout: Boolean = false,
 ) : LocationDataSource {
   var lastDesiredProviders: List<String> = emptyList()
   var lastMaxAgeMs: Long? = null
   var lastTimeoutMs: Long? = null
-  var lastIsPrecise: Boolean = false
 
   override fun hasFinePermission(context: Context): Boolean = fineGranted
 
@@ -230,18 +247,20 @@ private class FakeLocationDataSource(
     desiredProviders: List<String>,
     maxAgeMs: Long?,
     timeoutMs: Long,
-    isPrecise: Boolean,
-  ): LocationCaptureManager.Payload {
+  ): Location {
     lastDesiredProviders = desiredProviders
     lastMaxAgeMs = maxAgeMs
     lastTimeoutMs = timeoutMs
-    lastIsPrecise = isPrecise
     if (timeout) {
       kotlinx.coroutines.withTimeout(1) {
         kotlinx.coroutines.delay(5)
       }
     }
     failure?.let { throw it }
-    return payload ?: LocationCaptureManager.Payload(Json.encodeToString(mapOf("ok" to true)))
+    return Location(LocationManager.GPS_PROVIDER).apply {
+      latitude = 12.345678
+      longitude = 45.678912
+      accuracy = 5f
+    }
   }
 }

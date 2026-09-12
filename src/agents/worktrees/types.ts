@@ -1,5 +1,25 @@
 export type ManagedWorktreeOwnerKind = "manual" | "workboard" | "session";
 
+export type ManagedWorktreeRunEndCleanupOutcome =
+  | "removed-lossless"
+  | "retained-busy"
+  | "retained-dirty"
+  | "retained-unpushed"
+  | "retained-provisioned-drift"
+  | "failed";
+
+export type ManagedWorktreeRunEndCleanup = {
+  outcome: ManagedWorktreeRunEndCleanupOutcome;
+  at: number;
+  reason?: string;
+};
+
+export type ProvisionedFileState = {
+  path: string;
+  mode: number | null;
+  chunks: number;
+};
+
 export type ManagedWorktreeRecord = {
   id: string;
   name: string;
@@ -14,23 +34,46 @@ export type ManagedWorktreeRecord = {
   createdAt: number;
   lastActiveAt: number;
   removedAt?: number;
+  runEndCleanup?: ManagedWorktreeRunEndCleanup;
 };
 
 export type CreateManagedWorktreeParams = {
   repoRoot: string;
   name?: string;
+  /** Derived default name; collisions receive a stable numeric suffix. */
+  suggestedName?: string;
   baseRef?: string;
+  /** Verified immutable checkout point when baseRef retains the publication target. */
+  checkoutCommit?: string;
   ownerKind?: ManagedWorktreeOwnerKind;
   ownerId?: string;
-  // Running .openclaw/worktree-setup.sh executes repo-local code, so callers reachable from
-  // less-privileged surfaces (write-scoped session worktrees) opt out; admin paths keep it on.
+  // Repository Git hooks are always disabled; only the setup script runs repo-local code.
   runSetupScript?: boolean;
+  signal?: AbortSignal;
+  onProgress?: (phase: "checkout" | "setup") => void;
+  /** Synchronous caller-authority guard checked at allocation commit boundaries. */
+  commitGuard?: () => void;
 };
 
 export type RemoveManagedWorktreeResult = {
   removed: boolean;
   snapshotRef?: string;
   snapshotError?: string;
+};
+
+export type ManagedWorktreeBranch = {
+  name: string;
+  kind: "local" | "remote";
+};
+
+type ManagedWorktreeRepositoryStatus = "git" | "not_git" | "unavailable";
+
+export type ManagedWorktreeBranchesResult = {
+  branches: ManagedWorktreeBranch[];
+  defaultBranch?: string;
+  headBranch?: string;
+  repositoryStatus?: ManagedWorktreeRepositoryStatus;
+  branchesUnavailable?: boolean;
 };
 
 export type ManagedWorktreeGcResult = {

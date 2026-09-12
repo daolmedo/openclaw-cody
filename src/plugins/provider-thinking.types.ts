@@ -10,7 +10,7 @@ export type ProviderThinkingPolicyContext = {
   modelId: string;
 };
 
-export type ProviderThinkingModelCompat = {
+type ProviderThinkingModelCompat = {
   thinkingFormat?: string;
   supportedReasoningEfforts?: readonly string[] | null;
 };
@@ -29,12 +29,14 @@ export type ProviderThinkingModelCompat = {
 export type ProviderDefaultThinkingPolicyContext = ProviderThinkingPolicyContext & {
   /** Effective agent runtime selected for this model, when known. */
   agentRuntime?: string | null;
+  /** API adapter id from the selected catalog route, when known. */
+  api?: string | null;
   reasoning?: boolean;
   params?: Record<string, unknown>;
   compat?: ProviderThinkingModelCompat | null;
 };
 
-export type ProviderThinkingLevelId =
+type ProviderThinkingLevelId =
   | "off"
   | "minimal"
   | "low"
@@ -45,7 +47,7 @@ export type ProviderThinkingLevelId =
   | "max"
   | "ultra";
 
-export type ProviderThinkingLevel = {
+type ProviderThinkingLevel = {
   id: ProviderThinkingLevelId;
   /**
    * Optional display label. Use this when the stored value differs from the
@@ -70,3 +72,22 @@ export type ProviderThinkingProfile = {
    */
   preserveWhenCatalogReasoningFalse?: boolean;
 };
+
+/** Prepared provider policy ownership, without the broader Gateway registry contract. */
+export type ProviderThinkingRegistry = {
+  providers: ReadonlyArray<{
+    provider: {
+      id: string;
+      aliases?: string[];
+      hookAliases?: string[];
+      resolveThinkingProfile?: (
+        context: ProviderDefaultThinkingPolicyContext,
+      ) => ProviderThinkingProfile | null | undefined;
+    };
+  }>;
+};
+
+export type ProviderThinkingPolicySource =
+  | "active"
+  | "active-or-bundled"
+  | ProviderThinkingRegistry;

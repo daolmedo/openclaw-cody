@@ -1,9 +1,12 @@
 // Browser tests cover agent.shared plugin behavior.
 import { describe, expect, it, vi } from "vitest";
+import { BrowserProfileUnavailableError, toBrowserErrorResponse } from "../errors.js";
+import * as navigationGuard from "../navigation-guard.js";
 import type { BrowserRouteContext, ProfileContext } from "../server-context.js";
 import "../../test-support/browser-security.mock.js";
 import {
   readBody,
+  handleRouteError,
   resolveSafeRouteTabUrl,
   resolveTargetIdFromBody,
   resolveTargetIdFromQuery,
@@ -71,6 +74,45 @@ function routeContextForTab(
 }
 
 describe("browser route shared helpers", () => {
+  it("preserves structured browser errors on agent routes", () => {
+    const response = createBrowserRouteResponse();
+    const error = new BrowserProfileUnavailableError("display required", {
+      metadata: {
+        reason: "no_display_for_headed_profile",
+        details: {
+          profile: "openclaw",
+          requestedHeadless: false,
+          headlessSource: "env",
+          displayPresent: false,
+        },
+      },
+    });
+
+    handleRouteError({ mapTabError: toBrowserErrorResponse } as never, response.res, error);
+
+    expect(response.statusCode).toBe(409);
+    expect(response.body).toMatchObject({
+      error: "display required",
+      reason: "no_display_for_headed_profile",
+      details: { headlessSource: "env" },
+    });
+  });
+
+  it("redacts credentials from unmapped route errors", () => {
+    const response = createBrowserRouteResponse();
+    const error = new Error(
+      "connect failed for wss://browser-user:browser-password@browserless.example/cdp?token=browser-token",
+    );
+
+    handleRouteError({ mapTabError: () => null } as never, response.res, error);
+
+    expect(response.statusCode).toBe(500);
+    expect(response.body).toMatchObject({ error: expect.stringContaining("browserless.example") });
+    expect(JSON.stringify(response.body)).not.toContain("browser-user");
+    expect(JSON.stringify(response.body)).not.toContain("browser-password");
+    expect(JSON.stringify(response.body)).not.toContain("browser-token");
+  });
+
   describe("readBody", () => {
     it("returns object bodies", () => {
       expect(readBody(requestWithBody({ one: 1 }))).toEqual({ one: 1 });
@@ -133,6 +175,32 @@ describe("browser route shared helpers", () => {
         }),
       ).resolves.toBeUndefined();
     });
+
+    it("propagates cancelled URL verification instead of returning a redacted URL", async () => {
+      const controller = new AbortController();
+      const reason = new Error("browser navigation verification deadline expired");
+      const guard = vi
+        .spyOn(navigationGuard, "assertBrowserNavigationResultAllowed")
+        .mockImplementationOnce(async () => {
+          controller.abort(reason);
+          throw reason;
+        });
+      try {
+        await expect(
+          resolveSafeRouteTabUrl({
+            ctx: routeContext() as never,
+            profileCtx: profileContext([
+              { targetId: "tab-1", url: "https://example.com/current" },
+            ]) as never,
+            targetId: "tab-1",
+            signal: controller.signal,
+          }),
+        ).rejects.toBe(reason);
+        expect(guard).toHaveBeenCalledWith(expect.objectContaining({ signal: controller.signal }));
+      } finally {
+        guard.mockRestore();
+      }
+    });
   });
 
   describe("withRouteTabContext", () => {
@@ -154,7 +222,7 @@ describe("browser route shared helpers", () => {
 
       expect(ensureTabAvailable).toHaveBeenCalledWith(undefined, {
         allowPlaywrightFallback: true,
-        signal: undefined,
+        signal: expect.any(AbortSignal),
         timeoutMs: 60_000,
       });
     });

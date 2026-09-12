@@ -3,6 +3,7 @@
  * tools.
  */
 import path from "node:path";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import type { Page } from "playwright-core";
 import { resolvePreferredOpenClawTmpDir } from "../infra/tmp-openclaw-dir.js";
 import { DEFAULT_BROWSER_DOWNLOAD_TIMEOUT_MS } from "./constants.js";
@@ -18,6 +19,15 @@ import {
   restoreRoleRefsForTarget,
 } from "./pw-session.js";
 import {
+  clickViaPlaywright,
+  setFileChooserFilesViaPlaywright,
+} from "./pw-tools-core.interactions.js";
+import {
+  awaitActionWithAbort,
+  createAbortPromiseWithListener,
+  type NavigationTargetOptions,
+} from "./pw-tools-core.interactions.navigation.js";
+import {
   bumpDownloadArmId,
   bumpUploadArmId,
   normalizeTimeoutMs,
@@ -25,12 +35,24 @@ import {
   toAIFriendlyError,
 } from "./pw-tools-core.shared.js";
 
+async function dismissFileChooser(page: Page): Promise<void> {
+  await page.keyboard.press("Escape").catch(() => {});
+}
+
+type ActiveUpload = {
+  controller: AbortController;
+  settled: Promise<void>;
+};
+
+const activeUploads = new WeakMap<Page, ActiveUpload>();
+
 function createExplicitDownloadCapture(params: {
   page: Page;
   state: ReturnType<typeof ensurePageState>;
   timeoutMs: number;
   outPath?: string;
   rootDir?: string;
+  signal?: AbortSignal;
 }) {
   params.state.armIdDownload = bumpDownloadArmId();
   const armId = params.state.armIdDownload;
@@ -38,6 +60,7 @@ function createExplicitDownloadCapture(params: {
     mode: "explicit",
     outputPath: params.outPath,
     outputRoot: params.rootDir,
+    signal: params.signal,
     beforeSave: () => {
       if (params.state.armIdDownload !== armId) {
         throw new Error("Download was superseded by another waiter");
@@ -50,67 +73,156 @@ function resolveImplicitDownloadRoot(): string {
   return path.join(resolvePreferredOpenClawTmpDir(), "downloads");
 }
 
-/** Arms the next page file chooser and fills it with strict existing paths. */
-export async function armFileUploadViaPlaywright(opts: {
-  cdpUrl: string;
-  targetId?: string;
+type UploadOptions = NavigationTargetOptions & {
+  ref?: string;
   paths?: string[];
   timeoutMs?: number;
-}): Promise<void> {
-  const page = await getPageForTargetId(opts);
-  const state = ensurePageState(page);
+  signal?: AbortSignal;
+};
+
+async function runFileUpload(opts: UploadOptions): Promise<void> {
+  opts.signal?.throwIfAborted();
+  const atomic = opts.ref !== undefined;
+  const armId = bumpUploadArmId();
   const timeout = normalizeTimeoutMs(opts.timeoutMs, DEFAULT_BROWSER_DOWNLOAD_TIMEOUT_MS);
-
-  state.armIdUpload = bumpUploadArmId();
-  const armId = state.armIdUpload;
-
-  // The waiter is intentionally detached: the tool call arms future browser UI,
-  // while the later user click opens the chooser.
-  void page
-    .waitForEvent("filechooser", { timeout })
-    .then(async (fileChooser) => {
-      if (state.armIdUpload !== armId) {
-        return;
+  const controller = new AbortController();
+  const signal = opts.signal
+    ? AbortSignal.any([opts.signal, controller.signal])
+    : controller.signal;
+  const { abortPromise, cleanup } = createAbortPromiseWithListener(signal);
+  const armed = createDeferred<void>();
+  let started = false;
+  let deadline = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const startDeadline = () => {
+    deadline = Date.now() + timeout;
+    timer = setTimeout(
+      () =>
+        controller.abort(new Error(`Timeout ${timeout}ms exceeded while completing file upload`)),
+      timeout,
+    );
+  };
+  if (atomic) {
+    startDeadline();
+  }
+  const completion = (async () => {
+    const page = await awaitActionWithAbort(getPageForTargetId(opts), abortPromise);
+    signal.throwIfAborted();
+    const state = ensurePageState(page);
+    // Page lookup may finish out of order. Only a newer request can replace
+    // this page's owner; unrelated tabs share no chooser or cleanup queue.
+    if (state.armIdUpload > armId) {
+      throw new Error("File upload was superseded by another waiter");
+    }
+    state.armIdUpload = armId;
+    const previous = activeUploads.get(page);
+    const execution = Promise.resolve().then(async () => {
+      // A cancelled queued caller may return early, but its successor must
+      // still join every older native action before installing a new waiter.
+      await previous?.settled;
+      signal.throwIfAborted();
+      started = true;
+      if (!atomic) {
+        startDeadline();
       }
-      if (!opts.paths?.length) {
-        // Playwright removed `FileChooser.cancel()`; best-effort close the chooser instead.
-        try {
-          await page.keyboard.press("Escape");
-        } catch {
-          // Best-effort.
-        }
-        return;
-      }
-      const uploadPathsResult = await resolveStrictExistingUploadPaths({
-        requestedPaths: opts.paths,
-      });
-      if (!uploadPathsResult.ok) {
-        try {
-          await page.keyboard.press("Escape");
-        } catch {
-          // Best-effort.
-        }
-        return;
-      }
-      await fileChooser.setFiles(uploadPathsResult.paths);
+      const chooser = page.waitForEvent("filechooser", { timeout: 0, signal });
+      void chooser.catch(() => {});
+      armed.resolve();
       try {
-        const input =
-          typeof fileChooser.element === "function"
-            ? await Promise.resolve(fileChooser.element())
-            : null;
-        if (input) {
-          await input.evaluate((el) => {
-            el.dispatchEvent(new Event("input", { bubbles: true }));
-            el.dispatchEvent(new Event("change", { bubbles: true }));
+        if (atomic) {
+          await clickViaPlaywright({
+            ...opts,
+            ref: opts.ref!,
+            timeoutMs: Math.max(1, deadline - Date.now()),
+            resolvedPage: page,
+            signal,
           });
         }
-      } catch {
-        // Best-effort for sites that don't react to setFiles alone.
+        const fileChooser = await chooser;
+        signal.throwIfAborted();
+        let paths = opts.paths ?? [];
+        if (!atomic) {
+          const resolved = await awaitActionWithAbort(
+            resolveStrictExistingUploadPaths({ requestedPaths: paths }),
+            abortPromise,
+          );
+          signal.throwIfAborted();
+          if (!paths.length || !resolved.ok) {
+            await dismissFileChooser(page);
+            return;
+          }
+          paths = resolved.paths;
+        }
+        await setFileChooserFilesViaPlaywright({
+          ...opts,
+          page,
+          fileChooser,
+          paths,
+          timeoutMs: Math.max(1, deadline - Date.now()),
+          signal,
+        });
+        signal.throwIfAborted();
+      } catch (error) {
+        controller.abort(error);
+        if (
+          error instanceof Error &&
+          error.name === "AbortError" &&
+          error.cause === signal.reason
+        ) {
+          signal.throwIfAborted();
+        }
+        throw error;
+      } finally {
+        await chooser.catch(() => {});
       }
-    })
-    .catch(() => {
-      // Ignore timeouts; the chooser may never appear.
     });
+    const active = {
+      controller,
+      settled: execution.then(
+        () => {},
+        () => {},
+      ),
+    };
+    activeUploads.set(page, active);
+    previous?.controller.abort(new Error("File upload was superseded by another waiter"));
+    try {
+      await execution;
+    } finally {
+      if (activeUploads.get(page) === active) {
+        activeUploads.delete(page);
+      }
+    }
+  })().finally(() => {
+    clearTimeout(timer);
+    cleanup();
+  });
+  // Passive arming intentionally outlives this call; its errors are contained.
+  void completion.catch(() => {});
+  try {
+    await awaitActionWithAbort(
+      atomic ? completion : Promise.race([armed.promise, completion]),
+      abortPromise,
+    );
+  } catch (error) {
+    if (atomic && started) {
+      await completion;
+    }
+    throw error;
+  }
+}
+
+/** Arms the next page file chooser and fills it with strict existing paths. */
+export async function armFileUploadViaPlaywright(
+  opts: Omit<UploadOptions, "ref" | "signal">,
+): Promise<void> {
+  await runFileUpload(opts);
+}
+
+/** Clicks a ref and completes its file chooser as one request-owned operation. */
+export async function uploadViaPlaywright(
+  opts: UploadOptions & { ref: string; paths: string[] },
+): Promise<void> {
+  await runFileUpload(opts);
 }
 
 /** Accepts or dismisses a pending dialog, or arms the next matching dialog response. */
@@ -153,6 +265,7 @@ export async function waitForDownloadViaPlaywright(opts: {
   targetId?: string;
   path?: string;
   rootDir?: string;
+  signal?: AbortSignal;
   timeoutMs?: number;
 }): Promise<BrowserDownloadResult> {
   const page = await getPageForTargetId(opts);
@@ -165,13 +278,9 @@ export async function waitForDownloadViaPlaywright(opts: {
     timeoutMs: timeout,
     outPath: opts.path,
     rootDir: opts.path?.trim() ? opts.rootDir : (opts.rootDir ?? resolveImplicitDownloadRoot()),
+    signal: opts.signal,
   });
-  try {
-    return await capture.promise;
-  } catch (err) {
-    capture.cancel();
-    throw err;
-  }
+  return await capture.promise;
 }
 
 /** Clicks an element ref and saves the download triggered by that click. */
@@ -181,6 +290,7 @@ export async function downloadViaPlaywright(opts: {
   ref: string;
   path: string;
   rootDir?: string;
+  signal?: AbortSignal;
   timeoutMs?: number;
 }): Promise<BrowserDownloadResult> {
   const page = await getPageForTargetId(opts);
@@ -200,17 +310,17 @@ export async function downloadViaPlaywright(opts: {
     timeoutMs: timeout,
     outPath,
     rootDir: opts.rootDir,
+    signal: opts.signal,
   });
+  void capture.promise.catch(() => {});
   try {
     const locator = refLocator(page, ref);
-    try {
-      await locator.click({ timeout });
-    } catch (err) {
-      throw toAIFriendlyError(err, ref);
-    }
-    return await capture.promise;
+    await locator.click({ timeout, signal: opts.signal });
   } catch (err) {
     capture.cancel();
-    throw err;
+    throw opts.signal?.aborted && opts.signal.reason instanceof Error
+      ? opts.signal.reason
+      : toAIFriendlyError(err, ref);
   }
+  return await capture.promise;
 }

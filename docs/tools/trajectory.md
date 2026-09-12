@@ -4,7 +4,7 @@ read_when:
   - Debugging why an agent answered, failed, or called tools a certain way
   - Exporting a support bundle for an OpenClaw session
   - Investigating prompt context, tool calls, runtime errors, or usage metadata
-  - Disabling or relocating trajectory capture
+  - Disabling trajectory capture
 title: "Trajectory bundles"
 ---
 
@@ -52,7 +52,8 @@ results, runtime events, and local paths, so the chat command always runs
 through exec approval. Approve the export once when you intend to create the
 bundle; do not use allow-all. In group chats, OpenClaw sends the approval
 prompt and export result to the owner privately instead of posting trajectory
-details back to the shared room.
+details back to the shared room. The room receives only a status notice that
+distinguishes confirmed, pending, and suppressed private delivery.
 
 For local inspection or support workflows, run the underlying CLI command
 directly:
@@ -80,6 +81,8 @@ Runtime events include:
 - `trace.metadata`
 - `context.compiled`
 - `prompt.submitted`
+- `tool.call`, with the tool identity and sanitized arguments
+- `tool.result`, with the sanitized result and execution outcome
 - `model.fallback_step`, including the source model, next model, failure reason/detail, chain position, and whether the chain advanced, succeeded, or was exhausted
 - `model.completed`
 - `trace.artifacts`
@@ -114,31 +117,15 @@ Events are written as JSON Lines with this schema marker:
 `manifest.json` lists the files present in a given bundle; some files are
 omitted when the session did not capture the corresponding runtime data.
 
-## Capture location
+## Capture storage
 
-By default, runtime trajectory events are written beside the session file:
+Runtime trajectory events are stored with the session in the per-agent SQLite
+database. Exporting a trajectory materializes a redacted JSONL support bundle;
+the live runtime capture is not a session-adjacent JSONL sidecar.
 
-```text
-<session>.trajectory.jsonl
-```
-
-OpenClaw also writes a best-effort pointer file beside the session:
-
-```text
-<session>.trajectory-path.json
-```
-
-Set `OPENCLAW_TRAJECTORY_DIR` to store runtime trajectory sidecars in a
-dedicated directory instead, one JSONL file per session id:
-
-```bash
-export OPENCLAW_TRAJECTORY_DIR=/var/lib/openclaw/trajectories
-```
-
-Session maintenance removes trajectory sidecars when their owning session
-entry is pruned, capped, or evicted by the sessions disk budget. Runtime files
-outside the sessions directory are removed only when the pointer target still
-proves it belongs to that session.
+Legacy `.trajectory.jsonl` and `.trajectory-path.json` files may still appear
+from older releases or explicit legacy-file exports. Session maintenance treats
+those files as cleanup targets; active capture writes database rows.
 
 ## Disable capture
 
@@ -148,12 +135,12 @@ export OPENCLAW_TRAJECTORY=0
 
 This disables runtime trajectory capture before starting OpenClaw.
 `/export-trajectory` can still export the transcript branch, but runtime-only
-files such as compiled context, provider artifacts, and prompt metadata may be
+data such as compiled context, provider artifacts, and prompt metadata may be
 missing.
 
 ## Tune flush timeout
 
-OpenClaw flushes runtime trajectory sidecars during agent cleanup. The default
+OpenClaw flushes runtime trajectory rows during agent cleanup. The default
 cleanup timeout is 10,000 ms. On slow disks or large stores, set
 `OPENCLAW_TRAJECTORY_FLUSH_TIMEOUT_MS` before starting OpenClaw:
 
@@ -179,7 +166,7 @@ redacts sensitive values before writing export files:
 
 The exporter also bounds input size:
 
-- runtime sidecar files: the live capture file is a rolling window capped at 10 MiB, dropping the oldest events to make room for new ones; export accepts existing runtime sidecar files up to 50 MiB
+- runtime capture: the live capture is a rolling window capped at 10 MiB, dropping the oldest events to make room for new ones; export accepts existing legacy runtime sidecar files up to 50 MiB
 - session files: 50 MiB
 - runtime events per export: 200,000
 - total exported events: 250,000
@@ -193,7 +180,6 @@ and cannot know every application-specific secret.
 If the export has no runtime events:
 
 - confirm OpenClaw was started without `OPENCLAW_TRAJECTORY=0`
-- check whether `OPENCLAW_TRAJECTORY_DIR` points to a writable directory
 - run another message in the session, then export again
 - inspect `manifest.json` for `runtimeEventCount`
 
@@ -212,3 +198,4 @@ reproduction.
 - [Diffs](/tools/diffs)
 - [Session management](/concepts/session)
 - [Exec tool](/tools/exec)
+- [Codex harness runtime](/plugins/codex-harness-runtime)

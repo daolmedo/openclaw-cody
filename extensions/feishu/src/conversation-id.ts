@@ -1,5 +1,8 @@
 // Feishu plugin module implements conversation id behavior.
-import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString as normalizeText,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 
 export type FeishuGroupSessionScope =
   | "group"
@@ -24,14 +27,6 @@ export function resolveConfiguredFeishuGroupSessionScope(params: {
     params.feishuCfg?.groupSessionScope ??
     (legacyTopicSessionMode === "enabled" ? "group_topic" : "group")
   );
-}
-
-function normalizeText(value: unknown): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const trimmed = value.trim();
-  return trimmed || undefined;
 }
 
 export function buildFeishuConversationId(params: {
@@ -124,6 +119,9 @@ export function parseFeishuConversationId(params: {
   const topicSenderMatch = conversationId.match(/^(.+):topic:([^:]+):sender:([^:]+)$/i);
   if (topicSenderMatch) {
     const [, chatId, topicId, senderOpenId] = topicSenderMatch;
+    if (chatId === undefined || topicId === undefined || senderOpenId === undefined) {
+      return null;
+    }
     return {
       canonicalConversationId: buildFeishuConversationId({
         chatId,
@@ -141,6 +139,9 @@ export function parseFeishuConversationId(params: {
   const topicMatch = conversationId.match(/^(.+):topic:([^:]+)$/i);
   if (topicMatch) {
     const [, chatId, topicId] = topicMatch;
+    if (chatId === undefined || topicId === undefined) {
+      return null;
+    }
     return {
       canonicalConversationId: buildFeishuConversationId({
         chatId,
@@ -156,6 +157,9 @@ export function parseFeishuConversationId(params: {
   const senderMatch = conversationId.match(/^(.+):sender:([^:]+)$/i);
   if (senderMatch) {
     const [, chatId, senderOpenId] = senderMatch;
+    if (chatId === undefined || senderOpenId === undefined) {
+      return null;
+    }
     return {
       canonicalConversationId: buildFeishuConversationId({
         chatId,

@@ -1,16 +1,32 @@
 // Matrix tests cover thread context plugin behavior.
 import { describe, expect, it, vi } from "vitest";
-import { createPollStartEvent } from "./test-events.js";
 import {
-  createMatrixThreadContextResolver,
-  summarizeMatrixThreadStarterEvent,
-} from "./thread-context.js";
+  bundledReplacementContentCases,
+  createBundledReplacementEvent,
+  createPollStartEvent,
+  invalidBundledReplacementCases,
+} from "./test-events.js";
+import { createMatrixThreadContextResolver } from "./thread-context.js";
 import type { MatrixRawEvent } from "./types.js";
 
+async function resolveThreadSummary(event: MatrixRawEvent): Promise<string | undefined> {
+  const resolveThreadContext = createMatrixThreadContextResolver({
+    client: { getEvent: vi.fn(async () => event) } as never,
+    getMemberDisplayName: vi.fn(async () => "Alice"),
+    logVerboseMessage: () => {},
+  });
+  return (
+    await resolveThreadContext({
+      roomId: "!room:example.org",
+      threadRootId: event.event_id ?? "$root",
+    })
+  ).summary;
+}
+
 describe("matrix thread context", () => {
-  it("summarizes thread starter events from body text", () => {
+  it("summarizes thread starter events from body text", async () => {
     expect(
-      summarizeMatrixThreadStarterEvent({
+      await resolveThreadSummary({
         event_id: "$root",
         sender: "@alice:example.org",
         type: "m.room.message",
@@ -23,8 +39,34 @@ describe("matrix thread context", () => {
     ).toBe("Thread starter body");
   });
 
-  it("truncates long thread starter bodies on code-point boundaries", () => {
-    const summary = summarizeMatrixThreadStarterEvent({
+  it.each(bundledReplacementContentCases)(
+    "uses the latest bundled $name when summarizing an edited thread root",
+    async ({ options, expected }) => {
+      expect(await resolveThreadSummary(createBundledReplacementEvent("$root", options))).toBe(
+        expected,
+      );
+    },
+  );
+
+  it.each(invalidBundledReplacementCases)(
+    "does not summarize a bundled thread-root replacement from $name",
+    async ({ options }) => {
+      expect(await resolveThreadSummary(createBundledReplacementEvent("$root", options))).toBe(
+        "original text",
+      );
+    },
+  );
+
+  it("does not revive a bundled replacement from a redacted thread root", async () => {
+    expect(
+      await resolveThreadSummary(
+        createBundledReplacementEvent("$root", { content: {}, redacted: true }),
+      ),
+    ).toBe("Matrix m.room.message event");
+  });
+
+  it("truncates long thread starter bodies on code-point boundaries", async () => {
+    const summary = await resolveThreadSummary({
       event_id: "$root",
       sender: "@alice:example.org",
       type: "m.room.message",
@@ -40,9 +82,9 @@ describe("matrix thread context", () => {
     expect(summary && /[\uD800-\uDFFF]/.test(summary)).toBe(false);
   });
 
-  it("marks media-only thread starter events instead of returning bare filenames", () => {
+  it("marks media-only thread starter events instead of returning bare filenames", async () => {
     expect(
-      summarizeMatrixThreadStarterEvent({
+      await resolveThreadSummary({
         event_id: "$root",
         sender: "@alice:example.org",
         type: "m.room.message",
@@ -144,8 +186,8 @@ describe("matrix thread context", () => {
     expect(getMemberDisplayName).toHaveBeenCalledTimes(1);
   });
 
-  it("summarizes poll start thread roots from poll content", () => {
-    expect(summarizeMatrixThreadStarterEvent(createPollStartEvent("$root"))).toBe(
+  it("summarizes poll start thread roots from poll content", async () => {
+    expect(await resolveThreadSummary(createPollStartEvent("$root"))).toBe(
       "[Poll]\nLunch?\n\n1. Pizza\n2. Sushi",
     );
   });

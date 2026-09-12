@@ -1,4 +1,4 @@
-// Control UI chat module implements realtime talk shared behavior.
+import type { TalkClientToolCallResult } from "../../../../packages/gateway-protocol/src/schema/channels.js";
 import { REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME } from "../../../../src/talk/agent-consult-tool.js";
 import {
   buildRealtimeVoiceAgentCancelProviderResult,
@@ -8,19 +8,46 @@ import {
   shouldAutoControlRealtimeVoiceAgentText,
 } from "../../../../src/talk/agent-run-control-shared.js";
 import type { RealtimeVoiceAgentControlMode } from "../../../../src/talk/agent-run-control-shared.js";
+import type { RealtimeVoiceBrowserSession } from "../../../../src/talk/provider-types.js";
 import type { TalkEvent } from "../../../../src/talk/talk-events.js";
 import type { GatewayBrowserClient, GatewayEventFrame } from "../../api/gateway.ts";
+// Control UI chat module implements realtime talk shared behavior.
+import { formatUiError } from "../../lib/format-error.ts";
+import type { RealtimeTalkInputController } from "./realtime-talk-input.ts";
 
 export type RealtimeTalkStatus = "idle" | "connecting" | "listening" | "thinking" | "error";
 export type RealtimeTalkEvent = TalkEvent;
 
-export type RealtimeTalkCallbacks = {
-  onStatus?: (status: RealtimeTalkStatus, detail?: string) => void;
-  onTranscript?: (entry: { role: "user" | "assistant"; text: string; final: boolean }) => void;
-  onTalkEvent?: (event: RealtimeTalkEvent) => void;
+export type RealtimeTalkTranscript = {
+  role: "user" | "assistant";
+  text: string;
+  final: boolean;
+  itemId?: string;
+  order?: number;
 };
 
-type RealtimeTalkEventInput<TPayload = unknown> = {
+export type RealtimeTalkTranscriptItem =
+  | {
+      type: "created";
+      itemId: string;
+      previousItemId?: string | null;
+      role: "user" | "assistant" | null;
+    }
+  | { type: "settled"; itemId: string };
+
+export type RealtimeTalkCallbacks = {
+  onStatus?: (status: RealtimeTalkStatus, detail?: string) => void;
+  onVideoCapability?: (capable: boolean) => void;
+  onInputLevel?: (level: number) => void;
+  onTranscript?: (entry: RealtimeTalkTranscript) => void;
+  onTranscriptOrder?: (items: ReadonlyArray<{ itemId: string; order: number }>) => void;
+  onTranscriptItem?: (item: RealtimeTalkTranscriptItem) => void;
+  onTalkEvent?: (event: RealtimeTalkEvent) => void;
+  onVideoStream?: (stream: MediaStream | null) => void;
+  onVideoError?: (error: unknown) => void;
+};
+
+export type RealtimeTalkEventInput<TPayload = unknown> = {
   type: RealtimeTalkEvent["type"];
   payload?: TPayload;
   turnId?: string;
@@ -31,81 +58,45 @@ type RealtimeTalkEventInput<TPayload = unknown> = {
   parentId?: string;
 };
 
-type RealtimeTalkAudioContract = {
-  inputEncoding: "pcm16" | "g711_ulaw";
-  inputSampleRateHz: number;
-  outputEncoding: "pcm16" | "g711_ulaw";
-  outputSampleRateHz: number;
-};
-
-export type RealtimeTalkWebRtcSdpSessionResult = {
-  provider: string;
-  transport: "webrtc";
-  clientSecret: string;
-  offerUrl?: string;
-  offerHeaders?: Record<string, string>;
-  model?: string;
-  voice?: string;
-  expiresAt?: number;
+export type RealtimeTalkSessionResult = RealtimeVoiceBrowserSession & {
+  voiceSessionId?: string;
   consultThinkingLevel?: string;
   consultFastMode?: boolean;
 };
 
-export type RealtimeTalkJsonPcmWebSocketSessionResult = {
-  provider: string;
-  transport: "provider-websocket";
-  protocol: string;
-  clientSecret: string;
-  websocketUrl: string;
-  audio: RealtimeTalkAudioContract;
-  initialMessage?: unknown;
-  model?: string;
-  voice?: string;
-  expiresAt?: number;
-  consultThinkingLevel?: string;
-  consultFastMode?: boolean;
-};
+export type RealtimeTalkWebRtcSdpSessionResult = Extract<
+  RealtimeTalkSessionResult,
+  { transport: "webrtc" }
+>;
 
-export type RealtimeTalkGatewayRelaySessionResult = {
-  provider: string;
-  transport: "gateway-relay";
-  relaySessionId: string;
-  audio: RealtimeTalkAudioContract;
-  model?: string;
-  voice?: string;
-  expiresAt?: number;
-  consultThinkingLevel?: string;
-  consultFastMode?: boolean;
-};
+export type RealtimeTalkJsonPcmWebSocketSessionResult = Extract<
+  RealtimeTalkSessionResult,
+  { transport: "provider-websocket" }
+>;
 
-type RealtimeTalkManagedRoomSessionResult = {
-  provider: string;
-  transport: "managed-room";
-  roomUrl: string;
-  token?: string;
-  model?: string;
-  voice?: string;
-  expiresAt?: number;
-  consultThinkingLevel?: string;
-  consultFastMode?: boolean;
-};
+export type RealtimeTalkGatewayRelaySessionResult = Extract<
+  RealtimeTalkSessionResult,
+  { transport: "gateway-relay" }
+>;
 
-export type RealtimeTalkSessionResult =
-  | RealtimeTalkWebRtcSdpSessionResult
-  | RealtimeTalkJsonPcmWebSocketSessionResult
-  | RealtimeTalkGatewayRelaySessionResult
-  | RealtimeTalkManagedRoomSessionResult;
+export type RealtimeTalkTransportStartResult = "ready" | "cancelled";
 
 export type RealtimeTalkTransport = {
-  start(): Promise<void>;
-  stop(): void;
+  start(): Promise<RealtimeTalkTransportStartResult>;
+  activate?: () => void;
+  stop(options?: { emitClosed?: boolean }): void;
+  setVideoEnabled?: (enabled: boolean) => Promise<void>;
+  switchCamera?: (videoDeviceId: string | undefined) => Promise<void>;
 };
 
 export type RealtimeTalkTransportContext = {
   client: GatewayBrowserClient;
   sessionKey: string;
+  voiceSessionId?: string;
+  flushTranscriptWrites?: () => Promise<void>;
   callbacks: RealtimeTalkCallbacks;
-  inputDeviceId?: string;
+  input: Pick<RealtimeTalkInputController, "stream" | "adopt" | "stop">;
+  videoDeviceId?: string;
   consultThinkingLevel?: string;
   consultFastMode?: boolean;
 };
@@ -442,7 +433,7 @@ export async function steerRealtimeTalkActiveConsult(params: {
   } catch (error) {
     params.emitTalkEvent?.({
       type: "tool.error",
-      payload: { message: error instanceof Error ? error.message : String(error) },
+      payload: { message: formatUiError(error) },
       final: true,
     });
   }
@@ -451,14 +442,20 @@ export async function steerRealtimeTalkActiveConsult(params: {
 export async function submitRealtimeTalkAgentControl(params: {
   ctx: RealtimeTalkTransportContext;
   args: unknown;
-  submit: (callId: string, result: unknown) => void;
+  submit: (callId: string, result: unknown) => void | Promise<void>;
   callId: string;
   sessionId?: string;
   emitTalkEvent?: (input: RealtimeTalkEventInput) => void;
+  signal?: AbortSignal;
 }): Promise<void> {
+  if (params.signal?.aborted) {
+    return;
+  }
+  let result: unknown;
+  let talkEvent: RealtimeTalkEventInput;
   try {
     const parsed = parseRealtimeVoiceAgentControlToolArgs(params.args);
-    const result =
+    result =
       params.sessionId && params.sessionId.trim()
         ? await params.ctx.client.request("talk.session.steer", {
             sessionId: params.sessionId,
@@ -471,7 +468,10 @@ export async function submitRealtimeTalkAgentControl(params: {
             text: parsed.text,
             mode: parsed.mode,
           });
-    params.emitTalkEvent?.({
+    if (params.signal?.aborted) {
+      return;
+    }
+    talkEvent = {
       type: "tool.progress",
       callId: params.callId,
       payload: {
@@ -482,18 +482,25 @@ export async function submitRealtimeTalkAgentControl(params: {
         result && typeof result === "object" && "mode" in result
           ? result.mode === "status" || result.mode === "cancel"
           : undefined,
-    });
-    params.submit(params.callId, result);
+    };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    params.emitTalkEvent?.({
+    const message = formatUiError(error);
+    talkEvent = {
       type: "tool.error",
       callId: params.callId,
       payload: { message },
       final: true,
-    });
-    params.submit(params.callId, { error: message });
+    };
+    result = { error: message };
+    if (params.signal?.aborted || isAbortError(error)) {
+      return;
+    }
   }
+  await params.submit(params.callId, result);
+  if (params.signal?.aborted) {
+    return;
+  }
+  params.emitTalkEvent?.(talkEvent);
 }
 
 function maybeSpeakRealtimeTalkControlResult(
@@ -522,7 +529,7 @@ function maybeSpeakRealtimeTalkControlResult(
 export async function submitRealtimeTalkConsult(params: {
   ctx: RealtimeTalkTransportContext;
   args: unknown;
-  submit: (callId: string, result: unknown) => void;
+  submit: (callId: string, result: unknown) => void | Promise<void>;
   callId: string;
   relaySessionId?: string;
   emitTalkEvent?: (input: RealtimeTalkEventInput) => void;
@@ -531,73 +538,83 @@ export async function submitRealtimeTalkConsult(params: {
 }): Promise<void> {
   const { ctx, callId, submit } = params;
   ctx.callbacks.onStatus?.("thinking");
-  let runId: string | undefined;
+  let run: TalkClientToolCallResult | undefined;
   let aborted = false;
   let submitted = false;
-  const submitOnce = (result: unknown) => {
+  let submissionCompleted = false;
+  const submitOnce = async (result: unknown): Promise<void> => {
     if (submitted) {
       return;
     }
     submitted = true;
-    submit(callId, result);
+    await submit(callId, result);
+    submissionCompleted = true;
   };
-  const submitAbortResult = () => {
+  const submitAbortResult = async (): Promise<void> => {
     if (params.submitAbortResult !== false) {
-      submitOnce(buildRealtimeVoiceAgentCancelProviderResult());
+      await submitOnce(buildRealtimeVoiceAgentCancelProviderResult());
     }
   };
   const abortRun = () => {
     aborted = true;
-    if (runId) {
-      void ctx.client.request("chat.abort", { sessionKey: ctx.sessionKey, runId });
+    if (run) {
+      void ctx.client.request("chat.abort", {
+        sessionKey: run.agentSessionKey,
+        agentId: run.agentId,
+        runId: run.runId,
+      });
     }
   };
   if (params.signal?.aborted) {
-    submitAbortResult();
+    await submitAbortResult();
     return;
   }
   params.signal?.addEventListener("abort", abortRun, { once: true });
   try {
     const args =
       typeof params.args === "string" ? JSON.parse(params.args || "{}") : (params.args ?? {});
-    const response = await ctx.client.request<{ runId?: string; idempotencyKey?: string }>(
-      "talk.client.toolCall",
-      {
-        sessionKey: ctx.sessionKey,
-        callId,
-        name: REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME,
-        args,
-        ...(params.relaySessionId ? { relaySessionId: params.relaySessionId } : {}),
-      },
-    );
-    runId = response.runId ?? response.idempotencyKey;
-    if (!runId) {
-      throw new Error("OpenClaw realtime tool call did not return a run id");
+    await ctx.flushTranscriptWrites?.();
+    if (params.signal?.aborted) {
+      await submitAbortResult();
+      return;
     }
+    // Cancellation must not hide the acknowledgement that owns the Gateway run.
+    // Once the run id arrives, abortRun() can cancel the exact started consult.
+    run = await ctx.client.request<TalkClientToolCallResult>("talk.client.toolCall", {
+      sessionKey: ctx.sessionKey,
+      ...(ctx.voiceSessionId ? { voiceSessionId: ctx.voiceSessionId } : {}),
+      callId,
+      name: REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME,
+      args,
+      ...(params.relaySessionId ? { relaySessionId: params.relaySessionId } : {}),
+    });
     if (params.signal?.aborted) {
       abortRun();
-      submitAbortResult();
+      await submitAbortResult();
       return;
     }
     const result = await waitForChatResult({
       client: ctx.client,
-      runId,
+      runId: run.runId,
       timeoutMs: 120_000,
       emitTalkEvent: params.emitTalkEvent,
       signal: params.signal,
     });
-    submitOnce({ result });
+    await submitOnce({ result });
   } catch (error) {
+    if (submitted) {
+      throw error;
+    }
     if (aborted || params.signal?.aborted || isAbortError(error)) {
-      submitAbortResult();
+      await submitAbortResult();
       return;
     }
-    submitOnce({
-      error: error instanceof Error ? error.message : String(error),
+    await submitOnce({
+      error: formatUiError(error),
     });
   } finally {
     params.signal?.removeEventListener("abort", abortRun);
-    if (!aborted && !params.signal?.aborted) {
+    if (submissionCompleted && !aborted && !params.signal?.aborted) {
       ctx.callbacks.onStatus?.("listening");
     }
   }
@@ -605,9 +622,10 @@ export async function submitRealtimeTalkConsult(params: {
 
 function isAbortError(error: unknown): boolean {
   return (
-    typeof DOMException !== "undefined" &&
-    error instanceof DOMException &&
-    error.name === "AbortError"
+    (typeof DOMException !== "undefined" &&
+      error instanceof DOMException &&
+      error.name === "AbortError") ||
+    (typeof error === "object" && error !== null && "name" in error && error.name === "AbortError")
   );
 }
 

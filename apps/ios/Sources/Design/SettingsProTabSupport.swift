@@ -1,17 +1,13 @@
-import Darwin
 import OpenClawKit
 import SwiftUI
+import UIKit
 import UserNotifications
 
 enum SettingsRoute: Hashable {
     case gateway
+    case appleWatch
     case approvals
-    case permissions
-    case channels
-    case voice
     case diagnostics
-    case privacy
-    case notifications
     case licenses
     case about
 }
@@ -25,17 +21,17 @@ enum SettingsLayout {
 /// detail row on this view so row typography cannot drift between sections;
 /// plain `LabeledContent(String, value:)` renders unbranded system fonts.
 struct SettingsDetailRow: View {
-    let label: String
-    let value: String
+    let label: LocalizedStringKey
+    let value: OpenClawTextValue
 
-    init(_ label: String, value: String) {
+    init(_ label: LocalizedStringKey, value: OpenClawTextValue) {
         self.label = label
         self.value = value
     }
 
     var body: some View {
         LabeledContent {
-            Text(self.value)
+            self.value.text
                 .font(OpenClawType.subhead)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -46,12 +42,185 @@ struct SettingsDetailRow: View {
     }
 }
 
+struct SettingsBuildMetadataStrip: View {
+    let metadata: ArtifactBuildInfo
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.layoutDirection) private var layoutDirection
+
+    private struct Field: Identifiable {
+        enum ID: String {
+            case version
+            case commit
+            case built
+        }
+
+        let id: ID
+        let title: LocalizedStringKey
+        let value: String?
+        let forceLeftToRight: Bool
+    }
+
+    private var fields: [Field] {
+        [
+            Field(id: .version, title: "Version", value: self.metadata.versionDisplay, forceLeftToRight: true),
+            Field(id: .commit, title: "Commit", value: self.metadata.shortCommit, forceLeftToRight: true),
+            Field(id: .built, title: "Built", value: self.metadata.localizedBuildDate(), forceLeftToRight: false),
+        ]
+    }
+
+    var body: some View {
+        Group {
+            if self.dynamicTypeSize.isAccessibilitySize {
+                self.metadataColumn
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    self.metadataRow
+                    self.metadataColumn
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .foregroundStyle(.secondary)
+        .textSelection(.enabled)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(self.metadataAccessibilityLabel)
+        .accessibilityActions {
+            if self.metadata.gitCommit != nil {
+                Button {
+                    self.copyCommit()
+                } label: {
+                    Text("Copy full commit hash")
+                        .font(OpenClawType.subheadSemiBold)
+                }
+            }
+            Button {
+                self.copyBuildInfo()
+            } label: {
+                Text("Copy build info")
+                    .font(OpenClawType.subheadSemiBold)
+            }
+        }
+        .contextMenu {
+            if self.metadata.gitCommit != nil {
+                Button {
+                    self.copyCommit()
+                } label: {
+                    Label {
+                        Text("Copy Commit")
+                            .font(OpenClawType.subheadSemiBold)
+                    } icon: {
+                        Image(systemName: "number")
+                    }
+                }
+            }
+            Button {
+                self.copyBuildInfo()
+            } label: {
+                Label {
+                    Text("Copy Build Info")
+                        .font(OpenClawType.subheadSemiBold)
+                } icon: {
+                    Image(systemName: "doc.on.doc")
+                }
+            }
+        }
+    }
+
+    private var metadataRow: some View {
+        HStack(alignment: .center, spacing: 0) {
+            ForEach(Array(self.fields.enumerated()), id: \.element.id) { index, field in
+                if index > 0 {
+                    Divider()
+                        .frame(height: 30)
+                }
+                self.metadataField(field, alignment: .center)
+                    .frame(minWidth: 72, maxWidth: .infinity)
+                    .padding(.horizontal, 4)
+            }
+        }
+        .frame(minWidth: 240)
+    }
+
+    private var metadataColumn: some View {
+        VStack(alignment: .center, spacing: 8) {
+            ForEach(self.fields) { field in
+                self.metadataField(field, alignment: .center)
+            }
+        }
+    }
+
+    private func metadataField(_ field: Field, alignment: HorizontalAlignment) -> some View {
+        VStack(alignment: alignment, spacing: 1) {
+            Text(field.title)
+                .font(OpenClawType.caption2SemiBold)
+                .textCase(.uppercase)
+            Group {
+                if let value = field.value {
+                    Text(verbatim: value)
+                } else {
+                    Text("Unavailable")
+                }
+            }
+            .font(OpenClawType.monoSmall)
+            .lineLimit(1)
+            .minimumScaleFactor(0.72)
+            .environment(
+                \.layoutDirection,
+                field.forceLeftToRight ? .leftToRight : self.layoutDirection)
+        }
+    }
+
+    private var metadataAccessibilityLabel: String {
+        let version = self.metadata.versionDisplay
+        let commit = self.metadata.spokenCommit
+        let timestamp = self.metadata.buildTimestamp
+        let built = self.metadata.localizedBuildDate() ?? timestamp
+        if let commit, let timestamp, let built {
+            return String(
+                format: String(
+                    localized: "Version %1$@, commit %2$@, built %3$@, timestamp %4$@"),
+                version,
+                commit,
+                built,
+                timestamp)
+        }
+        if let commit {
+            return String(
+                format: String(
+                    localized: "Version %1$@, commit %2$@, build date unavailable"),
+                version,
+                commit)
+        }
+        if let timestamp, let built {
+            return String(
+                format: String(
+                    localized: "Version %1$@, commit unavailable, built %2$@, timestamp %3$@"),
+                version,
+                built,
+                timestamp)
+        }
+        return String(
+            format: String(
+                localized: "Version %@, commit unavailable, build date unavailable"),
+            version)
+    }
+
+    private func copyCommit() {
+        guard let gitCommit = self.metadata.gitCommit else { return }
+        UIPasteboard.general.string = gitCommit
+    }
+
+    private func copyBuildInfo() {
+        UIPasteboard.general.string = self.metadata.copyText
+    }
+}
+
 struct SettingsApprovalItem: Identifiable {
     let id: String
     let icon: String
-    let title: String
-    let detail: String
-    let priority: String
+    let title: OpenClawTextValue
+    let detail: OpenClawTextValue
+    let priority: OpenClawTextValue
     let color: Color
 }
 
@@ -69,16 +238,16 @@ struct SettingsApprovalRow: View {
                         .fill(self.item.color)
                 }
             VStack(alignment: .leading, spacing: 2) {
-                Text(self.item.title)
+                self.item.title.text
                     .font(OpenClawType.subheadSemiBold)
                     .lineLimit(1)
-                Text(self.item.detail)
+                self.item.detail.text
                     .font(OpenClawType.caption2Medium)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
             Spacer(minLength: 8)
-            Text(self.item.priority)
+            self.item.priority.text
                 .font(OpenClawType.captionBold)
                 .foregroundStyle(self.item.color)
                 .padding(.horizontal, 9)
@@ -112,64 +281,49 @@ enum SettingsNotificationStatus: Equatable {
         }
     }
 
+    var allowsNotifications: Bool {
+        self == .allowed
+    }
+}
+
+enum SettingsNotificationPresentation: Equatable {
+    case checking
+    case enabled
+    case off
+    case setup
+    case denied
+    case notSet
+    case unknown
+
     var text: String {
         switch self {
-        case .checking: "Checking"
-        case .allowed: "Enabled"
-        case .notAllowed: "Denied"
-        case .notSet: "Not Enabled"
-        case .unknown: "Unknown"
-        }
-    }
-
-    var actionTitle: String {
-        switch self {
-        case .notSet:
-            "Enable Notifications"
-        case .checking:
-            "Checking"
-        case .allowed:
-            "Manage in iOS Settings"
-        case .notAllowed, .unknown:
-            "Open iOS Settings"
-        }
-    }
-
-    var actionIcon: String {
-        switch self {
-        case .allowed:
-            "gear"
-        case .notAllowed, .unknown:
-            "gear.badge"
-        case .checking:
-            "hourglass"
-        case .notSet:
-            "bell.badge"
+        case .checking: String(localized: "Checking")
+        case .enabled: String(localized: "Enabled")
+        case .off: String(localized: "Off")
+        case .setup: String(localized: "Setup")
+        case .denied: String(localized: "Denied")
+        case .notSet: String(localized: "Not Enabled")
+        case .unknown: String(localized: "Unknown")
         }
     }
 
     var color: Color {
         switch self {
-        case .allowed:
+        case .enabled:
             OpenClawBrand.ok
-        case .notAllowed, .unknown:
+        case .denied, .setup, .unknown:
             OpenClawBrand.warn
-        case .checking, .notSet:
+        case .checking, .notSet, .off:
             .secondary
         }
     }
 
-    var shouldOpenNotificationSettings: Bool {
-        switch self {
-        case .allowed, .notAllowed, .unknown:
-            true
-        case .checking, .notSet:
-            false
-        }
+    var isActive: Bool {
+        self == .enabled
     }
 
-    var allowsNotifications: Bool {
-        self == .allowed
+    var needsAttention: Bool {
+        self != .checking && self != .enabled
     }
 }
 
@@ -210,54 +364,6 @@ enum SettingsDiagnostics {
 
     static func timestamp(_ date: Date) -> String {
         date.formatted(date: .omitted, time: .shortened)
-    }
-}
-
-extension SettingsProTab {
-    static func hasTailnetIPv4() -> Bool {
-        var addrList: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&addrList) == 0, let first = addrList else { return false }
-        defer { freeifaddrs(addrList) }
-        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
-            let flags = Int32(ptr.pointee.ifa_flags)
-            let isUp = (flags & IFF_UP) != 0
-            let isLoopback = (flags & IFF_LOOPBACK) != 0
-            guard let addrPtr = ptr.pointee.ifa_addr else { continue }
-            let family = addrPtr.pointee.sa_family
-            if !isUp || isLoopback || family != UInt8(AF_INET) { continue }
-            var addr = addrPtr.pointee
-            var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            let result = getnameinfo(
-                &addr,
-                socklen_t(addrPtr.pointee.sa_len),
-                &buffer,
-                socklen_t(buffer.count),
-                nil,
-                0,
-                NI_NUMERICHOST)
-            guard result == 0 else { continue }
-            let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
-            guard let ip = String(bytes: bytes, encoding: .utf8) else { continue }
-            if self.isTailnetIPv4(ip) { return true }
-        }
-        return false
-    }
-
-    static func isTailnetHostOrIP(_ host: String) -> Bool {
-        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if trimmed.hasSuffix(".ts.net") || trimmed.hasSuffix(".ts.net.") { return true }
-        return self.isTailnetIPv4(trimmed)
-    }
-
-    static func isTailnetIPv4(_ ip: String) -> Bool {
-        let parts = ip.split(separator: ".")
-        guard parts.count == 4 else { return false }
-        let octets = parts.compactMap { Int($0) }
-        guard octets.count == 4 else { return false }
-        let a = octets[0]
-        let b = octets[1]
-        guard (0...255).contains(a), (0...255).contains(b) else { return false }
-        return a == 100 && b >= 64 && b <= 127
     }
 }
 
@@ -306,7 +412,7 @@ private struct SettingsGatewayStatesPreview: View {
                     self.stateSection("Error") {
                         self.gatewayStatusCard(
                             title: "Tailscale warning",
-                            detail: "Tailscale is off on this device. Turn it on, then try again.",
+                            detail: "Check the gateway and your Tailscale connection, then try again.",
                             value: "network",
                             color: OpenClawBrand.warn)
                     }
@@ -338,8 +444,8 @@ private struct SettingsGatewayStatesPreview: View {
         ProCard(padding: 0, radius: SettingsLayout.cardRadius) {
             ProStatusRow(
                 icon: value == "online" ? "antenna.radiowaves.left.and.right" : "wifi.slash",
-                title: title,
-                detail: detail,
+                title: .localized(title),
+                detail: .localized(detail),
                 value: value,
                 color: color,
                 actionTitle: value == "setup" ? "Scan QR" : nil,

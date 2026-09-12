@@ -16,57 +16,28 @@ export function isAbortError(error: unknown): boolean {
   return message === "This operation was aborted";
 }
 
-export function mergeAbortSignals(
-  signals: ReadonlyArray<AbortSignal | undefined>,
-): { signal?: AbortSignal; dispose: () => void } {
-  const activeSignals: AbortSignal[] = [];
-  for (const signal of signals) {
-    if (signal && !activeSignals.includes(signal)) {
-      activeSignals.push(signal);
-    }
+export function racePromiseWithAbortSignal<T>(
+  promise: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!signal) {
+    return promise;
   }
-  if (activeSignals.length <= 1) {
-    return { signal: activeSignals[0], dispose: () => {} };
+  const abortError = () => createAbortError("Operation aborted", { cause: signal.reason });
+  if (signal.aborted) {
+    return Promise.reject(abortError());
   }
-
-  const controller = new AbortController();
-  const listeners = new Map<AbortSignal, () => void>();
-  let disposed = false;
-  const dispose = () => {
-    if (disposed) {
-      return;
-    }
-    disposed = true;
-    for (const [signal, listener] of listeners) {
-      signal.removeEventListener("abort", listener);
-    }
-    listeners.clear();
-  };
-  const abortFrom = (signal: AbortSignal) => {
-    if (controller.signal.aborted) {
-      return;
-    }
-    controller.abort(signal.reason);
-    dispose();
-  };
-
-  for (const signal of activeSignals) {
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(abortError());
+    signal.addEventListener("abort", onAbort, { once: true });
     if (signal.aborted) {
-      abortFrom(signal);
-      break;
+      onAbort();
     }
-    const listener = () => abortFrom(signal);
-    listeners.set(signal, listener);
-    signal.addEventListener("abort", listener, { once: true });
-    if (controller.signal.aborted || signal.aborted) {
-      if (!controller.signal.aborted) {
-        abortFrom(signal);
-      }
-      break;
-    }
-  }
-
-  return { signal: controller.signal, dispose };
+  });
+  return Promise.race([promise, aborted]).finally(() => {
+    signal.removeEventListener("abort", onAbort);
+  });
 }
 
 /** Resolves when the signal aborts, or immediately when no wait is needed. */

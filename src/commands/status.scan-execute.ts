@@ -16,9 +16,6 @@ import {
 export async function executeStatusScanFromOverview(params: {
   overview: StatusScanOverviewResult;
   runtime?: RuntimeEnv;
-  summary?: {
-    includeChannelSummary?: boolean;
-  };
   resolveMemory: (args: {
     cfg: StatusScanOverviewResult["cfg"];
     agentStatus: StatusScanOverviewResult["agentStatus"];
@@ -38,15 +35,14 @@ export async function executeStatusScanFromOverview(params: {
       memoryPlugin,
       ...(params.runtime ? { runtime: params.runtime } : {}),
     }),
-    resolveStatusSummaryFromOverview({
-      overview: params.overview,
-      includeChannelSummary: params.summary?.includeChannelSummary,
-    }),
+    resolveStatusSummaryFromOverview({ overview: params.overview }),
   ]);
 
   return buildStatusScanResult({
+    env: params.overview.env ?? {},
     cfg: params.overview.cfg,
     sourceConfig: params.overview.sourceConfig,
+    configDiagnostics: params.overview.configDiagnostics,
     secretDiagnostics: params.overview.secretDiagnostics,
     osSummary: params.overview.osSummary,
     tailscaleMode: params.overview.tailscaleMode,

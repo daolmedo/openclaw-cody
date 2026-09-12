@@ -3,8 +3,8 @@
  * Verifies plugin-provided env values are filtered and forwarded to the chosen
  * exec host without leaking unsafe overrides.
  */
+import { expectDefined } from "@openclaw/normalization-core";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { OPENCLAW_CLI_ENV_VALUE } from "../infra/openclaw-exec-env.js";
 import type { ExecuteNodeHostCommandParams } from "./bash-tools.exec-host-node.types.js";
 import type { BashSandboxConfig } from "./bash-tools.shared.js";
 import type { ExtensionContext } from "./sessions/index.js";
@@ -16,6 +16,7 @@ declare module "../plugins/hook-types.js" {
 }
 
 const CHANNEL_CONTEXT_ENV_KEY = "OPENCLAW_CHANNEL_CONTEXT";
+const OPENCLAW_CLI_ENV_VALUE = "1";
 type CapturedNodeHostParams = Pick<
   ExecuteNodeHostCommandParams,
   "env" | "requestedEnv" | "workdir"
@@ -92,6 +93,7 @@ vi.mock("../process/supervisor/index.js", () => ({
       mocks.spawnInputs.push({ env: input.env ? { ...input.env } : undefined });
       input.onStdout?.("ok\n");
       return {
+        activity: { resultSettled: true, lastOutputAtMs: Date.now() },
         runId: "mock-run",
         startedAtMs: Date.now(),
         stdin: undefined,
@@ -110,11 +112,10 @@ vi.mock("../process/supervisor/index.js", () => ({
     },
     cancel: vi.fn(),
     cancelScope: vi.fn(),
-    getRecord: vi.fn(),
   }),
 }));
 
-let createExecTool: typeof import("./bash-tools.exec.js").createExecTool;
+let createExecTool: typeof import("./bash-tools.exec-run.js").createExecTool;
 let toToolDefinitions: typeof import("./agent-tool-definition-adapter.js").toToolDefinitions;
 let createOpenClawCodingTools: typeof import("./agent-tools.js").createOpenClawCodingTools;
 const testExtensionContext = {} as ExtensionContext;
@@ -128,7 +129,7 @@ function installResolveExecEnvHook(result: Record<string, string>) {
 
 describe("exec resolve_exec_env hook wiring", () => {
   beforeAll(async () => {
-    ({ createExecTool } = await import("./bash-tools.exec.js"));
+    ({ createExecTool } = await import("./bash-tools.exec-run.js"));
     ({ toToolDefinitions } = await import("./agent-tool-definition-adapter.js"));
     ({ createOpenClawCodingTools } = await import("./agent-tools.js"));
   });
@@ -181,6 +182,7 @@ describe("exec resolve_exec_env hook wiring", () => {
       security: "full",
       ask: "off",
       sessionKey: "agent:main:telegram:chat-1",
+      sessionId: "session-1",
       messageProvider: "telegram",
       currentChannelId: "chat-1",
       channelContext: {
@@ -203,6 +205,7 @@ describe("exec resolve_exec_env hook wiring", () => {
       {
         agentId: "main",
         sessionKey: "agent:main:telegram:chat-1",
+        sessionId: "session-1",
         messageProvider: "telegram",
         channelId: "chat-1",
         channelContext: {
@@ -234,7 +237,7 @@ describe("exec resolve_exec_env hook wiring", () => {
     });
   });
 
-  it("forwards filtered plugin env to node host requests", async () => {
+  it("inherits configured node for auto while forwarding filtered plugin env", async () => {
     installResolveExecEnvHook({
       NODE_HOST_SAFE: "yes",
       LD_PRELOAD: "/tmp/preload.dylib",
@@ -251,6 +254,7 @@ describe("exec resolve_exec_env hook wiring", () => {
       },
     });
     await tool.execute("call-node", {
+      host: "auto",
       command: "echo ok",
       env: { REQUEST_SAFE: "request" },
     });
@@ -274,6 +278,8 @@ describe("exec resolve_exec_env hook wiring", () => {
       sender: { id: "ou_node" },
     });
     expect(mocks.nodeHostParams[0]?.env).not.toHaveProperty("LD_PRELOAD");
+    expect(mocks.gatewayParams).toHaveLength(0);
+    expect(mocks.spawnInputs).toHaveLength(0);
   });
 
   it("does not forward configured gateway cwd defaults to node host requests", async () => {
@@ -403,7 +409,7 @@ describe("exec resolve_exec_env hook wiring", () => {
       sessionKey: "agent:main:telegram:chat-1",
     });
 
-    const result = await definition.execute(
+    const result = await expectDefined(definition, "definition test invariant").execute(
       "call-invalid-wrapped-cwd-before-hooks",
       {
         command: "echo ok",
@@ -449,7 +455,7 @@ describe("exec resolve_exec_env hook wiring", () => {
       sessionKey: "agent:main:telegram:chat-1",
     });
 
-    const result = await definition.execute(
+    const result = await expectDefined(definition, "definition test invariant").execute(
       "call-backend-cwd-vetoed-before-validation",
       {
         command: "echo ok",
@@ -498,7 +504,7 @@ describe("exec resolve_exec_env hook wiring", () => {
       sessionKey: "agent:main:telegram:chat-1",
     });
 
-    const result = await definition.execute(
+    const result = await expectDefined(definition, "definition test invariant").execute(
       "call-backend-invalid-cwd-before-env",
       {
         command: "echo ok",
@@ -537,6 +543,8 @@ describe("exec resolve_exec_env hook wiring", () => {
       host: "sandbox",
       security: "full",
       ask: "off",
+      agentId: "policy-agent",
+      sessionKey: "global",
       sandbox: {
         containerName: "remote-sandbox-workdir-test",
         workspaceDir: process.cwd(),
@@ -549,10 +557,11 @@ describe("exec resolve_exec_env hook wiring", () => {
     const [definition] = toToolDefinitions([tool], {
       agentId: "ctx-agent",
       sessionKey: "agent:ctx-agent:telegram:chat-2",
+      sessionId: "ctx-session",
       channelId: "ctx-channel",
     });
 
-    const result = await definition.execute(
+    const result = await expectDefined(definition, "definition test invariant").execute(
       "call-backend-deferred-env-context",
       {
         command: "echo ok",
@@ -575,6 +584,7 @@ describe("exec resolve_exec_env hook wiring", () => {
     expect(mocks.hookRunner.runResolveExecEnv!.mock.calls[0]?.[1]).toMatchObject({
       agentId: "ctx-agent",
       sessionKey: "agent:ctx-agent:telegram:chat-2",
+      sessionId: "ctx-session",
       channelId: "ctx-channel",
     });
     expect(buildExecSpec.mock.calls[0]?.[0]?.env).toMatchObject({
@@ -604,7 +614,7 @@ describe("exec resolve_exec_env hook wiring", () => {
       channelId: "chat-1",
     });
 
-    const result = await definition.execute(
+    const result = await expectDefined(definition, "definition test invariant").execute(
       "call-invalid-lazy-cwd-before-hooks",
       {
         command: "echo ok",
@@ -667,7 +677,7 @@ describe("exec resolve_exec_env hook wiring", () => {
       channelId: "chat-1",
     });
 
-    await definition.execute(
+    await expectDefined(definition, "definition test invariant").execute(
       "call-before",
       {
         command: "echo ok",
@@ -689,7 +699,7 @@ describe("exec resolve_exec_env hook wiring", () => {
     });
   });
 
-  it("forwards private env preparation through the lazy exec tool", async () => {
+  it("inherits configured gateway for auto through lazy exec preparation", async () => {
     mocks.hookRunner = {
       hasHooks: vi.fn(
         (hookName: string) => hookName === "resolve_exec_env" || hookName === "before_tool_call",
@@ -715,9 +725,10 @@ describe("exec resolve_exec_env hook wiring", () => {
       channelId: "chat-1",
     });
 
-    await definition.execute(
+    await expectDefined(definition, "definition test invariant").execute(
       "call-lazy",
       {
+        host: "auto",
         command: "echo ok",
         env: { REQUEST_SAFE: "request" },
         yieldMs: 120_000,
@@ -738,6 +749,7 @@ describe("exec resolve_exec_env hook wiring", () => {
   });
 
   it("recomputes plugin env when before_tool_call changes exec host", async () => {
+    const executionSessionKey = "agent:main:telegram:chat-1";
     mocks.hookRunner = {
       hasHooks: vi.fn(
         (hookName: string) => hookName === "resolve_exec_env" || hookName === "before_tool_call",
@@ -754,14 +766,15 @@ describe("exec resolve_exec_env hook wiring", () => {
       host: "auto",
       security: "full",
       ask: "off",
-      sessionKey: "agent:main:telegram:chat-1",
+      agentId: "policy-agent",
+      sessionKey: "global",
     });
     const [definition] = toToolDefinitions([tool], {
       agentId: "main",
-      sessionKey: "agent:main:telegram:chat-1",
+      sessionKey: executionSessionKey,
     });
 
-    await definition.execute(
+    await expectDefined(definition, "definition test invariant").execute(
       "call-host-rewrite",
       {
         command: "echo ok",
@@ -773,16 +786,13 @@ describe("exec resolve_exec_env hook wiring", () => {
     );
 
     expect(mocks.hookRunner.runResolveExecEnv!).toHaveBeenCalledTimes(2);
-    expect(mocks.hookRunner.runResolveExecEnv!).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({ host: "gateway" }),
-      expect.anything(),
-    );
-    expect(mocks.hookRunner.runResolveExecEnv!).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({ host: "node" }),
-      expect.anything(),
-    );
+    for (const [index, host] of ["gateway", "node"].entries()) {
+      expect(mocks.hookRunner.runResolveExecEnv!).toHaveBeenNthCalledWith(
+        index + 1,
+        expect.objectContaining({ host, sessionKey: executionSessionKey }),
+        expect.objectContaining({ agentId: "main", sessionKey: executionSessionKey }),
+      );
+    }
     expect(mocks.nodeHostParams[0]?.requestedEnv).toEqual({
       NODE_PLUGIN_SAFE: "node",
       REQUEST_SAFE: "request",
@@ -814,7 +824,7 @@ describe("exec resolve_exec_env hook wiring", () => {
       sessionKey: "agent:main:telegram:chat-1",
     });
 
-    await definition.execute(
+    await expectDefined(definition, "definition test invariant").execute(
       "call-host-rewrite-with-remote-cwd",
       {
         command: "echo ok",
@@ -861,7 +871,7 @@ describe("exec resolve_exec_env hook wiring", () => {
       sessionKey: "agent:main:telegram:chat-1",
     });
 
-    await definition.execute(
+    await expectDefined(definition, "definition test invariant").execute(
       "call-host-sanitize",
       {
         command: "echo ok",
@@ -927,7 +937,7 @@ describe("exec resolve_exec_env hook wiring", () => {
       sessionKey: "agent:main:telegram:chat-1",
     });
 
-    await definition.execute(
+    await expectDefined(definition, "definition test invariant").execute(
       "call-command-rewrite",
       {
         env: { REQUEST_SAFE: "request" },

@@ -2,7 +2,7 @@ import type { ConfigFileSnapshot } from "../../../config/types.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import { migrateLegacyConfig } from "./legacy-config-migrate.js";
 
-export type StateMigrationConfigInput = {
+type StateMigrationConfigInput = {
   cfg?: OpenClawConfig;
   pluginDoctorConfig?: OpenClawConfig;
 };
@@ -24,10 +24,9 @@ export function resolveStateMigrationConfigInput(params: {
     return null;
   }
   const migrated = migrateLegacyConfig(migrationSource);
-  if (!migrated.config) {
-    return null;
-  }
-  if (migrated.partiallyValid) {
+  // Plugin config repair may retain a legacy locator until its state migration
+  // completes. No config mutation must not prevent that owner from retrying.
+  if (!migrated.config || migrated.partiallyValid) {
     return {
       pluginDoctorConfig: (pluginDoctorConfig ?? migrationSource) as OpenClawConfig,
     };

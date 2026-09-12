@@ -7,7 +7,7 @@ import type { TypingPolicy } from "../types.js";
 import type { TypingController } from "./typing.js";
 
 /** Inputs that decide when a channel typing indicator should be shown. */
-export type TypingModeContext = {
+type TypingModeContext = {
   configured?: TypingMode;
   isGroupChat: boolean;
   wasMentioned: boolean;
@@ -109,14 +109,10 @@ export function createTypingSignaler(params: {
     if (disabled) {
       return;
     }
-    const renderable = isRenderableText(text);
-    if (renderable) {
-      hasRenderableText = true;
-    } else if (normalizeOptionalString(text)) {
-      return;
-    } else {
+    if (!isRenderableText(text)) {
       return;
     }
+    hasRenderableText = true;
     if (shouldStartOnText) {
       await typing.startTypingOnText(text);
       return;

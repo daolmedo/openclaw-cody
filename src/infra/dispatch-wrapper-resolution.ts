@@ -9,8 +9,6 @@ import {
 import { normalizeExecutableToken } from "./exec-wrapper-tokens.js";
 import { parseInlineOptionToken } from "./inline-option-token.js";
 
-export { unwrapEnvInvocation } from "./command-carriers.js";
-
 export const MAX_DISPATCH_WRAPPER_DEPTH = 4;
 
 const NICE_OPTIONS_WITH_VALUE = new Set(["-n", "--adjustment", "--priority"]);
@@ -436,6 +434,7 @@ type DispatchWrapperSpec = {
   name: string;
   unwrap?: (argv: string[], platform?: NodeJS.Platform) => string[] | null;
   transparentUsage?: boolean | ((argv: string[], platform?: NodeJS.Platform) => boolean);
+  changesExecutableLookup?: true;
 };
 
 const DISPATCH_WRAPPER_SPECS: readonly DispatchWrapperSpec[] = [
@@ -446,22 +445,42 @@ const DISPATCH_WRAPPER_SPECS: readonly DispatchWrapperSpec[] = [
     transparentUsage: (_argv, platform) => supportsArchDispatchWrapper(platform),
   },
   { name: "caffeinate", unwrap: unwrapCaffeinateInvocation, transparentUsage: true },
+  { name: "bwrap" },
+  { name: "catchsegv" },
   { name: "chrt" },
+  { name: "chroot" },
+  { name: "cpulimit" },
   { name: "doas" },
+  { name: "eatmydata" },
   {
     name: "env",
     unwrap: unwrapEnvInvocation,
     transparentUsage: (argv) => !envInvocationUsesModifiers(argv),
   },
+  { name: "firejail" },
   { name: "flock", unwrap: unwrapFlockInvocation, transparentUsage: true },
+  { name: "gosu" },
   { name: "ionice" },
+  { name: "linux32" },
+  { name: "linux64" },
   { name: "nice", unwrap: unwrapNiceInvocation, transparentUsage: true },
+  { name: "nsenter" },
   { name: "nohup", unwrap: unwrapNohupInvocation, transparentUsage: true },
+  { name: "numactl" },
+  { name: "pkexec" },
+  { name: "proot" },
+  { name: "proxychains" },
+  { name: "proxychains4" },
+  { name: "runuser" },
   { name: "sandbox-exec", unwrap: unwrapSandboxExecInvocation, transparentUsage: true },
   { name: "script", unwrap: unwrapScriptInvocation, transparentUsage: false },
+  { name: "setarch" },
   { name: "setsid" },
+  { name: "setpriv" },
   { name: "stdbuf", unwrap: unwrapStdbufInvocation, transparentUsage: true },
+  { name: "su" },
   { name: "sudo" },
+  { name: "systemd-run" },
   { name: "taskset" },
   {
     name: "time",
@@ -469,12 +488,19 @@ const DISPATCH_WRAPPER_SPECS: readonly DispatchWrapperSpec[] = [
     transparentUsage: (argv) => !timeInvocationWritesOutputFile(argv),
   },
   { name: "timeout", unwrap: unwrapTimeoutInvocation, transparentUsage: true },
+  { name: "torify" },
+  { name: "torsocks" },
+  { name: "unbuffer" },
+  { name: "unshare" },
+  { name: "watch" },
   {
     name: "xcrun",
+    changesExecutableLookup: true,
     unwrap: (argv, platform) =>
       supportsXcrunDispatchWrapper(platform) ? unwrapXcrunInvocation(argv) : null,
     transparentUsage: (_argv, platform) => supportsXcrunDispatchWrapper(platform),
   },
+  { name: "xvfb-run" },
 ];
 
 const DISPATCH_WRAPPER_SPEC_BY_NAME = new Map(
@@ -490,11 +516,15 @@ type DispatchWrapperUnwrapResult =
   | { kind: "unwrapped"; wrapper: string; argv: string[] };
 
 type DispatchWrapperTrustPlan = {
+  dispatchChainComplete: boolean;
   argv: string[];
   wrappers: string[];
+  wrapperInvocations: DispatchWrapperInvocation[];
   policyBlocked: boolean;
   blockedWrapper?: string;
 };
+
+export type DispatchWrapperInvocation = { wrapper: string; sourceArgv: string[] };
 
 function blockDispatchWrapper(wrapper: string): DispatchWrapperUnwrapResult {
   return { kind: "blocked", wrapper };
@@ -559,12 +589,15 @@ function isSemanticDispatchWrapperUsage(
 function blockedDispatchWrapperPlan(params: {
   argv: string[];
   wrappers: string[];
+  wrapperInvocations: DispatchWrapperInvocation[];
   blockedWrapper: string;
 }): DispatchWrapperTrustPlan {
   return {
     argv: params.argv,
     wrappers: params.wrappers,
+    wrapperInvocations: params.wrapperInvocations,
     policyBlocked: true,
+    dispatchChainComplete: false,
     blockedWrapper: params.blockedWrapper,
   };
 }
@@ -576,12 +609,14 @@ export function resolveDispatchWrapperTrustPlan(
 ): DispatchWrapperTrustPlan {
   let current = argv;
   const wrappers: string[] = [];
+  const wrapperInvocations: DispatchWrapperInvocation[] = [];
   for (let depth = 0; depth < maxDepth; depth += 1) {
     const unwrap = unwrapKnownDispatchWrapperInvocation(current, platform);
     if (unwrap.kind === "blocked") {
       return blockedDispatchWrapperPlan({
         argv: current,
         wrappers,
+        wrapperInvocations,
         blockedWrapper: unwrap.wrapper,
       });
     }
@@ -589,10 +624,12 @@ export function resolveDispatchWrapperTrustPlan(
       break;
     }
     wrappers.push(unwrap.wrapper);
+    wrapperInvocations.push({ wrapper: unwrap.wrapper, sourceArgv: [...current] });
     if (isSemanticDispatchWrapperUsage(unwrap.wrapper, current, platform)) {
       return blockedDispatchWrapperPlan({
         argv: current,
         wrappers,
+        wrapperInvocations,
         blockedWrapper: unwrap.wrapper,
       });
     }
@@ -604,11 +641,20 @@ export function resolveDispatchWrapperTrustPlan(
       return blockedDispatchWrapperPlan({
         argv: current,
         wrappers,
+        wrapperInvocations,
         blockedWrapper: overflow.wrapper,
       });
     }
   }
-  return { argv: current, wrappers, policyBlocked: false };
+  return {
+    argv: current,
+    wrappers,
+    wrapperInvocations,
+    policyBlocked: false,
+    dispatchChainComplete: wrappers.every(
+      (wrapper) => !DISPATCH_WRAPPER_SPEC_BY_NAME.get(wrapper)?.changesExecutableLookup,
+    ),
+  };
 }
 
 export function hasDispatchEnvManipulation(argv: string[]): boolean {

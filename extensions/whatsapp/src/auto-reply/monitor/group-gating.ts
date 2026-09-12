@@ -1,6 +1,9 @@
 // Whatsapp plugin module implements group gating behavior.
 import type { BuildMentionRegexesOptions } from "openclaw/plugin-sdk/channel-mention-gating";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { createDedupeCache } from "openclaw/plugin-sdk/dedupe-runtime";
+import { formatAudioTranscriptForAgent } from "openclaw/plugin-sdk/media-understanding-runtime";
+import type { HistoryMediaEntry } from "openclaw/plugin-sdk/reply-history";
 import { resolveWhatsAppGroupsConfigPath } from "../../group-config-path.js";
 import {
   getPrimaryIdentityId,
@@ -32,6 +35,7 @@ export type GroupHistoryEntry = {
   timestamp?: number;
   id?: string;
   senderJid?: string;
+  media?: HistoryMediaEntry[];
 };
 
 type ApplyGroupGatingParams = {
@@ -57,25 +61,13 @@ type ApplyGroupGatingParams = {
 };
 
 const MAX_GROUP_DROP_WARNINGS = 100;
-const groupDropWarned = new Set<string>();
-
-export function resetGroupDropWarningsForTests() {
-  groupDropWarned.clear();
-}
+const groupDropWarned = createDedupeCache({
+  ttlMs: 0,
+  maxSize: MAX_GROUP_DROP_WARNINGS,
+});
 
 function shouldWarnForGroupDrop(warnKey: string): boolean {
-  if (groupDropWarned.has(warnKey)) {
-    return false;
-  }
-  groupDropWarned.add(warnKey);
-  while (groupDropWarned.size > MAX_GROUP_DROP_WARNINGS) {
-    const oldest = groupDropWarned.values().next().value;
-    if (!oldest) {
-      break;
-    }
-    groupDropWarned.delete(oldest);
-  }
-  return true;
+  return !groupDropWarned.check(warnKey);
 }
 
 function isOwnerSender(
@@ -118,6 +110,18 @@ function recordPendingGroupHistoryEntry(params: {
       timestamp: params.msg.event.timestamp,
       id: params.msg.event.id,
       senderJid: senderIdentity.jid ?? params.msg.platform.senderJid,
+      ...(params.msg.payload.media
+        ? {
+            media: [
+              {
+                path: params.msg.payload.media.path,
+                url: params.msg.payload.media.url ?? params.msg.payload.media.path,
+                contentType: params.msg.payload.media.type,
+                kind: params.msg.payload.media.kind ?? undefined,
+              },
+            ],
+          }
+        : {}),
     },
   });
 }
@@ -151,7 +155,7 @@ export async function applyGroupGating(params: ApplyGroupGatingParams) {
   const conversationGroupPolicy = inboundPolicy.resolveConversationGroupPolicy(conversationId);
   if (conversationGroupPolicy.allowlistEnabled && !conversationGroupPolicy.allowed) {
     const accountId = inboundPolicy.account.accountId;
-    const warnKey = `${accountId}:${conversationId}`;
+    const warnKey = JSON.stringify([accountId, conversationId, "group registry"]);
     if (shouldWarnForGroupDrop(warnKey)) {
       const groupsPath = resolveWhatsAppGroupsConfigPath({ cfg: params.cfg, accountId });
       params.replyLogger.warn(
@@ -266,10 +270,23 @@ export async function applyGroupGating(params: ApplyGroupGatingParams) {
       );
       return { shouldProcess: false, needsMentionText: true } as const;
     }
+    const accountId = inboundPolicy.account.accountId;
+    if (shouldWarnForGroupDrop(JSON.stringify([accountId, conversationId, "no mention"]))) {
+      const groupsPath = resolveWhatsAppGroupsConfigPath({ cfg: params.cfg, accountId });
+      params.replyLogger.warn(
+        { conversationId, accountId, groupsPath },
+        `WhatsApp group ${conversationId}: skipping messages without a mention. Mention patterns can be derived from the agent identity name. Use /activation always for this session, or set ${groupsPath}[${JSON.stringify(conversationId)}].requireMention=false for the default. Preserve existing groups entries; when adding the first groups map, include "*": {} to keep other chats admitted.`,
+      );
+    }
+    // Mention matching needs raw STT text, but deferred history is model-visible later.
+    const pendingHistoryBody =
+      params.mentionText === undefined
+        ? undefined
+        : formatAudioTranscriptForAgent(params.mentionText);
     return skipGroupMessageAndStoreHistory(
       params,
       `Group message stored for context (no mention detected) in ${conversationId}: ${mentionMsg.payload.body}`,
-      params.mentionText,
+      pendingHistoryBody,
     );
   }
 

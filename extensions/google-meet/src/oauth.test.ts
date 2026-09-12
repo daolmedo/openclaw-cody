@@ -1,9 +1,9 @@
 // Google Meet tests cover oauth plugin behavior.
 import { createServer, type Server } from "node:http";
+import * as providerAuthRuntime from "openclaw/plugin-sdk/provider-auth-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildGoogleMeetAuthUrl,
-  refreshGoogleMeetAccessToken,
   resolveGoogleMeetAccessToken,
   waitForGoogleMeetAuthCode,
 } from "./oauth.js";
@@ -84,15 +84,13 @@ describe("Google Meet OAuth", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const tokens = await refreshGoogleMeetAccessToken({
+    const tokens = await resolveGoogleMeetAccessToken({
       clientId: "client-id",
       clientSecret: "client-secret",
       refreshToken: "refresh-token",
     });
     expect(tokens.accessToken).toBe("new-access-token");
-    expect(tokens.refreshToken).toBeUndefined();
-    expect(tokens.scope).toBeUndefined();
-    expect(tokens.tokenType).toBe("Bearer");
+    expect(tokens.refreshed).toBe(true);
     expect(Number.isFinite(tokens.expiresAt)).toBe(true);
     expect(tokens.expiresAt).toBeGreaterThan(Date.now());
     const body = fetchMock.mock.calls[0]?.[1]?.body;
@@ -115,7 +113,7 @@ describe("Google Meet OAuth", () => {
     );
 
     await expect(
-      refreshGoogleMeetAccessToken({
+      resolveGoogleMeetAccessToken({
         clientId: "client-id",
         refreshToken: "refresh-token",
       }),
@@ -159,7 +157,7 @@ describe("Google Meet OAuth", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const tokens = await refreshGoogleMeetAccessToken({
+    const tokens = await resolveGoogleMeetAccessToken({
       clientId: "client-id",
       refreshToken: "refresh-token",
     });
@@ -180,7 +178,7 @@ describe("Google Meet OAuth", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const tokens = await refreshGoogleMeetAccessToken({
+    const tokens = await resolveGoogleMeetAccessToken({
       clientId: "client-id",
       refreshToken: "refresh-token",
     });
@@ -202,7 +200,7 @@ describe("Google Meet OAuth", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const tokens = await refreshGoogleMeetAccessToken({
+    const tokens = await resolveGoogleMeetAccessToken({
       clientId: "client-id",
       refreshToken: "refresh-token",
     });
@@ -234,6 +232,9 @@ describe("Google Meet OAuth", () => {
   });
 
   it("propagates non-listener callback failures without manual fallback", async () => {
+    // Test the SDK rejection without requiring the fixed callback port to be free.
+    const timeoutError = new Error("OAuth callback timeout");
+    vi.spyOn(providerAuthRuntime, "waitForLocalOAuthCallback").mockRejectedValueOnce(timeoutError);
     const promptInput = vi.fn(async () => "unused");
     await expect(
       waitForGoogleMeetAuthCode({
@@ -244,7 +245,7 @@ describe("Google Meet OAuth", () => {
         promptInput,
         writeLine: () => {},
       }),
-    ).rejects.toThrow(/timeout/i);
+    ).rejects.toBe(timeoutError);
     expect(promptInput).not.toHaveBeenCalled();
   });
 });

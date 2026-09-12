@@ -48,7 +48,7 @@ function resolveRawHomeDir(env: NodeJS.ProcessEnv, homedir: () => string): strin
   }
   if (explicitHome === "~" || explicitHome.startsWith("~/") || explicitHome.startsWith("~\\")) {
     const fallbackHome = resolveRawOsHomeDir(env, homedir);
-    return fallbackHome ? explicitHome.replace(/^~(?=$|[\\/])/, fallbackHome) : undefined;
+    return fallbackHome ? explicitHome.replace(/^~(?=$|[\\/])/, () => fallbackHome) : undefined;
   }
   return explicitHome;
 }
@@ -117,7 +117,7 @@ export function expandHomePrefix(
   if (!home) {
     return input;
   }
-  return input.replace(/^~(?=$|[\\/])/, home);
+  return input.replace(/^~(?=$|[\\/])/, () => home);
 }
 
 /** Resolves a user-supplied path after trimming and expanding against the effective home. */
@@ -143,16 +143,15 @@ export function resolveHomeRelativePath(
   return path.resolve(trimmed);
 }
 
-/**
- * Backward-compatible alias for resolving user paths against the effective home.
- *
- * @deprecated Use resolveHomeRelativePath.
- */
+/** Resolves a user path against the effective home, preserving an empty input. */
 export function resolveUserPath(
   input: string,
   env: NodeJS.ProcessEnv = process.env,
   homedir: () => string = os.homedir,
 ): string {
+  if (!input) {
+    return "";
+  }
   return resolveHomeRelativePath(input, { env, homedir });
 }
 

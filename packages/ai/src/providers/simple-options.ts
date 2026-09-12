@@ -1,3 +1,5 @@
+import { reasoningTagTextPolicy } from "../provider-options.js";
+import { copyProviderAcceptanceObserver } from "../transports/transport-stream-shared.js";
 // Simple provider option helpers normalize lightweight provider configuration.
 import type {
   Model,
@@ -19,7 +21,7 @@ export function buildBaseOptions(
 ): StreamOptions & FirstEventStreamOptions {
   void model;
   const firstEventOptions = options as FirstEventStreamOptions | undefined;
-  return {
+  const baseOptions = {
     temperature: options?.temperature,
     maxTokens: options?.maxTokens,
     stop: options?.stop,
@@ -35,12 +37,31 @@ export function buildBaseOptions(
     timeoutMs: options?.timeoutMs,
     firstEventTimeoutMs: firstEventOptions?.firstEventTimeoutMs,
     onFirstEventTimeout: firstEventOptions?.onFirstEventTimeout,
-    maxRetries: options?.maxRetries,
     maxRetryDelayMs: options?.maxRetryDelayMs,
     metadata: options?.metadata,
   };
+  reasoningTagTextPolicy.copy(options, baseOptions);
+  return copyProviderAcceptanceObserver(options, baseOptions);
 }
 
+export function clampMaxTokensToModel(model: Model, requestedMaxTokens: number): number;
+export function clampMaxTokensToModel(
+  model: Model,
+  requestedMaxTokens: number | undefined,
+): number | undefined;
+export function clampMaxTokensToModel(
+  model: Model,
+  requestedMaxTokens: number | undefined,
+): number | undefined {
+  return requestedMaxTokens === undefined
+    ? undefined
+    : Math.max(1, Math.min(requestedMaxTokens, model.maxTokens));
+}
+
+export function clampReasoning(effort: ThinkingLevel): Exclude<ThinkingLevel, "xhigh">;
+export function clampReasoning(
+  effort: ThinkingLevel | undefined,
+): Exclude<ThinkingLevel, "xhigh"> | undefined;
 export function clampReasoning(
   effort: ThinkingLevel | undefined,
 ): Exclude<ThinkingLevel, "xhigh"> | undefined {
@@ -54,7 +75,7 @@ export function adjustMaxTokensForThinking(
   reasoningLevel: ThinkingLevel,
   customBudgets?: ThinkingBudgets,
 ): { maxTokens: number; thinkingBudget: number } {
-  const defaultBudgets: ThinkingBudgets = {
+  const defaultBudgets: Required<ThinkingBudgets> = {
     minimal: 1024,
     low: 2048,
     medium: 8192,
@@ -64,8 +85,8 @@ export function adjustMaxTokensForThinking(
   const budgets = { ...defaultBudgets, ...customBudgets };
 
   const minOutputTokens = 1024;
-  const level = clampReasoning(reasoningLevel)!;
-  let thinkingBudget = budgets[level]!;
+  const level = clampReasoning(reasoningLevel);
+  let thinkingBudget = budgets[level];
   const maxTokens =
     baseMaxTokens === undefined
       ? modelMaxTokens

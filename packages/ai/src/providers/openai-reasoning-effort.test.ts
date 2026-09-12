@@ -4,6 +4,8 @@ import {
   isOpenAIGpt56Model,
   resolveOpenAIReasoningEffortForModel,
   resolveOpenAISupportedReasoningEfforts,
+  supportsOpenAIReasoningEffort,
+  supportsOpenAITemperature,
 } from "./openai-reasoning-effort.js";
 
 describe("OpenAI reasoning effort support", () => {
@@ -26,10 +28,8 @@ describe("OpenAI reasoning effort support", () => {
     expect(resolveOpenAIReasoningEffortForModel({ model: luna, effort: "off" })).toBe("none");
   });
 
-  it.each([
-    { provider: "openai", id: "gpt-5.5" },
-    { provider: "openai", id: "gpt-5.5" },
-  ])("preserves xhigh for $provider/$id", (model) => {
+  it("preserves xhigh for openai/gpt-5.5", () => {
+    const model = { provider: "openai", id: "gpt-5.5" };
     expect(resolveOpenAISupportedReasoningEfforts(model)).toContain("xhigh");
     expect(resolveOpenAIReasoningEffortForModel({ model, effort: "xhigh" })).toBe("xhigh");
   });
@@ -44,6 +44,14 @@ describe("OpenAI reasoning effort support", () => {
     const model = { provider: "openai", id: "gpt-5.4-mini", api: "openai-responses" };
     expect(resolveOpenAISupportedReasoningEfforts(model)).toContain("medium");
     expect(resolveOpenAIReasoningEffortForModel({ model, effort: "medium" })).toBe("medium");
+  });
+
+  it("matches canonical reasoning efforts case-insensitively", () => {
+    const model = { provider: "openai", id: "gpt-5.6-sol" };
+
+    expect(resolveOpenAIReasoningEffortForModel({ model, effort: "HIGH" })).toBe("high");
+    expect(resolveOpenAIReasoningEffortForModel({ model, effort: " XHIGH " })).toBe("xhigh");
+    expect(resolveOpenAIReasoningEffortForModel({ model, effort: "MAX" })).toBe("max");
   });
 
   it("does not downgrade xhigh when model compat metadata declares it explicitly", () => {
@@ -91,19 +99,113 @@ describe("OpenAI reasoning effort support", () => {
     ).toBe("none");
   });
 
-  it("omits unsupported disabled reasoning instead of falling back to enabled effort", () => {
+  it("preserves provider-native compat values mapped from canonical efforts", () => {
+    const model = {
+      provider: "example",
+      id: "custom-reasoning",
+      compat: {
+        supportedReasoningEfforts: ["ProviderDefault"],
+        reasoningEffortMap: {
+          high: "ProviderDefault",
+        },
+      },
+    };
+
     expect(
       resolveOpenAIReasoningEffortForModel({
-        model: { provider: "groq", id: "openai/gpt-oss-120b" },
-        effort: "off",
+        model,
+        effort: "HIGH",
+        fallbackMap: model.compat.reasoningEffortMap,
       }),
-    ).toBeUndefined();
+    ).toBe("ProviderDefault");
+  });
+
+  it("matches canonical fallback map keys case-insensitively", () => {
+    const model = {
+      provider: "example",
+      id: "custom-reasoning",
+      compat: {
+        supportedReasoningEfforts: ["ProviderLow", "ProviderHigh"],
+        reasoningEffortMap: {
+          HIGH: "ProviderHigh",
+        },
+      },
+    };
+
+    expect(
+      resolveOpenAIReasoningEffortForModel({
+        model,
+        effort: "HIGH",
+        fallbackMap: model.compat.reasoningEffortMap,
+      }),
+    ).toBe("ProviderHigh");
+  });
+
+  it("preserves canonical-looking provider-native compat values mapped from canonical efforts", () => {
+    const model = {
+      provider: "example",
+      id: "custom-reasoning",
+      compat: {
+        supportedReasoningEfforts: ["LOW", "MEDIUM", "HIGH"],
+        reasoningEffortMap: {
+          high: "HIGH",
+        },
+      },
+    };
+
+    expect(resolveOpenAISupportedReasoningEfforts(model)).toEqual(["LOW", "MEDIUM", "HIGH"]);
+    expect(
+      resolveOpenAIReasoningEffortForModel({
+        model,
+        effort: "HIGH",
+        fallbackMap: model.compat.reasoningEffortMap,
+      }),
+    ).toBe("HIGH");
+  });
+
+  it("requires an explicit map for canonical-looking provider casing", () => {
+    const model = {
+      provider: "example",
+      id: "custom-reasoning",
+      compat: {
+        supportedReasoningEfforts: ["NONE", "HIGH"],
+      },
+    };
+
+    expect(resolveOpenAIReasoningEffortForModel({ model, effort: "none" })).toBeUndefined();
+    expect(
+      resolveOpenAIReasoningEffortForModel({
+        model,
+        effort: "none",
+        fallbackMap: { none: "NONE" },
+      }),
+    ).toBe("NONE");
+  });
+
+  it("does not fold provider-native compat values", () => {
+    const model = {
+      provider: "example",
+      id: "custom-reasoning",
+      compat: {
+        supportedReasoningEfforts: ["ProviderDefault"],
+      },
+    };
+
+    expect(supportsOpenAIReasoningEffort(model, "ProviderDefault")).toBe(true);
+    expect(supportsOpenAIReasoningEffort(model, "providerdefault")).toBe(false);
+  });
+
+  it("omits unsupported disabled reasoning instead of falling back to enabled effort", () => {
+    const model = { provider: "groq", id: "openai/gpt-oss-120b" };
+
+    expect(resolveOpenAIReasoningEffortForModel({ model, effort: "off" })).toBeUndefined();
+    expect(resolveOpenAIReasoningEffortForModel({ model, effort: "OFF" })).toBeUndefined();
   });
 
   it("honors compat metadata that disables reasoning effort payloads", () => {
     const model = {
       provider: "xai",
-      id: "grok-4.20-beta-latest-reasoning",
+      id: "grok-4.20-0309-reasoning",
       compat: { supportsReasoningEffort: false },
     };
 
@@ -111,14 +213,42 @@ describe("OpenAI reasoning effort support", () => {
     expect(resolveOpenAIReasoningEffortForModel({ model, effort: "high" })).toBeUndefined();
   });
 
-  it("does not turn disabled reasoning into a fallback effort when compat omits none", () => {
+  it("passes disabled reasoning when xAI compat explicitly supports none", () => {
     const model = {
       provider: "xai",
       id: "grok-4.3",
-      compat: { supportedReasoningEfforts: ["low", "medium", "high"] },
+      compat: { supportedReasoningEfforts: ["none", "low", "medium", "high"] },
     };
 
-    expect(resolveOpenAIReasoningEffortForModel({ model, effort: "none" })).toBeUndefined();
+    expect(resolveOpenAIReasoningEffortForModel({ model, effort: "none" })).toBe("none");
     expect(resolveOpenAIReasoningEffortForModel({ model, effort: "high" })).toBe("high");
+  });
+});
+
+describe("OpenAI temperature support", () => {
+  it("rejects temperature for the GPT-5.6 family, including dated snapshots", () => {
+    expect(supportsOpenAITemperature({ id: "gpt-5.6" })).toBe(false);
+    expect(supportsOpenAITemperature({ id: "gpt-5.6-luna" })).toBe(false);
+    expect(supportsOpenAITemperature({ id: "gpt-5.6-terra-2026-04-01" })).toBe(false);
+  });
+
+  it("keeps temperature for earlier families and generic models", () => {
+    expect(supportsOpenAITemperature({ id: "gpt-5.5" })).toBe(true);
+    expect(supportsOpenAITemperature({ id: "gpt-5.4-mini" })).toBe(true);
+    expect(supportsOpenAITemperature({ id: "gpt-5.60" })).toBe(true);
+    expect(supportsOpenAITemperature({ id: "gpt-6-astra-custom" })).toBe(true);
+    expect(supportsOpenAITemperature({ id: "llama-4-70b" })).toBe(true);
+  });
+
+  it("honors catalog compat overrides in both directions", () => {
+    expect(
+      supportsOpenAITemperature({ id: "gpt-6-astra", compat: { supportsTemperature: true } }),
+    ).toBe(true);
+    expect(
+      supportsOpenAITemperature({ id: "gpt-5.6-luna", compat: { supportsTemperature: true } }),
+    ).toBe(true);
+    expect(
+      supportsOpenAITemperature({ id: "gpt-5.5", compat: { supportsTemperature: false } }),
+    ).toBe(false);
   });
 });

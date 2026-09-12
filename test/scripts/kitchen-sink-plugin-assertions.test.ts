@@ -22,9 +22,15 @@ const REQUIRED_FULL_DIAGNOSTIC_CANARIES = [
   "agent tool result middleware must be a function",
   "trusted tool policy registration requires id, description, and evaluate()",
   "plugin must declare contracts.tools for: kitchen-sink-tool",
-  'channel "kitchen-sink-channel-probe" registration missing required config helpers',
+  'channel "kitchen-sink-channel-probe" registration missing or invalid required capabilities.chatTypes',
   'agent harness "kitchen-sink-agent-harness" registration missing required runtime methods',
   "session scheduler job registration requires unique id, sessionKey, and kind",
+];
+const FROZEN_MEMORY_EMBEDDING_DIAGNOSTIC =
+  "plugin must own memory slot or declare contracts.memoryEmbeddingProviders for adapter: kitchen-sink-memory-embedding-provider";
+const PUBLISHED_INVALID_REGISTRATION_DIAGNOSTICS = [
+  "invalid widget presenter registration",
+  "worker provider registration missing method: resolveAllocation",
 ];
 
 function writeJson(filePath: string, value: unknown) {
@@ -71,11 +77,13 @@ function runAssertInstalled({
   diagnostics = [],
   env = {},
   inspectPayload,
+  surfaceMode = "full",
 }: {
   allInspectPayload?: unknown;
   diagnostics?: Array<{ level: string; message: string }>;
   env?: NodeJS.ProcessEnv;
   inspectPayload?: ReturnType<typeof fullSurfaceInspectPayload>;
+  surfaceMode?: string;
 } = {}) {
   const label = `diagnostics-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const pluginId = "openclaw-kitchen-sink-fixture";
@@ -121,7 +129,7 @@ function runAssertInstalled({
         KITCHEN_SINK_LABEL: label,
         KITCHEN_SINK_SOURCE: "npm",
         KITCHEN_SINK_SPEC: "npm:@openclaw/kitchen-sink@latest",
-        KITCHEN_SINK_SURFACE_MODE: "full",
+        KITCHEN_SINK_SURFACE_MODE: surfaceMode,
         KITCHEN_SINK_TMP_DIR: scratchRoot,
       },
     });
@@ -260,8 +268,12 @@ function toGitBashPath(value: string) {
   if (!match) {
     return value;
   }
-
-  return `/${match[1].toLowerCase()}/${match[2].replaceAll("\\", "/")}`;
+  const drive = match[1];
+  const suffix = match[2];
+  if (drive === undefined || suffix === undefined) {
+    return value;
+  }
+  return `/${drive.toLowerCase()}/${suffix.replaceAll("\\", "/")}`;
 }
 
 describe("kitchen-sink plugin assertions", () => {
@@ -301,12 +313,103 @@ describe("kitchen-sink plugin assertions", () => {
     );
   });
 
-  it("accepts published full-surface installs with stable diagnostic canaries", () => {
+  it.each(["full", "adversarial"])(
+    "accepts published invalid registration probes in %s mode",
+    (surfaceMode) => {
+      const result = runAssertInstalled({
+        diagnostics: diagnosticErrors([
+          ...REQUIRED_FULL_DIAGNOSTIC_CANARIES,
+          "memory prompt preparation registration missing prepare function",
+          ...PUBLISHED_INVALID_REGISTRATION_DIAGNOSTICS,
+        ]),
+        surfaceMode,
+      });
+
+      expect(result.status, result.stderr).toBe(0);
+    },
+  );
+
+  it.each(["conformance", "basic", "unknown"])(
+    "rejects published invalid registration probes in %s mode",
+    (surfaceMode) => {
+      const messages = [
+        "plugin must declare contracts.tools for: kitchen-sink-tool",
+        ...PUBLISHED_INVALID_REGISTRATION_DIAGNOSTICS,
+      ];
+      const result = runAssertInstalled({
+        diagnostics: diagnosticErrors(messages),
+        surfaceMode,
+      });
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(
+        `unexpected kitchen-sink diagnostic errors: ${messages.join(", ")}`,
+      );
+    },
+  );
+
+  it.each(["full", "adversarial"])(
+    "rejects an unknown diagnostic alongside published probes in %s mode",
+    (surfaceMode) => {
+      const message = "unexpected plugin registration failure";
+      const result = runAssertInstalled({
+        diagnostics: diagnosticErrors([
+          message,
+          ...REQUIRED_FULL_DIAGNOSTIC_CANARIES,
+          ...PUBLISHED_INVALID_REGISTRATION_DIAGNOSTICS,
+        ]),
+        surfaceMode,
+      });
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(`unexpected kitchen-sink diagnostic error: ${message}`);
+    },
+  );
+
+  it("accepts only the candidate memory diagnostic for an authorized frozen target", () => {
     const result = runAssertInstalled({
-      diagnostics: diagnosticErrors(REQUIRED_FULL_DIAGNOSTIC_CANARIES),
+      diagnostics: diagnosticErrors([FROZEN_MEMORY_EMBEDDING_DIAGNOSTIC]),
+      env: { OPENCLAW_FROZEN_PLUGIN_PRERELEASE_FIXTURE_DIALECT: "legacy" },
+      surfaceMode: "conformance",
     });
 
     expect(result.status).toBe(0);
+  });
+
+  it("rejects the candidate memory diagnostic for an ordinary target", () => {
+    const result = runAssertInstalled({
+      diagnostics: diagnosticErrors([FROZEN_MEMORY_EMBEDDING_DIAGNOSTIC]),
+      surfaceMode: "conformance",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(FROZEN_MEMORY_EMBEDDING_DIAGNOSTIC);
+  });
+
+  it("persists the scenario personality in plugin config", () => {
+    const home = mkdtempSync(path.join(tmpdir(), "openclaw-kitchen-sink-config-"));
+    try {
+      const result = spawnSync(process.execPath, [ASSERTIONS_SCRIPT, "configure-runtime"], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: home,
+          KITCHEN_SINK_ID: "openclaw-kitchen-sink-fixture",
+          KITCHEN_SINK_PERSONALITY: "conformance",
+        },
+      });
+
+      expect(result.status).toBe(0);
+      const config = JSON.parse(
+        readFileSync(path.join(home, ".openclaw", "openclaw.json"), "utf8"),
+      );
+      expect(config.plugins.entries["openclaw-kitchen-sink-fixture"]).toMatchObject({
+        config: { personality: "conformance" },
+        hooks: { allowConversationAccess: true },
+      });
+    } finally {
+      rmSync(home, { force: true, recursive: true });
+    }
   });
 
   it("requires kitchen-sink plugins to appear in inspect-all output", () => {
@@ -554,7 +657,7 @@ describe("kitchen-sink plugin assertions", () => {
   it("rejects kitchen-sink log scans without an isolated scratch root", () => {
     const parent = mkdtempSync(path.join(tmpdir(), "openclaw-kitchen-sink-scan-"));
     try {
-      const spawnEnv = { ...process.env, HOME: parent };
+      const spawnEnv: NodeJS.ProcessEnv = { ...process.env, HOME: parent };
       delete spawnEnv.KITCHEN_SINK_TMP_DIR;
       const result = spawnSync(process.execPath, [ASSERTIONS_SCRIPT, "scan-logs"], {
         encoding: "utf8",

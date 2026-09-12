@@ -1,3 +1,4 @@
+import { parseDateStringTimestampMs } from "openclaw/plugin-sdk/number-runtime";
 // Memory Wiki plugin module implements claim health behavior.
 import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { WikiClaim, WikiPageSummary } from "./markdown.js";
@@ -50,11 +51,7 @@ export type WikiPageContradictionCluster = {
 };
 
 function parseTimestamp(value?: string): number | null {
-  if (!value?.trim()) {
-    return null;
-  }
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : null;
+  return parseDateStringTimestampMs(value) ?? null;
 }
 
 function clampDaysSinceTouch(daysSinceTouch: number): number {
@@ -136,8 +133,8 @@ export function assessClaimFreshness(params: {
   claim: WikiClaim;
   now?: Date;
 }): WikiFreshness {
-  let hasClaimTimestamp = typeof params.claim.updatedAt === "string" &&
-    params.claim.updatedAt.trim().length > 0;
+  let hasClaimTimestamp =
+    typeof params.claim.updatedAt === "string" && params.claim.updatedAt.trim().length > 0;
   let latestTimestamp = resolveLatestTimestamp([params.claim.updatedAt]);
   let latestMs = parseTimestamp(latestTimestamp) ?? -1;
   for (const evidence of params.claim.evidence) {

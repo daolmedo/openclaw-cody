@@ -1,6 +1,6 @@
 // Lazy command-group registration: placeholder commands are replaced by real subcommand groups.
-import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import type { Command } from "commander";
+import { getCliPluginInvocationResources } from "../runtime-cleanup-scope.js";
 import { removeCommandByName } from "./command-tree.js";
 import { registerLazyCommand } from "./register-lazy-command.js";
 
@@ -8,11 +8,12 @@ import { registerLazyCommand } from "./register-lazy-command.js";
 export type CommandGroupPlaceholder = {
   name: string;
   description: string;
+  hidden?: boolean;
   options?: readonly CommandGroupPlaceholderOption[];
 };
 
 /** Commander option metadata attached to a lazy placeholder. */
-export type CommandGroupPlaceholderOption = {
+type CommandGroupPlaceholderOption = {
   flags: string;
   description: string;
 };
@@ -69,11 +70,10 @@ export function registerLazyCommandGroup(
     program,
     name: placeholder.name,
     description: placeholder.description,
+    hidden: placeholder.hidden,
     options: placeholder.options,
-    removeNames: uniqueStrings(getCommandGroupNames(entry)),
-    register: async () => {
-      await entry.register(program);
-    },
+    removeNames: getCommandGroupNames(entry),
+    register: () => entry.register(program),
   });
 }
 
@@ -88,8 +88,13 @@ export function registerCommandGroups(
   },
 ) {
   if (params.eager) {
+    const resources = getCliPluginInvocationResources();
     for (const entry of entries) {
-      void entry.register(program);
+      if (resources) {
+        resources.register(() => entry.register(program));
+      } else {
+        void entry.register(program);
+      }
     }
     return;
   }

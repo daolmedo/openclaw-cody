@@ -1,7 +1,7 @@
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 // Control UI module implements user identity behavior.
-import { coerceIdentityValue } from "../../../src/shared/assistant-identity-values.js";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { isRenderableControlUiAvatarUrl, resolveChatAvatarRenderUrl } from "../lib/avatar.ts";
-import { normalizeOptionalString } from "../lib/string-coerce.ts";
 
 const MAX_LOCAL_USER_NAME = 50;
 const MAX_LOCAL_USER_TEXT_AVATAR = 16;
@@ -29,12 +29,9 @@ function normalizeAvatar(value?: string | null): string | null {
 export function normalizeLocalUserIdentity(
   input?: Partial<LocalUserIdentity> | null,
 ): LocalUserIdentity {
+  const name = normalizeOptionalString(input?.name);
   return {
-    name:
-      coerceIdentityValue(
-        typeof input?.name === "string" ? input.name : undefined,
-        MAX_LOCAL_USER_NAME,
-      ) ?? null,
+    name: name ? truncateUtf16Safe(name, MAX_LOCAL_USER_NAME) : null,
     avatar: normalizeAvatar(input?.avatar),
   };
 }

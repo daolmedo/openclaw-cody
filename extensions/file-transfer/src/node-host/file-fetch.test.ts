@@ -4,11 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  FILE_FETCH_DEFAULT_MAX_BYTES,
-  FILE_FETCH_HARD_MAX_BYTES,
-  handleFileFetch,
-} from "./file-fetch.js";
+import { handleFileFetch } from "./file-fetch.js";
 
 let tmpRoot: string;
 
@@ -137,6 +133,55 @@ describe("handleFileFetch — happy path", () => {
     expect(readFileSpy).not.toHaveBeenCalled();
   });
 
+  it.runIf(process.platform !== "win32")(
+    "rejects a retargeted path before reading file bytes",
+    async () => {
+      const first = path.join(tmpRoot, "first.txt");
+      const second = path.join(tmpRoot, "second.txt");
+      const link = path.join(tmpRoot, "current.txt");
+      await fs.writeFile(first, "approved");
+      await fs.writeFile(second, "not approved");
+      await fs.symlink(first, link);
+
+      const preflight = await handleFileFetch({
+        path: link,
+        followSymlinks: true,
+        preflightOnly: true,
+      });
+      expectSuccess(preflight);
+      await fs.unlink(link);
+      await fs.symlink(second, link);
+
+      const result = await handleFileFetch({
+        path: link,
+        followSymlinks: true,
+        expectedCanonicalPath: preflight.path,
+      });
+
+      expectFailureCode(result, "CANONICAL_PATH_CHANGED");
+      expect(result.canonicalPath).toBe(second);
+    },
+  );
+
+  it("rejects a replacement at the same canonical pathname before reading bytes", async () => {
+    const target = path.join(tmpRoot, "target.txt");
+    const moved = path.join(tmpRoot, "moved.txt");
+    await fs.writeFile(target, "approved");
+    const preflight = await handleFileFetch({ path: target, preflightOnly: true });
+    expectSuccess(preflight);
+    await fs.rename(target, moved);
+    await fs.writeFile(target, "not approved");
+
+    const result = await handleFileFetch({
+      path: target,
+      expectedCanonicalPath: preflight.path,
+      expectedBinding: preflight.binding,
+    });
+
+    expectFailureCode(result, "CANONICAL_PATH_CHANGED");
+    expect(await fs.readFile(target, "utf8")).toBe("not approved");
+  });
+
   it("returns a sensible mime type for known extensions", async () => {
     const target = path.join(tmpRoot, "readme.md");
     await fs.writeFile(target, "# heading\n");
@@ -206,23 +251,25 @@ describe("handleFileFetch — size enforcement", () => {
   });
 
   it("clamps maxBytes to the hard ceiling", async () => {
-    expect(FILE_FETCH_HARD_MAX_BYTES).toBe(16 * 1024 * 1024);
-    expect(FILE_FETCH_DEFAULT_MAX_BYTES).toBeLessThanOrEqual(FILE_FETCH_HARD_MAX_BYTES);
+    const target = path.join(tmpRoot, "oversized.bin");
+    await fs.writeFile(target, "");
+    await fs.truncate(target, 16 * 1024 * 1024 + 1);
 
-    // A request asking for a maxBytes well above the hard ceiling should
-    // still be honored for a small file (no error).
-    const target = path.join(tmpRoot, "tiny.bin");
-    await fs.writeFile(target, Buffer.from([0x01, 0x02, 0x03]));
     const r = await handleFileFetch({ path: target, maxBytes: Number.MAX_SAFE_INTEGER });
-    expect(r.ok).toBe(true);
+    expectFailureCode(r, "FILE_TOO_LARGE");
+    expect(r.message).toContain("limit 16777216");
   });
 
   it("uses default cap when maxBytes is not finite or non-positive", async () => {
-    const target = path.join(tmpRoot, "small.bin");
-    await fs.writeFile(target, Buffer.from([0xff]));
-    expectSuccess(await handleFileFetch({ path: target, maxBytes: -1 }));
-    expectSuccess(await handleFileFetch({ path: target, maxBytes: Number.NaN }));
-    expectSuccess(await handleFileFetch({ path: target, maxBytes: "8" as unknown }));
+    const target = path.join(tmpRoot, "above-default.bin");
+    await fs.writeFile(target, "");
+    await fs.truncate(target, 8 * 1024 * 1024 + 1);
+
+    for (const maxBytes of [-1, Number.NaN, "8"] as unknown[]) {
+      const r = await handleFileFetch({ path: target, maxBytes });
+      expectFailureCode(r, "FILE_TOO_LARGE");
+      expect(r.message).toContain("limit 8388608");
+    }
   });
 });
 

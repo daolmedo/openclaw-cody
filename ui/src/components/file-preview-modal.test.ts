@@ -1,11 +1,23 @@
 /* @vitest-environment jsdom */
 
-import { html, nothing, render } from "lit";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawFilePreviewModal } from "./file-preview-modal.ts";
-import "./file-preview-modal.ts";
+import { createDeferred } from "../../../test/helpers/promise.js";
+import { i18n } from "../i18n/index.ts";
+import { OpenClawFilePreviewModal } from "./file-preview-modal.ts";
+
+type FilePreviewModalElement = HTMLElement & {
+  files: typeof files;
+  activePath: string;
+  query: string;
+  contextLabel: string;
+  updateComplete: Promise<boolean>;
+};
 
 let container: HTMLDivElement;
+
+const FILE_PREVIEW_MODAL_ELEMENT_NAME = `test-openclaw-file-preview-modal-${crypto.randomUUID()}`;
+
+customElements.define(FILE_PREVIEW_MODAL_ELEMENT_NAME, class extends OpenClawFilePreviewModal {});
 
 const files = [
   {
@@ -30,29 +42,19 @@ async function renderPreview(options: RenderPreviewOptions = {}) {
   const query = options.query ?? "";
   const activePath = options.activePath ?? "templates/digest.md";
   const previewFiles = options.previewFiles ?? files;
-  render(
-    html`
-      <openclaw-file-preview-modal
-        .files=${previewFiles}
-        .activePath=${activePath}
-        .query=${query}
-        .contextLabel=${"in morning-catchup"}
-      ></openclaw-file-preview-modal>
-    `,
-    container,
-  );
+  const modal = document.createElement(FILE_PREVIEW_MODAL_ELEMENT_NAME) as FilePreviewModalElement;
+  modal.files = previewFiles;
+  modal.activePath = activePath;
+  modal.query = query;
+  modal.contextLabel = "in morning-catchup";
+  container.append(modal);
 
-  const modal = container.querySelector<OpenClawFilePreviewModal>("openclaw-file-preview-modal");
-  expect(modal).toBeInstanceOf(HTMLElement);
-  if (!modal) {
-    throw new Error("expected file preview modal");
-  }
   await modal.updateComplete;
   await modal.updateComplete;
   return modal;
 }
 
-function shadowText(modal: OpenClawFilePreviewModal): string {
+function shadowText(modal: FilePreviewModalElement): string {
   return modal.shadowRoot?.textContent ?? "";
 }
 
@@ -62,10 +64,13 @@ describe("openclaw-file-preview-modal", () => {
     document.body.append(container);
   });
 
-  afterEach(() => {
-    render(nothing, container);
+  afterEach(async () => {
+    await i18n.setLocale("en");
+    container.replaceChildren();
     container.remove();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    delete (document as unknown as { execCommand?: unknown }).execCommand;
   });
 
   it("filters files by path or contents", async () => {
@@ -139,6 +144,44 @@ describe("openclaw-file-preview-modal", () => {
     expect(onSelect.mock.lastCall?.[0].detail).toBe("filters/auto-senders.txt");
   });
 
+  it("handles file navigation from the modal dialog event path", async () => {
+    const modal = await renderPreview();
+    const onSelect = vi.fn();
+    modal.addEventListener("file-preview-select", onSelect);
+
+    const dialog = modal.shadowRoot?.querySelector<HTMLElement>("openclaw-modal-dialog");
+    const arrowDown = new KeyboardEvent("keydown", {
+      key: "ArrowDown",
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+    });
+    dialog?.dispatchEvent(arrowDown);
+
+    expect(arrowDown.defaultPrevented).toBe(true);
+    expect(onSelect.mock.lastCall?.[0].detail).toBe("filters/auto-senders.txt");
+  });
+
+  it("restores modal focus when the same element reconnects", async () => {
+    const modal = await renderPreview();
+    const outside = document.createElement("button");
+    document.body.append(outside);
+
+    try {
+      container.remove();
+      outside.focus();
+      expect(document.activeElement).toBe(outside);
+      document.body.append(container);
+      await modal.updateComplete;
+
+      const input = modal.shadowRoot?.querySelector<HTMLInputElement>(".search");
+      expect(input).toBeInstanceOf(HTMLInputElement);
+      expect(modal.shadowRoot?.activeElement).toBe(input);
+    } finally {
+      outside.remove();
+    }
+  });
+
   it("blocks background arrow-key scrolling even when no files match", async () => {
     const modal = await renderPreview({ query: "missing" });
     const onDocumentKeydown = vi.fn();
@@ -172,11 +215,13 @@ describe("openclaw-file-preview-modal", () => {
     expect(firstChunks.map((chunk) => chunk.textContent ?? "").join("\n")).toBe(firstContents);
 
     body!.scrollTop = 2200;
+    expect(body!.scrollTop).toBe(2200);
 
-    const updatedModal = await renderPreview({ activePath: "second.ts", previewFiles });
-    const updatedBody = updatedModal.shadowRoot?.querySelector<HTMLElement>(".detail-body");
+    modal.activePath = "second.ts";
+    await modal.updateComplete;
+    const updatedBody = modal.shadowRoot?.querySelector<HTMLElement>(".detail-body");
     const secondChunks = [
-      ...(updatedModal.shadowRoot?.querySelectorAll<HTMLElement>(".code-chunk") ?? []),
+      ...(modal.shadowRoot?.querySelectorAll<HTMLElement>(".code-chunk") ?? []),
     ];
 
     expect(updatedBody?.scrollTop).toBe(0);
@@ -197,7 +242,94 @@ describe("openclaw-file-preview-modal", () => {
 
     await vi.waitFor(() => {
       expect(writeText).toHaveBeenCalledWith(contents);
-      expect(copyButton?.dataset.copied).toBe("1");
+      expect(copyButton?.getAttribute("aria-label")).toBe("Copied!");
     });
+  });
+
+  it.each([true, false])(
+    "restores localized file-copy labels after pending success %s",
+    async (copied) => {
+      const write = createDeferred();
+      const writeText = vi.fn(() => write.promise);
+      vi.stubGlobal("navigator", { clipboard: { writeText } });
+      Object.defineProperty(document, "execCommand", { configurable: true, value: () => false });
+      const schedule = vi.spyOn(window, "setTimeout");
+      const modal = await renderPreview();
+      const button = modal.shadowRoot!.querySelector<HTMLButtonElement>(".chat-copy-btn")!;
+      button.click();
+      expect(button.disabled).toBe(true);
+      i18n.registerTranslation("pt-BR", {
+        common: { close: "Fechar", copied: "Copiado!", copyFailed: "Falha ao copiar" },
+        filePreview: {
+          label: "Arquivos de suporte",
+          listLabel: "Arquivos",
+          searchPlaceholder: "Buscar arquivos…",
+          readOnly: "somente leitura",
+          emptyTitle: "Nenhum arquivo corresponde",
+          emptySubtitle: "Tente outro nome ou conteúdo.",
+          copyFile: "Copiar arquivo",
+          fileCount: "{count} arquivos",
+          filteredFileCount: "{count}/{total} arquivos",
+          noMatches: "Nenhum arquivo corresponde.",
+          navigate: "navegar",
+          kind: {
+            text: "Texto",
+            shell: "Shell",
+            file: "Arquivo",
+          },
+        },
+      });
+
+      await i18n.setLocale("pt-BR");
+      await modal.updateComplete;
+
+      expect(
+        modal.shadowRoot?.querySelector<HTMLElement & { label: string }>("openclaw-modal-dialog")
+          ?.label,
+      ).toBe("Arquivos de suporte");
+      expect(shadowText(modal)).toContain("2 arquivos");
+      expect(shadowText(modal)).toContain("Fechar");
+      expect(button.getAttribute("aria-label")).toBe("Copiar arquivo");
+      if (copied) {
+        write.resolve();
+      } else {
+        write.reject(new DOMException("Clipboard access denied"));
+      }
+      const feedback = modal.shadowRoot!.querySelector<HTMLElement>("[role=status]")!;
+      await vi.waitFor(() =>
+        expect(feedback.textContent).toBe(copied ? "Copiado!" : "Falha ao copiar"),
+      );
+      expect(feedback.hidden).toBe(false);
+      expect(button.getAttribute("aria-label")).toBe(feedback.textContent);
+      expect(writeText).toHaveBeenCalledWith("Morning digest template");
+      const reset = schedule.mock.calls.find(
+        ([, delay]) => delay === (copied ? 1_500 : 2_000),
+      )?.[0];
+      if (typeof reset !== "function") {
+        throw new Error("Expected copy feedback to schedule its reset");
+      }
+      reset();
+      expect(button.getAttribute("aria-label")).toBe("Copiar arquivo");
+      expect(feedback.hidden).toBe(true);
+    },
+  );
+
+  it("localizes generic file-kind chips", async () => {
+    i18n.registerTranslation("pt-BR", {
+      filePreview: {
+        kind: {
+          text: "Texto",
+          shell: "Shell",
+          file: "Arquivo",
+        },
+      },
+    });
+    await i18n.setLocale("pt-BR");
+
+    const modal = await renderPreview({
+      activePath: "filters/auto-senders.txt",
+    });
+
+    expect(modal.shadowRoot?.querySelector(".chip.accent")?.textContent).toBe("Texto");
   });
 });

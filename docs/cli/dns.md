@@ -8,7 +8,7 @@ title: "DNS"
 
 # `openclaw dns`
 
-DNS helpers for wide-area discovery (Tailscale + CoreDNS). Currently macOS + Homebrew CoreDNS only.
+DNS helpers for wide-area discovery (Tailscale + CoreDNS). `openclaw dns setup` prints its plan on any platform; applying that plan with `--apply` requires macOS with Homebrew CoreDNS.
 
 Related:
 
@@ -30,7 +30,7 @@ openclaw dns setup --apply
 | `--domain <domain>` | Wide-area discovery domain (for example `openclaw.internal`).                       |
 | `--apply`           | Install/update CoreDNS config and (re)start the service. Requires sudo, macOS only. |
 
-Without `--domain`, OpenClaw uses `discovery.wideArea.domain` from config.
+Without `--domain`, OpenClaw uses `discovery.wideArea.domain` from config. Setting that domain enables wide-area discovery.
 
 Without `--apply`, the command only prints:
 

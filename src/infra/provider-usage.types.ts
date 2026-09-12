@@ -78,12 +78,16 @@ export type ProviderUsageSnapshot = {
   costHistory?: ProviderUsageCostHistory;
   summary?: string;
   plan?: string;
+  /** Account identity (email) the usage was fetched under, when known. */
+  accountEmail?: string;
   error?: string;
 };
 
 export type UsageSummary = {
   updatedAt: number;
   providers: ProviderUsageSnapshot[];
+  /** A background refresh owns the real values; an empty list is incomplete. */
+  refreshing?: boolean;
 };
 
 /** Normalized provider id. Usage providers are discovered from plugin hooks at runtime. */

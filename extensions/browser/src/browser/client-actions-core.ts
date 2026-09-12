@@ -9,16 +9,22 @@ import {
   clampPositiveTimerTimeoutMs,
   resolveTimerTimeoutMs,
 } from "openclaw/plugin-sdk/number-runtime";
+import {
+  BROWSER_ACTION_TRANSPORT_SLACK_MS,
+  resolveBrowserActRequestTimeoutMs,
+  resolveBrowserNavigationTimeoutMs,
+} from "./act-policy.js";
 import type {
   BrowserActionOk,
   BrowserActionPathResult,
   BrowserActionTabResult,
+  BrowserBatchAbort,
+  BrowserBatchActionResult,
 } from "./client-actions-types.js";
 import { buildProfileQuery, withBaseUrl } from "./client-actions-url.js";
 import type { BrowserActRequest } from "./client-actions.types.js";
 import { fetchBrowserJson } from "./client-fetch.js";
 import {
-  DEFAULT_BROWSER_ACTION_TIMEOUT_MS,
   DEFAULT_BROWSER_DOWNLOAD_TIMEOUT_MS,
   DEFAULT_BROWSER_SCREENSHOT_TIMEOUT_MS,
 } from "./constants.js";
@@ -31,14 +37,13 @@ type BrowserActResponse = {
   targetId: string;
   url?: string;
   result?: unknown;
-  results?: Array<{ ok: boolean; error?: string }>;
+  results?: BrowserBatchActionResult[];
+  aborted?: BrowserBatchAbort;
   blockedByDialog?: boolean;
   browserState?: unknown;
   /** Download info when a click/batch/evaluate action triggers a browser download. */
   downloads?: BrowserDownloadResult[];
 };
-
-const BROWSER_REQUEST_TIMEOUT_SLACK_MS = 5_000;
 
 type BrowserDownloadActionResult = BrowserActionTabResult & { download: BrowserDownloadResult };
 
@@ -46,28 +51,11 @@ function normalizePositiveTimeoutMs(value: unknown): number | undefined {
   return clampPositiveTimerTimeoutMs(value);
 }
 
-function resolveBrowserActRequestTimeoutMs(req: BrowserActRequest): number {
-  const explicitTimeout = normalizePositiveTimeoutMs((req as { timeoutMs?: unknown }).timeoutMs);
-  const candidateTimeouts =
-    explicitTimeout === undefined
-      ? [DEFAULT_BROWSER_ACTION_TIMEOUT_MS]
-      : [addTimerTimeoutGraceMs(explicitTimeout, BROWSER_REQUEST_TIMEOUT_SLACK_MS) ?? 1];
-  if (req.kind === "wait") {
-    const waitDuration = normalizePositiveTimeoutMs(req.timeMs);
-    if (waitDuration !== undefined) {
-      candidateTimeouts.push(
-        addTimerTimeoutGraceMs(waitDuration, BROWSER_REQUEST_TIMEOUT_SLACK_MS) ?? 1,
-      );
-    }
-  }
-  return Math.max(...candidateTimeouts);
-}
-
 function resolveBrowserOperationRequestTimeoutMs(timeoutMs: unknown): number {
   const operationTimeoutMs =
     normalizePositiveTimeoutMs(timeoutMs) ?? DEFAULT_BROWSER_DOWNLOAD_TIMEOUT_MS;
   // Let the browser operation report its own timeout/error before the client watchdog fires.
-  return addTimerTimeoutGraceMs(operationTimeoutMs, BROWSER_REQUEST_TIMEOUT_SLACK_MS) ?? 1;
+  return addTimerTimeoutGraceMs(operationTimeoutMs, BROWSER_ACTION_TRANSPORT_SLACK_MS) ?? 1;
 }
 
 async function postDownloadRequest(
@@ -76,6 +64,7 @@ async function postDownloadRequest(
   body: Record<string, unknown>,
   profile?: string,
   timeoutMs?: number,
+  signal?: AbortSignal,
 ): Promise<BrowserDownloadActionResult> {
   const q = buildProfileQuery(profile);
   return await fetchBrowserJson<BrowserDownloadActionResult>(withBaseUrl(baseUrl, `${route}${q}`), {
@@ -83,6 +72,7 @@ async function postDownloadRequest(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
     timeoutMs: resolveBrowserOperationRequestTimeoutMs(timeoutMs),
+    signal,
   });
 }
 
@@ -92,15 +82,19 @@ export async function browserNavigate(
   opts: {
     url: string;
     targetId?: string;
+    timeoutMs?: number;
     profile?: string;
+    signal?: AbortSignal;
   },
 ): Promise<BrowserActionTabResult> {
   const q = buildProfileQuery(opts.profile);
+  const timeoutMs = resolveBrowserNavigationTimeoutMs(opts.timeoutMs);
   return await fetchBrowserJson<BrowserActionTabResult>(withBaseUrl(baseUrl, `/navigate${q}`), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url: opts.url, targetId: opts.targetId }),
-    timeoutMs: 20000,
+    body: JSON.stringify({ url: opts.url, targetId: opts.targetId, timeoutMs }),
+    timeoutMs: resolveBrowserOperationRequestTimeoutMs(timeoutMs),
+    signal: opts.signal,
   });
 }
 
@@ -114,6 +108,7 @@ export async function browserArmDialog(
     targetId?: string;
     timeoutMs?: number;
     profile?: string;
+    signal?: AbortSignal;
   },
 ): Promise<BrowserActionOk> {
   const q = buildProfileQuery(opts.profile);
@@ -128,6 +123,7 @@ export async function browserArmDialog(
       timeoutMs: opts.timeoutMs,
     }),
     timeoutMs: resolveBrowserOperationRequestTimeoutMs(opts.timeoutMs),
+    signal: opts.signal,
   });
 }
 
@@ -142,6 +138,7 @@ export async function browserArmFileChooser(
     targetId?: string;
     timeoutMs?: number;
     profile?: string;
+    signal?: AbortSignal;
   },
 ): Promise<BrowserActionOk> {
   const q = buildProfileQuery(opts.profile);
@@ -157,6 +154,7 @@ export async function browserArmFileChooser(
       timeoutMs: opts.timeoutMs,
     }),
     timeoutMs: resolveBrowserOperationRequestTimeoutMs(opts.timeoutMs),
+    signal: opts.signal,
   });
 }
 
@@ -168,6 +166,7 @@ export async function browserWaitForDownload(
     targetId?: string;
     timeoutMs?: number;
     profile?: string;
+    signal?: AbortSignal;
   },
 ): Promise<BrowserDownloadActionResult> {
   return await postDownloadRequest(
@@ -180,6 +179,7 @@ export async function browserWaitForDownload(
     },
     opts.profile,
     opts.timeoutMs,
+    opts.signal,
   );
 }
 
@@ -192,6 +192,7 @@ export async function browserDownload(
     targetId?: string;
     timeoutMs?: number;
     profile?: string;
+    signal?: AbortSignal;
   },
 ): Promise<BrowserDownloadActionResult> {
   return await postDownloadRequest(
@@ -205,6 +206,7 @@ export async function browserDownload(
     },
     opts.profile,
     opts.timeoutMs,
+    opts.signal,
   );
 }
 
@@ -212,7 +214,7 @@ export async function browserDownload(
 export async function browserAct(
   baseUrl: string | undefined,
   req: BrowserActRequest,
-  opts?: { profile?: string; timeoutMs?: number },
+  opts?: { profile?: string; timeoutMs?: number; signal?: AbortSignal },
 ): Promise<BrowserActResponse> {
   const q = buildProfileQuery(opts?.profile);
   return await fetchBrowserJson<BrowserActResponse>(withBaseUrl(baseUrl, `/act${q}`), {
@@ -220,6 +222,7 @@ export async function browserAct(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(req),
     timeoutMs: resolveTimerTimeoutMs(opts?.timeoutMs, resolveBrowserActRequestTimeoutMs(req)),
+    signal: opts?.signal,
   });
 }
 
@@ -235,6 +238,7 @@ export async function browserScreenshotAction(
     labels?: boolean;
     timeoutMs?: number;
     profile?: string;
+    signal?: AbortSignal;
   },
 ): Promise<BrowserActionPathResult> {
   const q = buildProfileQuery(opts.profile);
@@ -253,5 +257,6 @@ export async function browserScreenshotAction(
       timeoutMs: effectiveTimeoutMs,
     }),
     timeoutMs: effectiveTimeoutMs,
+    signal: opts.signal,
   });
 }

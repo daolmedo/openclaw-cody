@@ -27,11 +27,7 @@ export function enablePrivateQaScriptEnv(env: NodeJS.ProcessEnv = process.env) {
   env.OPENCLAW_DISABLE_BUNDLED_PLUGINS = "0";
 }
 
-export function resolveQaE2eOutputPath(argv: readonly string[] = process.argv.slice(2)) {
-  return parseQaE2eArgs(argv).outputPath;
-}
-
-export function usage(): string {
+function usage(): string {
   return `Usage: pnpm qa:e2e [--output <path>]
 
 Options:
@@ -118,7 +114,7 @@ export async function main(
 
 function isMainModule() {
   const entry = process.argv[1];
-  return Boolean(entry) && import.meta.url === pathToFileURL(entry).href;
+  return entry !== undefined && import.meta.url === pathToFileURL(entry).href;
 }
 
 if (isMainModule()) {

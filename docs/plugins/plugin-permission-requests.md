@@ -63,7 +63,6 @@ export default definePluginEntry({
               ? ["allow-once", "deny"]
               : ["allow-once", "allow-always", "deny"],
           timeoutMs: 120_000,
-          timeoutBehavior: "deny",
           onResolution(decision) {
             console.log(`deploy approval resolved: ${decision}`);
           },
@@ -76,8 +75,8 @@ export default definePluginEntry({
 
 Write prompt text for the person who will approve the action:
 
-- Keep `title` short and action-focused; the Gateway caps it at 80 characters.
-- Keep `description` specific and bounded; the Gateway caps it at 256
+- Keep `title` short and action-focused. The Gateway caps it at 80 characters.
+- Keep `description` specific and bounded. The Gateway caps it at 512
   characters.
 - Include the action, target, and risk. Do not include secrets, tokens, or
   private payloads that should not appear in chat approval surfaces.
@@ -89,6 +88,65 @@ Write prompt text for the person who will approve the action:
 - `timeoutMs` defaults to 120000 (2 minutes) and is capped at 600000 (10
   minutes) regardless of the requested value.
 
+## Declare approval scope
+
+Set `requireApproval.scope` when your plugin knows the consequences of an
+operation. Scope is typed, optional, and display-only: it helps reviewers
+understand the action but never grants permission or changes the approval
+decision. The plugin declaring the approval supplies these facts. Channels never
+infer scope from commands, titles, or message text.
+
+For an email to three external recipients, include the destination, total
+recipient count, an optional preview, and the audience:
+
+```typescript
+requireApproval: {
+  title: "Send customer update",
+  scope: {
+    kind: "message-send",
+    target: "email",
+    recipientCount: 3,
+    recipients: ["alice@example.com", "bob@example.com"],
+    audience: "external",
+  },
+}
+```
+
+For a payment, provide the exact decimal amount as a string, its currency, and
+the payee or payment system:
+
+```typescript
+requireApproval: {
+  title: "Pay invoice",
+  scope: {
+    kind: "payment",
+    amount: "49.99",
+    currency: "EUR",
+    target: "Stripe",
+  },
+}
+```
+
+For an external post, identify its destination and declare its visibility:
+
+```typescript
+requireApproval: {
+  title: "Publish announcement",
+  scope: {
+    kind: "external-post",
+    target: "github",
+    visibility: "public",
+  },
+}
+```
+
+Message audiences can be `internal` or `external`. External-post visibility can
+be `public` or `restricted`. Recipient previews contain at most five identities.
+All strings are sanitized and bounded before display: targets and recipient
+identities are limited to 128 characters, payment amounts to 40, and currencies
+to 12. If sanitization would exceed a bound, OpenClaw omits the scope while
+preserving the normal approval prompt.
+
 ## Decision behavior
 
 OpenClaw creates a pending approval with a `plugin:` ID, delivers it to the
@@ -99,9 +157,14 @@ available approval surfaces, and waits for a decision.
 | `allow-once`      | The current call continues.                                               |
 | `allow-always`    | The current call continues and the decision is passed to the plugin.      |
 | `deny`            | The call is blocked with a denied tool result.                            |
-| Timeout           | The call is blocked unless `timeoutBehavior` is `"allow"`.                |
+| Timeout           | The call is blocked.                                                      |
 | Cancellation      | The call is blocked when the run is aborted.                              |
 | No approval route | The call is blocked because no connected approval surface can resolve it. |
+
+Only the exact `allow-once` and `allow-always` decisions permitted by the
+request allow execution. Unknown, malformed, mismatched, missing, and timed-out
+decisions fail closed. The legacy `timeoutBehavior` field remains accepted for
+plugin compatibility but is deprecated and ignored. Do not set it in new hooks.
 
 `allow-always` is only durable when the requesting plugin or runtime implements
 that persistence. For ordinary `before_tool_call.requireApproval` hooks,
@@ -110,9 +173,10 @@ current call and passes the resolved value to `onResolution`. If your plugin
 offers `allow-always`, document and implement exactly what future calls it
 trusts.
 
-If the hook also returns `params`, OpenClaw applies those parameter changes only
-after the approval succeeds. A lower-priority hook can still block after a
-higher-priority hook requested approval.
+If the hook also returns `params`, OpenClaw snapshots the base parameters and
+those overrides when approval is requested, then applies the overrides only
+after approval succeeds. A lower-priority hook can still block, but cannot
+rewrite the parameters covered by the pending approval.
 
 `allowedDecisions` limits the buttons and commands shown to the user. The
 Gateway rejects a resolve attempt for any decision the request did not offer.
@@ -188,7 +252,7 @@ plugin approval support instead of only checking `approvals.exec`.
 
 ## Related
 
-- [Plugin hooks](/plugins/hooks#tool-call-policy)
+- [Plugin hooks](/plugins/hooks/tool-policy#tool-call-policy)
 - [Building plugins](/plugins/building-plugins#registering-tools)
 - [Advanced exec approvals](/tools/exec-approvals-advanced#plugin-approval-forwarding)
 - [Gateway protocol](/gateway/protocol)

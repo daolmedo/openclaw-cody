@@ -111,7 +111,7 @@ function resolveSignalAliasTargetFromMap(params: {
   }
 }
 
-export function resolveSignalAliasTarget(params: {
+function resolveSignalAliasTarget(params: {
   cfg: OpenClawConfig;
   accountId?: string | null;
   input: string;
@@ -140,6 +140,28 @@ export function resolveSignalTarget(params: {
     return { ...aliasTarget, source: "alias" };
   }
   return null;
+}
+
+export function resolveSignalDeliveredConversationKey(params: {
+  cfg: OpenClawConfig;
+  accountId?: string | null;
+  to: string;
+}): string | null {
+  // Delivery already succeeded, so conversation-key recovery is fail-soft.
+  // Approval route revalidation stays fail-closed in approval-reaction-routes.ts.
+  try {
+    return (
+      resolveSignalTarget({
+        cfg: params.cfg,
+        accountId: params.accountId,
+        input: params.to,
+      })?.to ??
+      normalizeSignalMessagingTarget(params.to) ??
+      null
+    );
+  } catch {
+    return normalizeSignalMessagingTarget(params.to) ?? null;
+  }
 }
 
 export function listSignalAliasDirectoryEntries(params: {

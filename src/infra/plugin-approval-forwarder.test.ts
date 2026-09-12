@@ -1,13 +1,17 @@
 // Covers plugin approval forwarding through channel capabilities.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ChannelPlugin } from "../channels/plugins/types.js";
+import type { ChannelPlugin } from "../channels/plugins/types.public.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
 import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
 import { createExecApprovalForwarder } from "./exec-approval-forwarder.js";
 import type { PluginApprovalRequest, PluginApprovalResolved } from "./plugin-approvals.js";
 
-afterEach(() => {
+const forwarders: ReturnType<typeof createExecApprovalForwarder>[] = [];
+
+afterEach(async () => {
+  await Promise.all(forwarders.map((forwarder) => forwarder.stop()));
+  forwarders.length = 0;
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
@@ -50,6 +54,7 @@ function createForwarder(params: {
     nowMs: () => 1000,
     resolveSessionTarget: params.resolveSessionTarget,
   });
+  forwarders.push(forwarder);
   return { deliver, forwarder };
 }
 
@@ -218,28 +223,31 @@ describe("plugin approval forwarding", () => {
               {
                 label: "Allow Once",
                 action: {
-                  type: "command",
-                  command: "/approve plugin-req-1 allow-once",
+                  type: "approval",
+                  approvalId: "plugin-req-1",
+                  approvalKind: "plugin",
+                  decision: "allow-once",
                 },
-                value: "/approve plugin-req-1 allow-once",
                 style: "success",
               },
               {
                 label: "Allow Always",
                 action: {
-                  type: "command",
-                  command: "/approve plugin-req-1 allow-always",
+                  type: "approval",
+                  approvalId: "plugin-req-1",
+                  approvalKind: "plugin",
+                  decision: "allow-always",
                 },
-                value: "/approve plugin-req-1 allow-always",
                 style: "primary",
               },
               {
                 label: "Deny",
                 action: {
-                  type: "command",
-                  command: "/approve plugin-req-1 deny",
+                  type: "approval",
+                  approvalId: "plugin-req-1",
+                  approvalKind: "plugin",
+                  decision: "deny",
                 },
-                value: "/approve plugin-req-1 deny",
                 style: "danger",
               },
             ],
@@ -273,19 +281,21 @@ describe("plugin approval forwarding", () => {
               {
                 label: "Allow Once",
                 action: {
-                  type: "command",
-                  command: "/approve plugin-req-1 allow-once",
+                  type: "approval",
+                  approvalId: "plugin-req-1",
+                  approvalKind: "plugin",
+                  decision: "allow-once",
                 },
-                value: "/approve plugin-req-1 allow-once",
                 style: "success",
               },
               {
                 label: "Deny",
                 action: {
-                  type: "command",
-                  command: "/approve plugin-req-1 deny",
+                  type: "approval",
+                  approvalId: "plugin-req-1",
+                  approvalKind: "plugin",
+                  decision: "deny",
                 },
-                value: "/approve plugin-req-1 deny",
                 style: "danger",
               },
             ],
@@ -422,6 +432,7 @@ describe("plugin approval forwarding", () => {
       await registerPendingApproval(forwarder, deliver);
 
       await forwarder.handlePluginApprovalResolved!(makePluginResolved());
+      await flushPendingDelivery();
       expect(deliver).toHaveBeenCalled();
       const text = firstDeliveredPayload(deliver)?.text ?? "";
       expect(text).toContain("Plugin approval");
@@ -462,7 +473,7 @@ describe("plugin approval forwarding", () => {
       await forwarder.handlePluginApprovalRequested!(makePluginRequest());
       await flushPendingDelivery();
       expect(deliver).toHaveBeenCalled();
-      forwarder.stop();
+      await forwarder.stop();
       deliver.mockClear();
       // After stop, resolved should not deliver
       await forwarder.handlePluginApprovalResolved!({

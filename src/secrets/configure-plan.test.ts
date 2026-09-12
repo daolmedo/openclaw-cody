@@ -6,7 +6,6 @@ import {
   TALK_TEST_PROVIDER_ID,
 } from "../test-utils/talk-test-provider.js";
 import {
-  buildConfigureCandidates,
   buildConfigureCandidatesForScope,
   buildSecretsConfigurePlan,
   collectConfigureProviderChanges,
@@ -17,7 +16,7 @@ import { resolveConfigSecretTargetByPath } from "./target-registry.js";
 describe("secrets configure plan helpers", () => {
   beforeAll(() => {
     resolveConfigSecretTargetByPath(["channels", "telegram", "botToken"]);
-    buildConfigureCandidates({} as OpenClawConfig);
+    buildConfigureCandidatesForScope({ config: {} as OpenClawConfig });
   });
 
   it("builds configure candidates from supported configure targets", () => {
@@ -33,13 +32,25 @@ describe("secrets configure plan helpers", () => {
         telegram: {
           botToken: "token", // pragma: allowlist secret
         },
+        nostr: {
+          privateKey: "nostr-private-key", // pragma: allowlist secret
+        },
       },
     } as OpenClawConfig;
 
-    const candidates = buildConfigureCandidates(config);
+    const candidates = buildConfigureCandidatesForScope({ config });
     const paths = candidates.map((entry) => entry.path);
     expect(paths).toContain(TALK_TEST_PROVIDER_API_KEY_PATH);
     expect(paths).toContain("channels.telegram.botToken");
+    expect(paths).toContain("channels.nostr.privateKey");
+    expect(resolveConfigSecretTargetByPath(["channels", "nostr", "privateKey"])).toMatchObject({
+      entry: {
+        id: "channels.nostr.privateKey",
+        includeInPlan: true,
+        includeInConfigure: true,
+        includeInAudit: true,
+      },
+    });
   });
 
   it("collects provider upserts and deletes", () => {
@@ -87,7 +98,7 @@ describe("secrets configure plan helpers", () => {
     );
     expect(openaiCandidate?.type).toBe("auth-profiles.api_key.key");
     expect(openaiCandidate?.agentId).toBe("main");
-    expect(openaiCandidate?.configFile).toBe("auth-profiles.json");
+    expect(openaiCandidate?.configFile).toBe("auth-profile-store");
     expect(openaiCandidate?.authProfileProvider).toBe("openai");
   });
 
@@ -214,7 +225,7 @@ describe("secrets configure plan helpers", () => {
     expect(plan.options).toEqual({
       scrubEnv: true,
       scrubAuthProfilesForProviderTargets: true,
-      scrubLegacyAuthJson: true,
+      scrubLegacyAuthJson: false,
     });
   });
 });

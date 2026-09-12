@@ -12,10 +12,11 @@ import {
 } from "../../../packages/gateway-protocol/src/index.js";
 import { listAgentIds, resolveAgentWorkspaceDir } from "../../agents/agent-scope.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { normalizeAgentId } from "../../routing/session-key.js";
+import { normalizeAgentIdStrict } from "../../routing/session-key.js";
 import type { GatewayRequestHandlers, RespondFn } from "./types.js";
 import { assertValidParams } from "./validation.js";
 import {
+  decodeUtf8Strict,
   listWorkspacePath,
   normalizeRelativePath,
   readWorkspaceFile,
@@ -69,11 +70,16 @@ function resolveWorkspaceScopeOrRespond(
   cfg: OpenClawConfig,
   respond: RespondFn,
 ): { agentId: string; workspaceDir: string; browserPath: string } | null {
-  const agentId = normalizeAgentId(params.agentId);
-  if (!new Set(listAgentIds(cfg)).has(agentId)) {
-    respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unknown agent id"));
+  const normalized = normalizeAgentIdStrict(params.agentId);
+  if (!normalized.ok || !new Set(listAgentIds(cfg)).has(normalized.value)) {
+    respond(
+      false,
+      undefined,
+      errorShape(ErrorCodes.INVALID_REQUEST, `agent "${params.agentId}" not found`),
+    );
     return null;
   }
+  const agentId = normalized.value;
   const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
   const rawPath = params.path ?? "";
   const portablePath = rawPath.replaceAll("\\", "/");
@@ -99,18 +105,6 @@ function resolveWorkspaceScopeOrRespond(
     return null;
   }
   return { agentId, workspaceDir, browserPath };
-}
-
-function decodeUtf8Strict(buffer: Buffer): string | undefined {
-  // NUL bytes are valid UTF-8 but mark binary payloads we refuse to inline.
-  if (buffer.includes(0)) {
-    return undefined;
-  }
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(buffer);
-  } catch {
-    return undefined;
-  }
 }
 
 /** Gateway handlers for read-only agent workspace browsing. */

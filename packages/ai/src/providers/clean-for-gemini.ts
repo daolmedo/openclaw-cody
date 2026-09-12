@@ -46,6 +46,33 @@ function copySchemaMeta(from: Record<string, unknown>, to: Record<string, unknow
   }
 }
 
+// Google requires enum entries as strings even when the declared schema type is numeric or
+// boolean. Keep the type intact so tool argument generation and runtime validation still agree.
+function stringifyGeminiEnumValue(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  if (typeof value === "boolean") {
+    return String(value);
+  }
+  return undefined;
+}
+
+function cleanGeminiEnumValues(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const values = value.flatMap((entry) => {
+    const stringified = stringifyGeminiEnumValue(entry);
+    return stringified === undefined ? [] : [stringified];
+  });
+  const unique = [...new Set(values)];
+  return unique.length > 0 ? unique : undefined;
+}
+
 // Check if an anyOf/oneOf array contains only literal values that can be flattened.
 // TypeBox Type.Literal generates { const: "value", type: "string" }.
 // Some schemas may use { enum: ["value"], type: "string" }.
@@ -181,10 +208,15 @@ function tryResolveLocalRef(ref: string, defs: SchemaDefs | undefined): unknown 
   return defs.get(name);
 }
 
-function simplifyUnionVariants(params: { obj: Record<string, unknown>; variants: unknown[] }): {
-  variants: unknown[];
-  simplified?: unknown;
-} {
+function simplifyUnionVariants(params: { obj: Record<string, unknown>; variants: unknown[] }):
+  | {
+      kind: "simplified";
+      value: unknown;
+    }
+  | {
+      kind: "variants";
+      value: unknown[];
+    } {
   const { obj, variants } = params;
 
   const { variants: nonNullVariants, stripped } = stripNullVariants(variants);
@@ -196,7 +228,7 @@ function simplifyUnionVariants(params: { obj: Record<string, unknown>; variants:
       enum: flattened.enum,
     };
     copySchemaMeta(obj, result);
-    return { variants: nonNullVariants, simplified: result };
+    return { kind: "simplified", value: result };
   }
 
   if (stripped && nonNullVariants.length === 1) {
@@ -206,12 +238,12 @@ function simplifyUnionVariants(params: { obj: Record<string, unknown>; variants:
         ...(lone as Record<string, unknown>),
       };
       copySchemaMeta(obj, result);
-      return { variants: nonNullVariants, simplified: result };
+      return { kind: "simplified", value: result };
     }
-    return { variants: nonNullVariants, simplified: lone };
+    return { kind: "simplified", value: lone };
   }
 
-  return { variants: stripped ? nonNullVariants : variants };
+  return { kind: "variants", value: stripped ? nonNullVariants : variants };
 }
 
 // Gemini rejects object schemas whose `required` entries do not exist in `properties`.
@@ -303,18 +335,18 @@ function cleanSchemaForGeminiWithDefs(
 
   if (hasAnyOf) {
     const simplified = simplifyUnionVariants({ obj, variants: cleanedAnyOf ?? [] });
-    cleanedAnyOf = simplified.variants;
-    if ("simplified" in simplified) {
-      return simplified.simplified;
+    if (simplified.kind === "simplified") {
+      return simplified.value;
     }
+    cleanedAnyOf = simplified.value;
   }
 
   if (hasOneOf) {
     const simplified = simplifyUnionVariants({ obj, variants: cleanedOneOf ?? [] });
-    cleanedOneOf = simplified.variants;
-    if ("simplified" in simplified) {
-      return simplified.simplified;
+    if (simplified.kind === "simplified") {
+      return simplified.value;
     }
+    cleanedOneOf = simplified.value;
   }
 
   const cleaned: Record<string, unknown> = {};
@@ -325,7 +357,18 @@ function cleanSchemaForGeminiWithDefs(
     }
 
     if (key === "const") {
-      cleaned.enum = [value];
+      const enumValues = cleanGeminiEnumValues([value]);
+      if (enumValues) {
+        cleaned.enum = enumValues;
+      }
+      continue;
+    }
+
+    if (key === "enum") {
+      const enumValues = cleanGeminiEnumValues(value);
+      if (enumValues) {
+        cleaned.enum = enumValues;
+      }
       continue;
     }
 

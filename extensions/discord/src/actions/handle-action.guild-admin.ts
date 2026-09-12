@@ -1,4 +1,3 @@
-// Discord plugin module implements handle action.guild admin behavior.
 import type { AgentToolResult } from "openclaw/plugin-sdk/agent-core";
 import {
   readNonNegativeIntegerParam,
@@ -6,10 +5,12 @@ import {
   readStringArrayParam,
   readStringParam,
 } from "openclaw/plugin-sdk/agent-runtime";
+import { readBooleanParam } from "openclaw/plugin-sdk/boolean-param";
 import type { ChannelMessageActionContext } from "openclaw/plugin-sdk/channel-contract";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { handleDiscordAction } from "../../action-runtime-api.js";
 import { isTrustedRequesterGuildAdminAction } from "../trusted-requester-actions.js";
+import type { DiscordMessagingActionOptions } from "./runtime.messaging.shared.js";
 import {
   isDiscordModerationAction,
   readDiscordModerationCommand,
@@ -22,15 +23,7 @@ import {
 
 type Ctx = Pick<
   ChannelMessageActionContext,
-  | "action"
-  | "params"
-  | "cfg"
-  | "accountId"
-  | "requesterSenderId"
-  | "senderIsOwner"
-  | "toolContext"
-  | "mediaLocalRoots"
-  | "mediaReadFile"
+  "action" | "params" | "cfg" | "accountId" | "requesterSenderId" | "senderIsOwner" | "toolContext"
 >;
 
 function readDiscordRequesterSenderId(ctx: Ctx): string | undefined {
@@ -54,8 +47,10 @@ function senderParam(senderUserId: string | undefined) {
 export async function tryHandleDiscordMessageActionGuildAdmin(params: {
   ctx: Ctx;
   resolveChannelId: () => string;
+  readPolicyOptions?: DiscordMessagingActionOptions;
+  actionOptions: DiscordMessagingActionOptions;
 }): Promise<AgentToolResult<unknown> | undefined> {
-  const { ctx, resolveChannelId } = params;
+  const { ctx, resolveChannelId, readPolicyOptions, actionOptions } = params;
   const { action, params: actionParams, cfg } = ctx;
   const accountId = ctx.accountId ?? readStringParam(actionParams, "accountId");
   const senderUserId = readDiscordRequesterSenderId(ctx);
@@ -68,6 +63,7 @@ export async function tryHandleDiscordMessageActionGuildAdmin(params: {
     return await handleDiscordAction(
       { action: "memberInfo", accountId: accountId ?? undefined, guildId, userId },
       cfg,
+      readPolicyOptions,
     );
   }
 
@@ -78,16 +74,22 @@ export async function tryHandleDiscordMessageActionGuildAdmin(params: {
     return await handleDiscordAction(
       { action: "roleInfo", accountId: accountId ?? undefined, guildId },
       cfg,
+      readPolicyOptions,
     );
   }
 
   if (action === "emoji-list") {
-    const guildId = readStringParam(actionParams, "guildId", {
-      required: true,
-    });
+    const guildId = readStringParam(actionParams, "guildId");
+    const limit = readPositiveIntegerParam(actionParams, "limit");
     return await handleDiscordAction(
-      { action: "emojiList", accountId: accountId ?? undefined, guildId },
+      {
+        action: "emojiList",
+        accountId: accountId ?? undefined,
+        ...(guildId ? { guildId } : { channelId: resolveChannelId() }),
+        ...(limit ? { limit } : {}),
+      },
       cfg,
+      readPolicyOptions,
     );
   }
 
@@ -112,6 +114,7 @@ export async function tryHandleDiscordMessageActionGuildAdmin(params: {
         ...senderParam(senderUserId),
       },
       cfg,
+      actionOptions,
     );
   }
 
@@ -144,6 +147,7 @@ export async function tryHandleDiscordMessageActionGuildAdmin(params: {
         ...senderParam(senderUserId),
       },
       cfg,
+      actionOptions,
     );
   }
 
@@ -173,6 +177,7 @@ export async function tryHandleDiscordMessageActionGuildAdmin(params: {
     return await handleDiscordAction(
       { action: "channelInfo", accountId: accountId ?? undefined, channelId },
       cfg,
+      readPolicyOptions,
     );
   }
 
@@ -183,6 +188,7 @@ export async function tryHandleDiscordMessageActionGuildAdmin(params: {
     return await handleDiscordAction(
       { action: "channelList", accountId: accountId ?? undefined, guildId },
       cfg,
+      readPolicyOptions,
     );
   }
 
@@ -310,6 +316,7 @@ export async function tryHandleDiscordMessageActionGuildAdmin(params: {
     return await handleDiscordAction(
       { action: "voiceStatus", accountId: accountId ?? undefined, guildId, userId },
       cfg,
+      readPolicyOptions,
     );
   }
 
@@ -320,6 +327,7 @@ export async function tryHandleDiscordMessageActionGuildAdmin(params: {
     return await handleDiscordAction(
       { action: "eventList", accountId: accountId ?? undefined, guildId },
       cfg,
+      readPolicyOptions,
     );
   }
 
@@ -353,7 +361,7 @@ export async function tryHandleDiscordMessageActionGuildAdmin(params: {
         ...senderParam(senderUserId),
       },
       cfg,
-      { mediaLocalRoots: ctx.mediaLocalRoots },
+      actionOptions,
     );
   }
 
@@ -403,12 +411,14 @@ export async function tryHandleDiscordMessageActionGuildAdmin(params: {
         limit,
       },
       cfg,
+      readPolicyOptions,
     );
   }
 
   if (action === "thread-reply") {
     const content = readStringParam(actionParams, "message", {
       required: true,
+      trim: false,
     });
     const mediaUrl =
       readStringParam(actionParams, "media", { trim: false }) ??
@@ -429,9 +439,10 @@ export async function tryHandleDiscordMessageActionGuildAdmin(params: {
         content,
         mediaUrl: mediaUrl ?? undefined,
         replyTo: replyTo ?? undefined,
+        ...(readBooleanParam(actionParams, "silent") === true ? { silent: true } : {}),
       },
       cfg,
-      { mediaLocalRoots: ctx.mediaLocalRoots, mediaReadFile: ctx.mediaReadFile },
+      actionOptions,
     );
   }
 
@@ -467,6 +478,7 @@ export async function tryHandleDiscordMessageActionGuildAdmin(params: {
         limit: readPositiveIntegerParam(actionParams, "limit"),
       },
       cfg,
+      readPolicyOptions,
     );
   }
 

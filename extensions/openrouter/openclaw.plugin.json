@@ -1,11 +1,17 @@
 {
   "id": "openrouter",
-  "icon": "https://cdn.simpleicons.org/openrouter",
+  "categories": ["models", "voice", "media"],
+  "capabilityCatalogEntry": "./capability-catalog.ts",
   "activation": {
     "onStartup": false
   },
   "enabledByDefault": true,
   "providers": ["openrouter"],
+  "modelCatalog": {
+    "discovery": {
+      "openrouter": "runtime"
+    }
+  },
   "modelIdNormalization": {
     "providers": {
       "openrouter": {
@@ -64,6 +70,7 @@
       "provider": "openrouter",
       "method": "oauth",
       "choiceId": "openrouter-oauth",
+      "appGuidedAuth": "oauth",
       "choiceLabel": "OpenRouter OAuth",
       "choiceHint": "Browser sign-in",
       "groupId": "openrouter",

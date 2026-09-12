@@ -2,12 +2,26 @@
 set -euo pipefail
 
 args=("$@")
+scope="system"
 if [[ "${args[0]:-}" == "--user" ]]; then
+  scope="user"
   args=("${args[@]:1}")
 fi
 cmd="${args[0]:-}"
 
 case "$cmd" in
+  daemon-reload)
+    [ "$scope" = user ] || exit 1
+    # Only an explicit manager reload publishes changed unit bytes. Passive
+    # GetUnit/command inspection must not manufacture loaded service state.
+    shopt -s nullglob
+    for loaded in "$HOME"/.config/systemd/user/*.service.loaded-unit; do
+      [ -f "${loaded%.loaded-unit}" ] || rm -f "$loaded"
+    done
+    for unit in "$HOME"/.config/systemd/user/*.service; do
+      cp "$unit" "$unit.loaded-unit"
+    done
+    ;;
   status) ;;
   is-active)
     echo "inactive" >&2
@@ -24,6 +38,20 @@ case "$cmd" in
     exit 1
     ;;
   show)
+    property=""
+    for arg in "${args[@]:1}"; do
+      case "$arg" in
+        --property=*) property="${arg#--property=}" ;;
+      esac
+    done
+    if [[ "$scope" == "system" && "$property" == "LoadState" ]]; then
+      echo "not-found"
+      exit 0
+    fi
+    if [[ "$scope" == "system" && "$property" == "UnitPath" ]]; then
+      echo "/etc/systemd/system /usr/lib/systemd/system"
+      exit 0
+    fi
     printf "%s\n" \
       "ActiveState=inactive" \
       "SubState=dead" \

@@ -4,6 +4,11 @@ import path from "node:path";
 import type { PluginStateSyncKeyedStore } from "openclaw/plugin-sdk/plugin-state-runtime";
 import { getOptionalVoiceCallStateRuntime } from "../runtime-state.js";
 import { CallRecordSchema, TerminalStates, type CallId, type CallRecord } from "../types.js";
+import {
+  MAX_CALL_REPLAY_KEYS,
+  rememberManagerReplayKey,
+  trimCallReplayKeys,
+} from "./replay-keys.js";
 
 // Persistent voice-call event store backed by plugin state chunk records.
 
@@ -62,10 +67,10 @@ function resolvePluginStateEnv(storePath: string): NodeJS.ProcessEnv {
 }
 
 /** Open the plugin state stores when the runtime is available. */
-function createCallRecordStateStores(storePath: string): CallRecordStateStores | null {
+function createCallRecordStateStores(storePath: string): CallRecordStateStores {
   const runtime = getOptionalVoiceCallStateRuntime();
   if (!runtime) {
-    return null;
+    throw new Error("Voice Call state runtime not initialized");
   }
   const env = resolvePluginStateEnv(storePath);
   return {
@@ -117,7 +122,8 @@ function buildNewEventKey(order: { persistedAt: number; sequence: number }): str
 /** Recover the sequence segment from newer event keys. */
 function parseEventKeySequence(key: string): number {
   const match = /^event:[^:]+:(\d+):/.exec(key);
-  return match ? Number.parseInt(match[1], 10) : 0;
+  const sequence = match?.[1];
+  return sequence ? Number.parseInt(sequence, 10) : 0;
 }
 
 /** Parse a stored call record line from v2 envelope or legacy raw-call JSON. */
@@ -168,12 +174,20 @@ function countCallRecordChunks(call: CallRecord): number {
 
 /** Truncate oversized call records to fit the bounded plugin state chunk budget. */
 export function prepareVoiceCallRecordForStorage(call: CallRecord): CallRecord {
-  if (countCallRecordChunks(call) <= MAX_CHUNKS_PER_CALL_RECORD_EVENT) {
-    return call;
+  let boundedCall = call;
+  if (call.processedEventIds.length > MAX_CALL_REPLAY_KEYS) {
+    boundedCall = {
+      ...call,
+      processedEventIds: [...call.processedEventIds],
+    };
+    trimCallReplayKeys(boundedCall.processedEventIds);
   }
-  const transcriptEntries = call.transcript.length;
+  if (countCallRecordChunks(boundedCall) <= MAX_CHUNKS_PER_CALL_RECORD_EVENT) {
+    return boundedCall;
+  }
+  const transcriptEntries = boundedCall.transcript.length;
   const metadata = {
-    ...call.metadata,
+    ...boundedCall.metadata,
     voiceCallPersistence: {
       transcriptTruncated: true,
       originalTranscriptEntries: transcriptEntries,
@@ -195,14 +209,14 @@ export function prepareVoiceCallRecordForStorage(call: CallRecord): CallRecord {
   ];
   for (const candidateInput of candidateInputs) {
     const candidate = CallRecordSchema.parse({
-      ...call,
+      ...boundedCall,
       ...candidateInput,
     });
     if (countCallRecordChunks(candidate) <= MAX_CHUNKS_PER_CALL_RECORD_EVENT) {
       return candidate;
     }
   }
-  return call;
+  return boundedCall;
 }
 
 /** Register a serialized call record event and its chunks, then prune old events. */
@@ -264,14 +278,29 @@ function pruneCallRecordEvents(stores: CallRecordStateStores): void {
 }
 
 /** Read and reassemble one chunked call record event. */
-function readCallRecordEvent(stores: CallRecordStateStores, eventKey: string): CallRecord | null {
-  const meta = stores.events.lookup(eventKey);
-  if (!meta) {
+function readCallRecordEvent(
+  stores: CallRecordStateStores,
+  eventKey: string,
+  meta: CallRecordEventMeta,
+): CallRecord | null {
+  if (
+    !Number.isSafeInteger(meta.chunkCount) ||
+    meta.chunkCount < 1 ||
+    meta.chunkCount > MAX_CHUNKS_PER_CALL_RECORD_EVENT
+  ) {
     return null;
   }
+  // Preserve compatibility with published hosts exposing point reads only.
+  const records = stores.chunks.lookupMany?.(
+    Array.from({ length: meta.chunkCount }, (_, index) => buildChunkKey(eventKey, index)),
+  );
   const chunks: Buffer[] = [];
   for (let index = 0; index < meta.chunkCount; index += 1) {
-    const chunk = stores.chunks.lookup(buildChunkKey(eventKey, index));
+    const result = records?.[index];
+    if (result && !result.ok) {
+      throw result.error;
+    }
+    const chunk = records ? result?.value : stores.chunks.lookup(buildChunkKey(eventKey, index));
     if (!chunk || chunk.index !== index) {
       return null;
     }
@@ -287,7 +316,7 @@ function readCallRecordEvents(stores: CallRecordStateStores): CallRecord[] {
     .entries()
     .toSorted((a, b) => a.createdAt - b.createdAt || a.key.localeCompare(b.key))
     .map((entry) => {
-      const call = readCallRecordEvent(stores, entry.key);
+      const call = readCallRecordEvent(stores, entry.key, entry.value);
       return call
         ? {
             call,
@@ -312,9 +341,6 @@ function readCallRecordEvents(stores: CallRecordStateStores): CallRecord[] {
 export function persistCallRecord(storePath: string, call: CallRecord): void {
   try {
     const stores = createCallRecordStateStores(storePath);
-    if (!stores) {
-      throw new Error("Voice Call state runtime not initialized");
-    }
     const order = nextCallRecordOrder();
     registerCallRecordEvent(stores, buildNewEventKey(order), call, order);
   } catch (err) {
@@ -323,17 +349,11 @@ export function persistCallRecord(storePath: string, call: CallRecord): void {
   }
 }
 
-/** Test hook for older async persistence call sites. */
-export async function flushPendingCallRecordWritesForTest(): Promise<void> {
-  await Promise.resolve();
-}
-
 /** Restore nonterminal active calls and provider/event indexes from persisted records. */
 export function loadActiveCallsFromStore(storePath: string): {
   activeCalls: Map<CallId, CallRecord>;
   providerCallIdMap: Map<string, CallId>;
   processedEventIds: Set<string>;
-  rejectedProviderCallIds: Set<string>;
 } {
   const stores = tryCreateCallRecordStateStores(storePath);
   let calls: CallRecord[] = [];
@@ -347,22 +367,23 @@ export function loadActiveCallsFromStore(storePath: string): {
       activeCalls: new Map(),
       providerCallIdMap: new Map(),
       processedEventIds: new Set(),
-      rejectedProviderCallIds: new Set(),
     };
   }
   const callMap = new Map<CallId, CallRecord>();
   for (const call of calls) {
+    // Reinsert so iteration follows the latest retained snapshot for each call.
+    callMap.delete(call.callId);
     callMap.set(call.callId, call);
   }
 
   const activeCalls = new Map<CallId, CallRecord>();
   const providerCallIdMap = new Map<string, CallId>();
   const processedEventIds = new Set<string>();
-  const rejectedProviderCallIds = new Set<string>();
 
   for (const [callId, call] of callMap) {
+    trimCallReplayKeys(call.processedEventIds);
     for (const eventId of call.processedEventIds) {
-      processedEventIds.add(eventId);
+      rememberManagerReplayKey(processedEventIds, eventId);
     }
     if (TerminalStates.has(call.state)) {
       continue;
@@ -373,7 +394,7 @@ export function loadActiveCallsFromStore(storePath: string): {
     }
   }
 
-  return { activeCalls, providerCallIdMap, processedEventIds, rejectedProviderCallIds };
+  return { activeCalls, providerCallIdMap, processedEventIds };
 }
 
 function readCallHistoryFromStore(storePath: string): CallRecord[] {
@@ -388,16 +409,14 @@ function readCallHistoryFromStore(storePath: string): CallRecord[] {
   return [];
 }
 
-/** Find the newest retained snapshots matching each call identifier namespace. */
-export async function findCallMatchesInStore(
-  storePath: string,
-  callId: string,
-): Promise<{ byCallId?: CallRecord; byProviderCallId?: CallRecord }> {
-  const calls = readCallHistoryFromStore(storePath);
-  return {
-    byCallId: calls.findLast((call) => call.callId === callId),
-    byProviderCallId: calls.findLast((call) => call.providerCallId === callId),
-  };
+/** Resolve an internal ID or retained provider alias to its newest logical call snapshot. */
+export function findCallInStore(storePath: string, callId: string): CallRecord | undefined {
+  // Admission and status must distinguish unavailable history from an absent call.
+  const calls = readCallRecordEvents(createCallRecordStateStores(storePath));
+  const match =
+    calls.findLast((call) => call.callId === callId) ??
+    calls.findLast((call) => call.providerCallId === callId);
+  return match ? calls.findLast((call) => call.callId === match.callId) : undefined;
 }
 
 /** Return the newest persisted call history rows up to the requested limit. */

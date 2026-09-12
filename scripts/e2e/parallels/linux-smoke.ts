@@ -6,13 +6,9 @@ import { pathToFileURL } from "node:url";
 import { posixAgentWorkspaceScript } from "./agent-workspace.ts";
 import {
   die,
-  ensureValue,
   currentRunningSnapshotInfo,
   makeTempDir,
   parseBoolEnv,
-  parseMode,
-  parseTcpPort,
-  parseProvider,
   readPositiveIntEnv,
   modelProviderConfigBatchJson,
   posixCodexPlatformPackageRepairFunction,
@@ -44,12 +40,16 @@ import {
   buildCommonSmokeSummary,
   expectedPackageBuildCommit,
   expectedPackageTargetVersion,
+  ensureSmokeGuestRuntime,
   extractLastOpenClawVersion,
+  installSmokeRuntimeCompanions,
+  npmRegistryEnv,
   packAndServeSmokeArtifact,
   printSmokeTargetSummary,
+  posixStopGatewayScript,
+  parseSmokeCliArgs,
   SmokeRunController,
-  type SmokeHostOptions,
-  type SmokeRunOptions,
+  type SmokeCliOptions,
 } from "./smoke-common.ts";
 
 // Older published baselines predate this warning, but still need update coverage.
@@ -69,12 +69,15 @@ function compareOpenClawPackageVersions(left: string, right: string): number {
     if (!match) {
       return [0, 0, 0];
     }
-    return [Number(match[1]), Number(match[2]), Number(match[3])];
+    const [, year, month, patch] = match;
+    if (!year || !month || !patch) {
+      return [0, 0, 0];
+    }
+    return [Number(year), Number(month), Number(patch)];
   };
-  const leftParts = parse(left);
-  const rightParts = parse(right);
-  for (let index = 0; index < leftParts.length; index++) {
-    const delta = leftParts[index] - rightParts[index];
+  const [leftYear, leftMonth, leftPatch] = parse(left);
+  const [rightYear, rightMonth, rightPatch] = parse(right);
+  for (const delta of [leftYear - rightYear, leftMonth - rightMonth, leftPatch - rightPatch]) {
     if (delta !== 0) {
       return delta;
     }
@@ -82,13 +85,8 @@ function compareOpenClawPackageVersions(left: string, right: string): number {
   return 0;
 }
 
-interface LinuxOptions extends SmokeHostOptions, SmokeRunOptions {
-  vmName: string;
+interface LinuxOptions extends SmokeCliOptions {
   vmNameExplicit: boolean;
-  apiKeyEnv?: string;
-  modelId?: string;
-  installUrl: string;
-  latestVersion?: string;
 }
 
 interface LinuxSummary {
@@ -166,87 +164,16 @@ Options:
 }
 
 export function parseArgs(argv: string[]): LinuxOptions {
-  const args = stripLeadingPackageManagerSeparator(argv);
   const options = defaultOptions();
-  parseArgv: for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    switch (arg) {
-      case "--":
-        break parseArgv;
-      case "--vm":
-        options.vmName = ensureValue(args, i, arg);
-        options.vmNameExplicit = true;
-        i++;
-        break;
-      case "--snapshot-hint":
-        options.snapshotHint = ensureValue(args, i, arg);
-        i++;
-        break;
-      case "--mode":
-        options.mode = parseMode(ensureValue(args, i, arg));
-        i++;
-        break;
-      case "--provider":
-        options.provider = parseProvider(ensureValue(args, i, arg));
-        i++;
-        break;
-      case "--model":
-        options.modelId = ensureValue(args, i, arg);
-        i++;
-        break;
-      case "--api-key-env":
-      case "--openai-api-key-env":
-        options.apiKeyEnv = ensureValue(args, i, arg);
-        i++;
-        break;
-      case "--install-url":
-        options.installUrl = ensureValue(args, i, arg);
-        i++;
-        break;
-      case "--host-port":
-        options.hostPort = parseTcpPort(ensureValue(args, i, arg), arg);
-        options.hostPortExplicit = true;
-        i++;
-        break;
-      case "--host-ip":
-        options.hostIp = ensureValue(args, i, arg);
-        i++;
-        break;
-      case "--latest-version":
-        options.latestVersion = ensureValue(args, i, arg);
-        i++;
-        break;
-      case "--install-version":
-        options.installVersion = ensureValue(args, i, arg);
-        i++;
-        break;
-      case "--target-package-spec":
-        options.targetPackageSpec = ensureValue(args, i, arg);
-        i++;
-        break;
-      case "--npm-registry":
-        options.npmRegistry = ensureValue(args, i, arg);
-        i++;
-        break;
-      case "--keep-server":
-        options.keepServer = true;
-        break;
-      case "--json":
-        options.json = true;
-        break;
-      case "-h":
-      case "--help":
-        process.stdout.write(usage());
-        process.exit(0);
-      default:
-        die(`unknown arg: ${arg}`);
-    }
-  }
-  return options;
-}
-
-function stripLeadingPackageManagerSeparator(argv: string[]): string[] {
-  return argv[0] === "--" ? argv.slice(1) : argv;
+  return parseSmokeCliArgs(argv, options, {
+    usage,
+    valueHandlers: {
+      "--vm": (parsed, value) => {
+        parsed.vmName = value;
+        parsed.vmNameExplicit = true;
+      },
+    },
+  });
 }
 
 class LinuxSmoke extends SmokeRunController<LinuxOptions> {
@@ -261,6 +188,7 @@ class LinuxSmoke extends SmokeRunController<LinuxOptions> {
   private snapshot!: SnapshotInfo;
   private phases!: PhaseRunner;
   private guest!: LinuxGuest;
+  private guestEnv: Record<string, string> = {};
 
   protected status = {
     daemon: "systemd-user-unavailable",
@@ -294,7 +222,7 @@ class LinuxSmoke extends SmokeRunController<LinuxOptions> {
       this.snapshot = shouldSkipSnapshotRestore()
         ? currentRunningSnapshotInfo(this.options.vmName)
         : resolveSnapshot(this.options.vmName, this.options.snapshotHint);
-      this.guest = new LinuxGuest(this.options.vmName, this.phases);
+      this.guest = new LinuxGuest(this.options.vmName, this.phases, () => this.guestEnv);
       this.latestVersion = resolveLatestVersion(this.options.latestVersion);
       await this.prepareHost(
         defaultOptions().hostPort,
@@ -309,6 +237,8 @@ class LinuxSmoke extends SmokeRunController<LinuxOptions> {
         this.hostIp,
         this.hostPort,
         this.artifactLabel(),
+        false,
+        this.options.provider,
       );
 
       await this.runLanesAndFinish();
@@ -330,13 +260,28 @@ class LinuxSmoke extends SmokeRunController<LinuxOptions> {
     await this.phase("fresh.bootstrap-guest", BOOTSTRAP_TIMEOUT_SECONDS, () =>
       this.bootstrapGuest(),
     );
+    await this.phase("fresh.reset-state", 180, () => this.resetState());
     await this.phase("fresh.preflight", 90, () => this.logGuestPreflight());
-    await this.phase("fresh.install-latest-bootstrap", 420, () => this.installLatestRelease());
+    await this.phase("fresh.ensure-runtime", 420, () =>
+      ensureSmokeGuestRuntime({
+        runShell: (script) => this.guestBash(script),
+        bootstrap: () => this.installLatestRelease(),
+      }),
+    );
     await this.phase("fresh.install-main", 420, () =>
       this.installMainTgz("openclaw-main-fresh.tgz"),
     );
     this.status.freshVersion = await this.extractLastVersion("fresh.install-main");
     await this.phase("fresh.verify-main-version", 90, () => this.verifyTargetVersion());
+    await this.phase("fresh.install-companions", 600, () =>
+      installSmokeRuntimeCompanions({
+        provider: this.options.provider,
+        readCli: (args) => this.guestExec(["openclaw", ...args]),
+        installCli: (args) => {
+          this.guestExec(["openclaw", ...args]);
+        },
+      }),
+    );
     await this.phase("fresh.onboard-ref", 420, () => this.runRefOnboard());
     await this.phase("fresh.inject-bad-plugin", 90, () =>
       this.maybeInjectBadPluginFixture("fresh"),
@@ -358,6 +303,7 @@ class LinuxSmoke extends SmokeRunController<LinuxOptions> {
     await this.phase("upgrade.bootstrap-guest", BOOTSTRAP_TIMEOUT_SECONDS, () =>
       this.bootstrapGuest(),
     );
+    await this.phase("upgrade.reset-state", 180, () => this.resetState());
     await this.phase("upgrade.preflight", 90, () => this.logGuestPreflight());
     await this.phase("upgrade.install-latest", 420, () => this.installLatestRelease());
     this.status.latestInstalledVersion = await this.extractLastVersion("upgrade.install-latest");
@@ -429,6 +375,8 @@ printf 'preflight.npmRoot=%s\n' "$(npm root -g 2>/dev/null || true)"`);
   }
 
   private restoreSnapshot(): void {
+    // A restored baseline must resolve public packages, not the previous candidate registry.
+    this.guestEnv = {};
     if (shouldSkipSnapshotRestore()) {
       say(`Skip snapshot restore; using current running VM ${this.options.vmName}`);
       this.waitForGuestReady();
@@ -488,6 +436,16 @@ run_apt_with_lock_retry apt-get -o Acquire::Check-Date=false -o DPkg::Lock::Time
 run_apt_with_lock_retry apt-get -o DPkg::Lock::Timeout=30 install -y curl ca-certificates`);
   }
 
+  private resetState(): void {
+    this.guestBash(String.raw`set -euo pipefail
+pkill -f '[o]penclaw.*gateway run' >/dev/null 2>&1 || true
+pkill -f '[o]penclaw-gateway' >/dev/null 2>&1 || true
+pkill -f '[o]penclaw.mjs gateway' >/dev/null 2>&1 || true
+npm uninstall -g openclaw >/dev/null 2>&1 || true
+rm -rf /root/.openclaw /root/.npm/_cacache
+rm -f /tmp/openclaw-parallels-linux-gateway.log`);
+  }
+
   private installLatestRelease(): void {
     this.downloadGuestFile(this.options.installUrl, "/tmp/openclaw-install.sh");
     if (this.options.installVersion) {
@@ -528,19 +486,10 @@ fi`);
     if (!this.artifact || !this.server) {
       die("package artifact/server missing");
     }
+    this.guestEnv = npmRegistryEnv(this.options.npmRegistry ?? this.server.registry?.url);
     const tgzUrl = this.server.urlFor(this.artifact.path);
     this.downloadGuestFile(tgzUrl, `/tmp/${tempName}`);
-    const npmArgs = ["npm", "install", "-g", `/tmp/${tempName}`, "--no-fund", "--no-audit"];
-    this.guestExec(
-      this.options.npmRegistry
-        ? [
-            "/usr/bin/env",
-            `NPM_CONFIG_REGISTRY=${this.options.npmRegistry}`,
-            `npm_config_registry=${this.options.npmRegistry}`,
-            ...npmArgs,
-          ]
-        : npmArgs,
-    );
+    this.guestExec(["npm", "install", "-g", `/tmp/${tempName}`, "--no-fund", "--no-audit"]);
     this.guestExec(["openclaw", "--version"]);
   }
 
@@ -573,6 +522,7 @@ fi`);
       "local",
       "--auth-choice",
       this.auth.authChoice,
+      ...(this.auth.tokenProvider ? ["--token-provider", this.auth.tokenProvider] : []),
       "--secret-input-mode",
       "ref",
       "--gateway-port",
@@ -678,17 +628,7 @@ setsid sh -lc ` +
     const args = help.includes("--require-rpc")
       ? ["openclaw", "gateway", "status", "--deep", "--require-rpc"]
       : ["openclaw", "gateway", "status", "--deep"];
-    const result = run(
-      "prlctl",
-      ["exec", this.options.vmName, "/usr/bin/env", "HOME=/root", "OPENCLAW_ALLOW_ROOT=1", ...args],
-      {
-        check: false,
-        quiet: true,
-        timeoutMs: this.remainingPhaseTimeoutMs(),
-      },
-    );
-    this.log(result.stdout);
-    this.log(result.stderr);
+    const result = this.guest.run(args, { check: false });
     if (check && result.status !== 0) {
       throw new Error("gateway status failed");
     }
@@ -697,26 +637,10 @@ setsid sh -lc ` +
 
   private verifyGatewayStatus(): void {
     for (let attempt = 1; attempt <= 8; attempt++) {
-      const result = run(
-        "prlctl",
-        [
-          "exec",
-          this.options.vmName,
-          "/usr/bin/env",
-          "HOME=/root",
-          "OPENCLAW_ALLOW_ROOT=1",
-          "openclaw",
-          "gateway",
-          "status",
-          "--deep",
-          "--require-rpc",
-          "--timeout",
-          "15000",
-        ],
-        { check: false, quiet: true, timeoutMs: this.remainingPhaseTimeoutMs() },
+      const result = this.guest.run(
+        ["openclaw", "gateway", "status", "--deep", "--require-rpc", "--timeout", "15000"],
+        { check: false },
       );
-      this.log(result.stdout);
-      this.log(result.stderr);
       if (result.status === 0) {
         return;
       }
@@ -774,6 +698,7 @@ rm -rf /root/.openclaw/test-bad-plugin`);
   }
 
   private verifyLocalTurn(): void {
+    this.guestBash(`set -euo pipefail\n${posixStopGatewayScript()}`);
     this.guestExec(["openclaw", "models", "set", this.auth.modelId]);
     const modelProviderConfigBatch = modelProviderConfigBatchJson(this.auth.modelId, "linux");
     if (modelProviderConfigBatch) {

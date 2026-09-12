@@ -1,12 +1,6 @@
 /** Doctor notes for auth profile health, OAuth refresh failures, and legacy Codex config. */
-import path from "node:path";
 import { note } from "../../packages/terminal-core/src/note.js";
-import {
-  listAgentIds,
-  resolveAgentDir,
-  resolveDefaultAgentDir,
-  resolveDefaultAgentId,
-} from "../agents/agent-scope.js";
+import { listAgentIds, resolveAgentDir } from "../agents/agent-scope.js";
 import {
   buildAuthHealthSummary,
   DEFAULT_OAUTH_WARN_MS,
@@ -16,19 +10,31 @@ import {
 import {
   type AuthCredentialReasonCode,
   ensureAuthProfileStore,
+  findPersistedAuthProfileCredential,
   hasAnyAuthProfileStoreSource,
   hasLocalAuthProfileStoreSource,
+  loadAuthProfileStoreForRuntime,
   resolveApiKeyForProfile,
   resolveProfileUnusableUntilForDisplay,
 } from "../agents/auth-profiles.js";
 import { formatAuthDoctorHint } from "../agents/auth-profiles/doctor.js";
 import {
+  buildAuthProfileUnusableHint,
   buildOAuthRefreshFailureLoginCommand,
   classifyOAuthRefreshFailure,
   formatOAuthRefreshFailureLoginCommandMarkdown,
   type OAuthRefreshFailureReason,
 } from "../agents/auth-profiles/oauth-refresh-failure.js";
-import { resolveAuthStorePathForDisplay } from "../agents/auth-profiles/path-resolve.js";
+import { shouldUseMainOwnerForLocalOAuthCredential } from "../agents/auth-profiles/ownership.js";
+import {
+  resolveSharedAuthStoreOwnership,
+  resolveSharedAuthStorePath,
+} from "../agents/auth-profiles/path-resolve.js";
+import { resolveAuthStorePathForDisplay } from "../agents/auth-profiles/paths.js";
+import {
+  inspectPersistedSharedAuthProfileStoreRaw,
+  resolveAuthProfileDatabasePath,
+} from "../agents/auth-profiles/sqlite.js";
 import { buildProviderAuthRecoveryHint } from "../agents/provider-auth-recovery-hint.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { HealthFinding } from "../flows/health-checks.js";
@@ -45,6 +51,20 @@ const AUTH_PROFILES_CHECK_ID = "core/doctor/auth-profiles";
 const DOCTOR_REAUTH_PROVIDER_ALIASES: Readonly<Record<string, string>> = {
   [LEGACY_CODEX_PROVIDER_ID]: OPENAI_PROVIDER_ID,
 };
+
+/** Surface the one-time relocation while the legacy shared owner is still active. */
+export function noteSharedAuthStoreStatus(env: NodeJS.ProcessEnv = process.env): void {
+  if (
+    resolveSharedAuthStoreOwnership(env).location !== "legacy-main" ||
+    inspectPersistedSharedAuthProfileStoreRaw(env).status !== "readable"
+  ) {
+    return;
+  }
+  note(
+    "Shared auth profiles still live in the main agent database. Run `openclaw doctor --fix` to move them into shared SQLite state and make the main agent deletable.",
+    "Shared auth store",
+  );
+}
 
 function hasConfiguredCodexOAuthProfile(cfg: OpenClawConfig): boolean {
   return Object.values(cfg.auth?.profiles ?? {}).some(
@@ -119,9 +139,7 @@ function buildCodexProviderOverrideWarning(providerOverride: unknown): string {
   return lines.join("\n");
 }
 
-export function legacyCodexProviderOverrideToHealthFinding(
-  providerOverride: unknown,
-): HealthFinding {
+function legacyCodexProviderOverrideToHealthFinding(providerOverride: unknown): HealthFinding {
   const message =
     "Legacy openai-codex transport override can shadow configured Codex OAuth credentials.";
   const details = buildCodexProviderOverrideWarning(providerOverride);
@@ -159,60 +177,40 @@ type AuthIssue = {
 };
 
 type AuthProfileHealthTarget = {
-  agentId: string;
-  agentDir: string;
-  isDefault: boolean;
+  label: string;
+  agentDir?: string;
 };
 
-function formatAgentNoteTitle(title: string, agentId: string, labelAgents: boolean): string {
-  return labelAgents ? `${title} (agent: ${agentId})` : title;
+function formatAuthNoteTitle(
+  title: string,
+  target: AuthProfileHealthTarget,
+  labelStores: boolean,
+): string {
+  return labelStores ? `${title} (${target.label})` : title;
 }
 
 function listAuthProfileHealthTargets(cfg: OpenClawConfig): AuthProfileHealthTarget[] {
-  const defaultAgentId = resolveDefaultAgentId(cfg);
   const targets = new Map<string, AuthProfileHealthTarget>();
-  const addTarget = (agentId: string, agentDir: string, isDefault: boolean) => {
-    const key = path.resolve(agentDir);
-    const existing = targets.get(key);
-    if (!existing || isDefault) {
-      targets.set(key, { agentId, agentDir, isDefault: isDefault || existing?.isDefault === true });
-    }
-  };
-
-  addTarget(defaultAgentId, resolveDefaultAgentDir(cfg), true);
+  if (hasAnyAuthProfileStoreSource() || Object.keys(cfg.auth?.profiles ?? {}).length > 0) {
+    targets.set(resolveSharedAuthStorePath(), { label: "Shared" });
+  }
   for (const agentId of listAgentIds(cfg)) {
-    if (agentId === defaultAgentId) {
-      continue;
-    }
     const agentDir = resolveAgentDir(cfg, agentId);
-    if (hasLocalAuthProfileStoreSource(agentDir)) {
-      addTarget(agentId, agentDir, false);
+    const databasePath = resolveAuthProfileDatabasePath(agentDir);
+    if (!targets.has(databasePath) && hasLocalAuthProfileStoreSource(agentDir)) {
+      targets.set(databasePath, { label: `Agent ${agentId}`, agentDir });
     }
   }
 
   return [...targets.values()];
 }
 
-/** Returns the short doctor hint for disabled or cooldown auth profiles. */
-export function resolveUnusableProfileHint(params: {
-  kind: "cooldown" | "disabled";
-  reason?: string;
-}): string {
-  if (params.kind === "disabled") {
-    if (params.reason === "billing") {
-      return "Top up credits (provider billing) or switch provider.";
-    }
-    if (params.reason === "auth_permanent" || params.reason === "auth") {
-      return "Refresh or replace credentials, then retry.";
-    }
-  }
-  return "Wait for cooldown or switch provider.";
-}
-
 function formatOAuthRefreshFailureReason(reason: OAuthRefreshFailureReason | null): string {
   switch (reason) {
     case "refresh_token_reused":
       return "refresh_token_reused";
+    case "expired":
+      return "expired";
     case "invalid_grant":
       return "invalid_grant";
     case "sign_in_again":
@@ -227,7 +225,7 @@ function formatOAuthRefreshFailureReason(reason: OAuthRefreshFailureReason | nul
 }
 
 /** Formats provider OAuth refresh failures as actionable doctor note lines. */
-export function formatOAuthRefreshFailureDoctorLine(params: {
+function formatOAuthRefreshFailureDoctorLine(params: {
   profileId: string;
   provider: string;
   message: string;
@@ -294,7 +292,7 @@ function resolveAuthProfileStorePath(target: AuthProfileHealthTarget): string {
 function authProfileIssueToHealthFinding(params: {
   issue: AuthIssue;
   target: AuthProfileHealthTarget;
-  labelAgents: boolean;
+  labelStores: boolean;
   hint: string | null;
 }): HealthFinding {
   const remaining =
@@ -302,7 +300,7 @@ function authProfileIssueToHealthFinding(params: {
       ? ` (${formatRemainingShort(params.issue.remainingMs)})`
       : "";
   const reason = params.issue.reasonCode ? ` [${params.issue.reasonCode}]` : "";
-  const owner = params.labelAgents ? `Agent ${params.target.agentId} auth profile` : "Auth profile";
+  const owner = params.labelStores ? `${params.target.label} auth profile` : "Auth profile";
   return {
     checkId: AUTH_PROFILES_CHECK_ID,
     severity: "warning",
@@ -318,19 +316,55 @@ function authProfileIssueToHealthFinding(params: {
   };
 }
 
-function authProfileCooldownToHealthFinding(params: {
+type AuthProfileCooldown = {
   profileId: string;
-  target: AuthProfileHealthTarget;
-  labelAgents: boolean;
   kind: string;
   remaining: string;
   hint: string;
-}): HealthFinding {
+};
+
+function collectAuthProfileCooldowns(store: ReturnType<typeof ensureAuthProfileStore>) {
+  const cooldowns: AuthProfileCooldown[] = [];
+  const now = Date.now();
+  for (const profileId of Object.keys(store.usageStats ?? {})) {
+    const until = resolveProfileUnusableUntilForDisplay(store, profileId);
+    if (!until || now >= until) {
+      continue;
+    }
+    const stats = store.usageStats?.[profileId];
+    const disabledActive = typeof stats?.disabledUntil === "number" && now < stats.disabledUntil;
+    const reason = disabledActive ? stats?.disabledReason : stats?.cooldownReason;
+    const displayReason = disabledActive ? reason : (stats?.cooldownClassification ?? reason);
+    cooldowns.push({
+      profileId,
+      kind: `${disabledActive ? "disabled" : "cooldown"}${displayReason ? `:${displayReason}` : ""}`,
+      remaining: formatRemainingShort(until - now),
+      hint: buildAuthProfileUnusableHint({
+        kind: disabledActive ? "disabled" : "cooldown",
+        reason,
+        // Local cooldowns can refer to shared credentials, whose expiry is checked separately.
+        provider:
+          store.profiles[profileId]?.provider ??
+          findPersistedAuthProfileCredential({ profileId })?.provider ??
+          profileId,
+        profileId,
+      }),
+    });
+  }
+  return cooldowns;
+}
+
+function authProfileCooldownToHealthFinding(
+  params: AuthProfileCooldown & {
+    target: AuthProfileHealthTarget;
+    labelStores: boolean;
+  },
+): HealthFinding {
   return {
     checkId: AUTH_PROFILES_CHECK_ID,
     severity: "warning",
-    message: params.labelAgents
-      ? `Agent ${params.target.agentId} auth profile ${params.profileId} is ${params.kind} (${params.remaining}).`
+    message: params.labelStores
+      ? `${params.target.label} auth profile ${params.profileId} is ${params.kind} (${params.remaining}).`
       : `Auth profile ${params.profileId} is ${params.kind} (${params.remaining}).`,
     path: resolveAuthProfileStorePath(params.target),
     target: params.profileId,
@@ -348,51 +382,61 @@ function isAuthProfileHealthIssue(profile: AuthHealthSummary["profiles"][number]
   );
 }
 
+function loadAuthProfileHealth(params: {
+  cfg: OpenClawConfig;
+  target: AuthProfileHealthTarget;
+  allowKeychainPrompt: boolean;
+  readOnly?: boolean;
+}) {
+  // Same-store inheritance keeps local cooldowns and CLI overlays. Credential health follows
+  // canonical OAuth ownership, so stale local copies cannot refresh shared credentials twice.
+  const store = loadAuthProfileStoreForRuntime(params.target.agentDir, {
+    inheritedAuthDir: params.target.agentDir,
+    allowKeychainPrompt: params.allowKeychainPrompt,
+    readOnly: params.readOnly,
+  });
+  const profiles = params.target.agentDir
+    ? Object.fromEntries(
+        Object.entries(store.profiles).filter(
+          ([profileId, local]) =>
+            local.type !== "oauth" ||
+            !shouldUseMainOwnerForLocalOAuthCredential({
+              profileId,
+              local,
+              main: findPersistedAuthProfileCredential({ profileId }),
+            }),
+        ),
+      )
+    : store.profiles;
+  return {
+    store,
+    summary: buildAuthHealthSummary({
+      store: { ...store, profiles },
+      cfg: params.cfg,
+      warnAfterMs: DEFAULT_OAUTH_WARN_MS,
+      allowKeychainPrompt: params.allowKeychainPrompt,
+    }),
+  };
+}
+
 async function collectAuthProfileHealthFindingsForTarget(params: {
   cfg: OpenClawConfig;
   allowKeychainPrompt: boolean;
   target: AuthProfileHealthTarget;
-  labelAgents: boolean;
+  labelStores: boolean;
 }): Promise<readonly HealthFinding[]> {
-  const store = ensureAuthProfileStore(params.target.agentDir, {
-    allowKeychainPrompt: params.allowKeychainPrompt,
-    readOnly: true,
-  });
+  const { store, summary } = loadAuthProfileHealth({ ...params, readOnly: true });
   const findings: HealthFinding[] = [];
-  const now = Date.now();
-  for (const profileId of Object.keys(store.usageStats ?? {})) {
-    const until = resolveProfileUnusableUntilForDisplay(store, profileId);
-    if (!until || now >= until) {
-      continue;
-    }
-    const stats = store.usageStats?.[profileId];
-    const remaining = formatRemainingShort(until - now);
-    const disabledActive = typeof stats?.disabledUntil === "number" && now < stats.disabledUntil;
-    const kind = disabledActive
-      ? `disabled${stats.disabledReason ? `:${stats.disabledReason}` : ""}`
-      : "cooldown";
-    const hint = resolveUnusableProfileHint({
-      kind: disabledActive ? "disabled" : "cooldown",
-      reason: stats?.disabledReason,
-    });
+  for (const cooldown of collectAuthProfileCooldowns(store)) {
     findings.push(
       authProfileCooldownToHealthFinding({
-        profileId,
+        ...cooldown,
         target: params.target,
-        labelAgents: params.labelAgents,
-        kind,
-        remaining,
-        hint,
+        labelStores: params.labelStores,
       }),
     );
   }
 
-  const summary = buildAuthHealthSummary({
-    store,
-    cfg: params.cfg,
-    warnAfterMs: DEFAULT_OAUTH_WARN_MS,
-    allowKeychainPrompt: params.allowKeychainPrompt,
-  });
   const issues = summary.profiles.filter(isAuthProfileHealthIssue);
   for (const issue of issues) {
     const authIssue: AuthIssue = {
@@ -406,7 +450,7 @@ async function collectAuthProfileHealthFindingsForTarget(params: {
       authProfileIssueToHealthFinding({
         issue: authIssue,
         target: params.target,
-        labelAgents: params.labelAgents,
+        labelStores: params.labelStores,
         hint: await resolveAuthIssueHint(authIssue, params.cfg, store),
       }),
     );
@@ -419,22 +463,16 @@ export async function collectAuthProfileHealthFindings(params: {
   cfg: OpenClawConfig;
   allowKeychainPrompt?: boolean;
 }): Promise<readonly HealthFinding[]> {
-  const configuredProfiles = Object.keys(params.cfg.auth?.profiles ?? {}).length > 0;
-  const targets = listAuthProfileHealthTargets(params.cfg);
-  const activeTargets = targets.filter((target) =>
-    target.isDefault
-      ? hasAnyAuthProfileStoreSource(target.agentDir) || configuredProfiles
-      : hasLocalAuthProfileStoreSource(target.agentDir),
-  );
+  const activeTargets = listAuthProfileHealthTargets(params.cfg);
   const findings: HealthFinding[] = [];
-  const labelAgents = activeTargets.length > 1;
+  const labelStores = activeTargets.length > 1;
   for (const target of activeTargets) {
     findings.push(
       ...(await collectAuthProfileHealthFindingsForTarget({
         cfg: params.cfg,
         allowKeychainPrompt: params.allowKeychainPrompt ?? false,
         target,
-        labelAgents,
+        labelStores,
       })),
     );
   }
@@ -455,52 +493,25 @@ async function noteAuthProfileHealthForTarget(params: {
   prompter: DoctorPrompter;
   allowKeychainPrompt: boolean;
   target: AuthProfileHealthTarget;
-  labelAgents: boolean;
-}): Promise<void> {
-  const store = ensureAuthProfileStore(params.target.agentDir, {
-    allowKeychainPrompt: params.allowKeychainPrompt,
-  });
+  labelStores: boolean;
+}): Promise<string[]> {
+  let { store, summary } = loadAuthProfileHealth(params);
   const noteTitle = (title: string) =>
-    formatAgentNoteTitle(title, params.target.agentId, params.labelAgents);
-  const unusable = (() => {
-    const now = Date.now();
-    const out: string[] = [];
-    for (const profileId of Object.keys(store.usageStats ?? {})) {
-      const until = resolveProfileUnusableUntilForDisplay(store, profileId);
-      if (!until || now >= until) {
-        continue;
-      }
-      const stats = store.usageStats?.[profileId];
-      const remaining = formatRemainingShort(until - now);
-      const disabledActive = typeof stats?.disabledUntil === "number" && now < stats.disabledUntil;
-      const kind = disabledActive
-        ? `disabled${stats.disabledReason ? `:${stats.disabledReason}` : ""}`
-        : "cooldown";
-      const hint = resolveUnusableProfileHint({
-        kind: disabledActive ? "disabled" : "cooldown",
-        reason: stats?.disabledReason,
-      });
-      out.push(`- ${profileId}: ${kind} (${remaining})${hint ? ` — ${hint}` : ""}`);
-    }
-    return out;
-  })();
+    formatAuthNoteTitle(title, params.target, params.labelStores);
+  const unusable = collectAuthProfileCooldowns(store).map(
+    ({ profileId, kind, remaining, hint }) =>
+      `- ${profileId}: ${kind} (${remaining})${hint ? ` — ${hint}` : ""}`,
+  );
 
   if (unusable.length > 0) {
     note(unusable.join("\n"), noteTitle("Auth profile cooldowns"));
   }
 
-  let summary = buildAuthHealthSummary({
-    store,
-    cfg: params.cfg,
-    warnAfterMs: DEFAULT_OAUTH_WARN_MS,
-    allowKeychainPrompt: params.allowKeychainPrompt,
-  });
-
   const findIssues = () => summary.profiles.filter(isAuthProfileHealthIssue);
 
   let issues = findIssues();
   if (issues.length === 0) {
-    return;
+    return [];
   }
 
   const refreshTargets = issues.filter(
@@ -522,6 +533,7 @@ async function noteAuthProfileHealthForTarget(params: {
           store,
           profileId: profile.profileId,
           agentDir: params.target.agentDir,
+          forceRefresh: true,
         });
       } catch (err) {
         const message = formatErrorMessage(err);
@@ -537,35 +549,11 @@ async function noteAuthProfileHealthForTarget(params: {
     if (errors.length > 0) {
       note(errors.join("\n"), noteTitle("OAuth refresh errors"));
     }
-    summary = buildAuthHealthSummary({
-      store: ensureAuthProfileStore(params.target.agentDir, {
-        allowKeychainPrompt: false,
-      }),
-      cfg: params.cfg,
-      warnAfterMs: DEFAULT_OAUTH_WARN_MS,
-      allowKeychainPrompt: false,
-    });
+    ({ store, summary } = loadAuthProfileHealth({ ...params, allowKeychainPrompt: false }));
     issues = findIssues();
   }
 
-  if (issues.length > 0) {
-    const issueLines = await Promise.all(
-      issues.map((issue) =>
-        formatAuthIssueLine(
-          {
-            profileId: issue.profileId,
-            provider: issue.provider,
-            status: issue.status,
-            reasonCode: issue.reasonCode,
-            remainingMs: issue.remainingMs,
-          },
-          params.cfg,
-          store,
-        ),
-      ),
-    );
-    note(issueLines.join("\n"), noteTitle("Model auth"));
-  }
+  return Promise.all(issues.map((issue) => formatAuthIssueLine(issue, params.cfg, store)));
 }
 
 /** Checks configured agent auth stores and emits doctor notes for stale or unusable profiles. */
@@ -574,23 +562,29 @@ export async function noteAuthProfileHealth(params: {
   prompter: DoctorPrompter;
   allowKeychainPrompt: boolean;
 }): Promise<void> {
-  const configuredProfiles = Object.keys(params.cfg.auth?.profiles ?? {}).length > 0;
-  const targets = listAuthProfileHealthTargets(params.cfg);
-  const activeTargets = targets.filter((target) =>
-    target.isDefault
-      ? hasAnyAuthProfileStoreSource(target.agentDir) || configuredProfiles
-      : hasLocalAuthProfileStoreSource(target.agentDir),
-  );
+  const activeTargets = listAuthProfileHealthTargets(params.cfg);
   if (activeTargets.length === 0) {
     return;
   }
 
-  const labelAgents = activeTargets.length > 1;
+  const labelStores = activeTargets.length > 1;
+  const storesByIssueLine = new Map<string, Set<string>>();
   for (const target of activeTargets) {
-    await noteAuthProfileHealthForTarget({
-      ...params,
-      target,
-      labelAgents,
-    });
+    for (const line of await noteAuthProfileHealthForTarget({ ...params, target, labelStores })) {
+      const labels = storesByIssueLine.get(line) ?? new Set<string>();
+      storesByIssueLine.set(line, labels.add(target.label));
+    }
   }
+  if (storesByIssueLine.size === 0) {
+    return;
+  }
+  // One aggregated note; a line shared by every checked store needs no attribution.
+  const lines = [...storesByIssueLine.entries()]
+    .toSorted(([left], [right]) => left.localeCompare(right))
+    .map(([line, labels]) =>
+      labels.size === activeTargets.length
+        ? line
+        : `${line} (stores: ${[...labels].toSorted().join(", ")})`,
+    );
+  note(lines.join("\n"), "Model auth");
 }

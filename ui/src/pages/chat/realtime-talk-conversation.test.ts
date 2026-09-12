@@ -1,8 +1,8 @@
+// @vitest-environment node
 // Control UI tests cover realtime talk conversation behavior.
 import { describe, expect, it } from "vitest";
 import {
   createRealtimeTalkConversationState,
-  finishRealtimeConversationEntry,
   updateRealtimeTalkConversation,
 } from "./realtime-talk-conversation.ts";
 
@@ -28,85 +28,236 @@ describe("realtime Talk conversation", () => {
     ]);
   });
 
-  it("inserts spacing after punctuation-ended transcript fragments", () => {
+  it("inserts spacing after punctuation-ended user transcript fragments", () => {
     let state = createRealtimeTalkConversationState();
 
     state = updateRealtimeTalkConversation(state, {
-      role: "assistant",
+      role: "user",
       text: "Ready.",
       final: false,
       nowMs: 1,
     });
     state = updateRealtimeTalkConversation(state, {
-      role: "assistant",
+      role: "user",
       text: "What next?",
       final: false,
       nowMs: 2,
     });
 
     expect(state.entries).toMatchObject([
-      { role: "assistant", text: "Ready. What next?", isStreaming: true },
+      { role: "user", text: "Ready. What next?", isStreaming: true },
     ]);
   });
 
-  it("keeps a late final rewrite in the original user bubble", () => {
+  it("concatenates streamed assistant deltas verbatim without injecting spaces", () => {
     let state = createRealtimeTalkConversationState();
 
-    state = updateRealtimeTalkConversation(state, {
-      role: "user",
-      text: "Can you tack",
-      final: false,
-      nowMs: 1,
-    });
-    state = finishRealtimeConversationEntry(state, "user", 2);
+    const deltas = ["I", "'m", " Chat", "G", "PT", ",", " a", " con", "vers", "ational", " AI"];
+    for (const [index, delta] of deltas.entries()) {
+      state = updateRealtimeTalkConversation(state, {
+        role: "assistant",
+        text: delta,
+        final: false,
+        nowMs: index + 1,
+      });
+    }
+
+    expect(state.entries).toMatchObject([
+      { role: "assistant", text: "I'm ChatGPT, a conversational AI", isStreaming: true },
+    ]);
+  });
+
+  it("keeps per-character assistant deltas verbatim across punctuation boundaries", () => {
+    let state = createRealtimeTalkConversationState();
+
+    for (const [index, char] of "Version 1.2 is on docs.openclaw.ai today.".split("").entries()) {
+      state = updateRealtimeTalkConversation(state, {
+        role: "assistant",
+        text: char,
+        final: false,
+        nowMs: index + 1,
+      });
+    }
+
+    expect(state.entries).toMatchObject([
+      { role: "assistant", text: "Version 1.2 is on docs.openclaw.ai today.", isStreaming: true },
+    ]);
+  });
+
+  it("replaces streamed assistant text with the authoritative final transcript", () => {
+    let state = createRealtimeTalkConversationState();
+
+    for (const delta of ["I'm Chat", "GPT."]) {
+      state = updateRealtimeTalkConversation(state, {
+        role: "assistant",
+        text: delta,
+        final: false,
+        nowMs: 1,
+      });
+    }
     state = updateRealtimeTalkConversation(state, {
       role: "assistant",
-      text: "Checking",
-      final: false,
-      nowMs: 3,
-    });
-    state = updateRealtimeTalkConversation(state, {
-      role: "user",
-      text: "Can you check?",
+      text: "I'm ChatGPT, nice to meet you.",
       final: true,
-      nowMs: 4,
+      nowMs: 2,
     });
 
     expect(state.entries).toMatchObject([
-      { role: "user", text: "Can you check?", isStreaming: false },
-      { role: "assistant", text: "Checking", isStreaming: true },
+      { role: "assistant", text: "I'm ChatGPT, nice to meet you.", isStreaming: false },
     ]);
   });
 
-  it("creates a new bubble for the next final user turn after assistant output starts", () => {
+  it("appends a final assistant fragment that only carries the transcript tail", () => {
     let state = createRealtimeTalkConversationState();
 
     state = updateRealtimeTalkConversation(state, {
-      role: "user",
-      text: "First request",
+      role: "assistant",
+      text: "Sure, the lights are ",
       final: false,
       nowMs: 1,
     });
-    state = finishRealtimeConversationEntry(state, "user", 2);
     state = updateRealtimeTalkConversation(state, {
       role: "assistant",
-      text: "Checking",
-      final: false,
-      nowMs: 3,
-    });
-    state = updateRealtimeTalkConversation(state, {
-      role: "user",
-      text: "Second request",
+      text: "off now.",
       final: true,
-      nowMs: 4,
+      nowMs: 2,
     });
 
     expect(state.entries).toMatchObject([
-      { role: "user", text: "First request", isStreaming: false },
-      { role: "assistant", text: "Checking", isStreaming: false },
-      { role: "user", text: "Second request", isStreaming: false },
+      { role: "assistant", text: "Sure, the lights are off now.", isStreaming: false },
     ]);
   });
+
+  it("bounds streamed assistant delta growth while retaining useful context", () => {
+    let state = createRealtimeTalkConversationState();
+    const opening = "Opening context stays visible. ";
+
+    state = updateRealtimeTalkConversation(state, {
+      role: "assistant",
+      text: `${opening}${"a".repeat(7_900)}`,
+      final: false,
+      nowMs: 1,
+    });
+    state = updateRealtimeTalkConversation(state, {
+      role: "assistant",
+      text: "b".repeat(500),
+      final: false,
+      nowMs: 2,
+    });
+    state = updateRealtimeTalkConversation(state, {
+      role: "assistant",
+      text: `${"c".repeat(500)}NEWEST`,
+      final: false,
+      nowMs: 3,
+    });
+
+    expect(state.entries[0]?.text.length).toBeLessThanOrEqual(8_000);
+    expect(state.entries[0]?.text.startsWith(opening)).toBe(true);
+    expect(state.entries[0]?.text).toContain("\n…\n");
+    expect(state.entries[0]?.text.split("\n…\n")).toHaveLength(2);
+    expect(state.entries[0]?.text.endsWith("NEWEST")).toBe(true);
+  });
+
+  it("replaces a bounded assistant stream with the authoritative final transcript", () => {
+    let state = createRealtimeTalkConversationState();
+    const opening = "Original opening context. ";
+
+    state = updateRealtimeTalkConversation(state, {
+      role: "assistant",
+      text: `${opening}${"draft ".repeat(1_600)}`,
+      final: false,
+      nowMs: 1,
+    });
+    expect(state.entries[0]?.text).toContain("\n…\n");
+
+    state = updateRealtimeTalkConversation(state, {
+      role: "assistant",
+      text: `${opening}corrected ${"final ".repeat(1_600)}DONE`,
+      final: true,
+      nowMs: 2,
+    });
+
+    expect(state.entries[0]?.text.length).toBeLessThanOrEqual(8_000);
+    expect(state.entries[0]?.text.startsWith(`${opening}corrected `)).toBe(true);
+    expect(state.entries[0]?.text).not.toContain("draft ");
+    expect(state.entries[0]?.text.endsWith("DONE")).toBe(true);
+    expect(state.entries[0]?.isStreaming).toBe(false);
+  });
+
+  it("does not expose dangling surrogates at a bounded transcript edge", () => {
+    let state = createRealtimeTalkConversationState();
+    const transcript = `${"a".repeat(8_000)}🚀${"b".repeat(7_740)}`;
+
+    state = updateRealtimeTalkConversation(state, {
+      role: "assistant",
+      text: transcript,
+      final: true,
+      nowMs: 1,
+    });
+
+    const text = state.entries[0]?.text ?? "";
+    expect(text.length).toBeLessThanOrEqual(8_000);
+    expect(text).not.toMatch(
+      /(?:[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF])/,
+    );
+  });
+
+  it("does not trust a natural truncation marker outside the bounded prefix", () => {
+    let state = createRealtimeTalkConversationState();
+
+    state = updateRealtimeTalkConversation(state, {
+      role: "assistant",
+      text: `${"a".repeat(7_998)}\n…\n${"b".repeat(500)}NEWEST`,
+      final: true,
+      nowMs: 1,
+    });
+
+    expect(state.entries[0]?.text.length).toBeLessThanOrEqual(8_000);
+    expect(state.entries[0]?.text.startsWith("a".repeat(256))).toBe(true);
+    expect(state.entries[0]?.text.endsWith("NEWEST")).toBe(true);
+  });
+
+  it.each([255, 256])(
+    "does not retain a lone high surrogate before a natural marker at offset %i",
+    (markerOffset) => {
+      let state = createRealtimeTalkConversationState();
+      const retainedText = "a".repeat(markerOffset - 1);
+
+      state = updateRealtimeTalkConversation(state, {
+        role: "assistant",
+        text: `${retainedText}\uD800\n…\n${"b".repeat(8_000)}NEWEST`,
+        final: true,
+        nowMs: 1,
+      });
+
+      const text = state.entries[0]?.text ?? "";
+      expect(text.length).toBeLessThanOrEqual(8_000);
+      expect(text.startsWith(`${retainedText}\n…\n`)).toBe(true);
+      expect(text.endsWith("NEWEST")).toBe(true);
+      expect(text).not.toMatch(
+        /(?:[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF])/,
+      );
+    },
+  );
+
+  it.each(["user", "assistant"] as const)(
+    "bounds oversized final %s entries while retaining the newest text",
+    (role) => {
+      let state = createRealtimeTalkConversationState();
+
+      state = updateRealtimeTalkConversation(state, {
+        role,
+        text: `Useful opening. ${"x".repeat(9_000)}NEWEST`,
+        final: true,
+        nowMs: 1,
+      });
+
+      expect(state.entries[0]?.text.length).toBeLessThanOrEqual(8_000);
+      expect(state.entries[0]?.text.startsWith("Useful opening. ")).toBe(true);
+      expect(state.entries[0]?.text.endsWith("NEWEST")).toBe(true);
+      expect(state.entries[0]?.isStreaming).toBe(false);
+    },
+  );
 
   it("keeps alternating realtime turns as separate bubbles", () => {
     let state = createRealtimeTalkConversationState();

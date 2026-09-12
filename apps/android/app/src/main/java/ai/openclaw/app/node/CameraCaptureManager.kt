@@ -1,13 +1,11 @@
 package ai.openclaw.app.node
 
-import ai.openclaw.app.PermissionRequester
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.Matrix
 import android.hardware.camera2.CameraCharacteristics
 import android.util.Base64
 import androidx.camera.camera2.interop.Camera2CameraInfo
@@ -63,10 +61,14 @@ internal class CameraClipSession(
     return file
   }
 
-  fun transferFile(): File {
+  fun transferFile(onTransfer: (File) -> Unit): File {
     check(!closed) { "camera clip session is closed" }
     return checkNotNull(temporaryFile) { "camera clip session has no file" }
-      .also { temporaryFile = null }
+      .also { file ->
+        // Claim ownership before release because cancellation can discard a dispatched FilePayload.
+        onTransfer(file)
+        temporaryFile = null
+      }
   }
 
   override fun close() {
@@ -93,6 +95,7 @@ internal class CameraClipSession(
 
 class CameraCaptureManager(
   private val context: Context,
+  private val defaultFacing: () -> String = { "front" },
 ) {
   /** Base64 JSON response for camera.snap after resize and JPEG budget enforcement. */
   data class Payload(
@@ -116,18 +119,10 @@ class CameraCaptureManager(
 
   @Volatile private var lifecycleOwner: LifecycleOwner? = null
 
-  @Volatile private var permissionRequester: PermissionRequester? = null
-
   /** Supplies the foreground Activity lifecycle required by CameraX use-case binding. */
   fun attachLifecycleOwner(owner: LifecycleOwner) {
     // CameraX binds use cases to an Activity lifecycle; background services cannot capture alone.
     lifecycleOwner = owner
-  }
-
-  /** Supplies the Activity-owned permission launcher used by camera and microphone commands. */
-  fun attachPermissionRequester(requester: PermissionRequester) {
-    // Permission prompts must be launched by the Activity that owns the ActivityResult registry.
-    permissionRequester = requester
   }
 
   /** Lists CameraX devices with stable Camera2 ids where available. */
@@ -139,30 +134,16 @@ class CameraCaptureManager(
         .sortedBy { it.id }
     }
 
-  private suspend fun ensureCameraPermission() {
+  private fun ensureCameraPermission() {
     val granted = checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
     if (granted) return
-
-    val requester =
-      permissionRequester
-        ?: throw IllegalStateException("CAMERA_PERMISSION_REQUIRED: grant Camera permission")
-    val results = requester.requestIfMissing(listOf(Manifest.permission.CAMERA))
-    if (results[Manifest.permission.CAMERA] != true) {
-      throw IllegalStateException("CAMERA_PERMISSION_REQUIRED: grant Camera permission")
-    }
+    throw IllegalStateException("CAMERA_PERMISSION_REQUIRED: grant Camera permission")
   }
 
-  private suspend fun ensureMicPermission() {
+  private fun ensureMicPermission() {
     val granted = checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
     if (granted) return
-
-    val requester =
-      permissionRequester
-        ?: throw IllegalStateException("MIC_PERMISSION_REQUIRED: grant Microphone permission")
-    val results = requester.requestIfMissing(listOf(Manifest.permission.RECORD_AUDIO))
-    if (results[Manifest.permission.RECORD_AUDIO] != true) {
-      throw IllegalStateException("MIC_PERMISSION_REQUIRED: grant Microphone permission")
-    }
+    throw IllegalStateException("MIC_PERMISSION_REQUIRED: grant Microphone permission")
   }
 
   /** Captures one still image and returns a gateway-sized JPEG payload. */
@@ -171,7 +152,7 @@ class CameraCaptureManager(
       ensureCameraPermission()
       val owner = lifecycleOwner ?: throw IllegalStateException("UNAVAILABLE: camera not ready")
       val params = parseJsonParamsObject(paramsJson)
-      val facing = parseFacing(params) ?: "front"
+      val facing = resolveCameraFacing(parseFacing(params), defaultFacing())
       val quality = (parseQuality(params) ?: 0.95).coerceIn(0.1, 1.0)
       val maxWidth = parseMaxWidth(params) ?: 1600
       val deviceId = parseDeviceId(params)
@@ -194,7 +175,7 @@ class CameraCaptureManager(
       val decoded =
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
           ?: throw IllegalStateException("UNAVAILABLE: failed to decode captured image")
-      val rotated = rotateBitmapByExif(decoded, orientation)
+      val rotated = JpegSizeLimiter.normalizeOrientation(decoded, orientation)
       val scaled =
         if (maxWidth > 0 && rotated.width > maxWidth) {
           val h =
@@ -217,6 +198,7 @@ class CameraCaptureManager(
             initialWidth = scaled.width,
             initialHeight = scaled.height,
             startQuality = (quality * 100.0).roundToInt().coerceIn(10, 100),
+            minQuality = (quality * 100.0).roundToInt().coerceIn(10, 20),
             maxBytes = maxEncodedBytes,
             encode = { width, height, q ->
               val bitmap =
@@ -247,16 +229,19 @@ class CameraCaptureManager(
 
   /** Records a short MP4 clip into a temporary cache file for the caller to encode/delete. */
   @SuppressLint("MissingPermission")
-  suspend fun clip(paramsJson: String?): FilePayload =
+  suspend fun clip(
+    paramsJson: String?,
+    onFileReady: (File) -> Unit,
+  ): FilePayload =
     withContext(Dispatchers.Main) {
       ensureCameraPermission()
-      val owner = lifecycleOwner ?: throw IllegalStateException("UNAVAILABLE: camera not ready")
       val params = parseJsonParamsObject(paramsJson)
-      val facing = parseFacing(params) ?: "front"
+      val facing = resolveCameraFacing(parseFacing(params), defaultFacing())
       val durationMs = (parseDurationMs(params) ?: 3_000).coerceIn(200, 60_000)
       val includeAudio = parseIncludeAudio(params) ?: true
       val deviceId = parseDeviceId(params)
       if (includeAudio) ensureMicPermission()
+      val owner = lifecycleOwner ?: throw IllegalStateException("UNAVAILABLE: camera not ready")
 
       val provider = context.cameraProvider()
 
@@ -329,41 +314,12 @@ class CameraCaptureManager(
         }
 
         FilePayload(
-          file = session.transferFile(),
+          file = session.transferFile(onFileReady),
           durationMs = durationMs.toLong(),
           hasAudio = includeAudio,
         )
       }
     }
-
-  private fun rotateBitmapByExif(
-    bitmap: Bitmap,
-    orientation: Int,
-  ): Bitmap {
-    val matrix = Matrix()
-    // CameraX JPEG bytes keep sensor orientation in EXIF; normalize before resizing/encoding.
-    when (orientation) {
-      ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
-      ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
-      ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
-      ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
-      ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1f, -1f)
-      ExifInterface.ORIENTATION_TRANSPOSE -> {
-        matrix.postRotate(90f)
-        matrix.postScale(-1f, 1f)
-      }
-      ExifInterface.ORIENTATION_TRANSVERSE -> {
-        matrix.postRotate(-90f)
-        matrix.postScale(-1f, 1f)
-      }
-      else -> return bitmap
-    }
-    val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-    if (rotated !== bitmap) {
-      bitmap.recycle()
-    }
-    return rotated
-  }
 
   private fun parseFacing(params: JsonObject?): String? {
     val value = parseJsonString(params, "facing")?.trim()?.lowercase() ?: return null
@@ -443,6 +399,11 @@ class CameraCaptureManager(
   @SuppressLint("UnsafeOptInUsageError")
   private fun cameraIdOrNull(info: CameraInfo): String? = runCatching { Camera2CameraInfo.from(info).cameraId }.getOrNull()
 }
+
+internal fun resolveCameraFacing(
+  explicitFacing: String?,
+  preferredFacing: String,
+): String = explicitFacing ?: preferredFacing.takeIf { it == "back" } ?: "front"
 
 private suspend fun Context.cameraProvider(): ProcessCameraProvider =
   suspendCancellableCoroutine { cont ->

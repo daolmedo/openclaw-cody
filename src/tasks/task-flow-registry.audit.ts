@@ -1,36 +1,21 @@
 // Produces task-flow registry audit summaries for diagnostics and maintenance.
 import { listTasksForFlowId } from "./runtime-internal.js";
 import { isTaskFlowCancellationPending } from "./task-cancellation-state.js";
+import type {
+  TaskFlowAuditCode,
+  TaskFlowAuditFinding,
+  TaskFlowAuditSeverity,
+  TaskFlowAuditSummary,
+} from "./task-flow-registry.audit.types.js";
 import { getTaskFlowRegistryRestoreFailure, listTaskFlowRecords } from "./task-flow-registry.js";
 import type { TaskFlowRecord } from "./task-flow-registry.types.js";
+import { summarizeAuditFindings } from "./task-registry.audit.shared.js";
 import type { TaskRecord } from "./task-registry.types.js";
 
-/** Severity used by task-flow registry audit findings. */
-export type TaskFlowAuditSeverity = "warn" | "error";
-export type TaskFlowAuditCode =
-  | "restore_failed"
-  | "stale_running"
-  | "stale_waiting"
-  | "stale_blocked"
-  | "cancel_stuck"
-  | "missing_linked_tasks"
-  | "blocked_task_missing"
-  | "inconsistent_timestamps";
-
-export type TaskFlowAuditFinding = {
-  severity: TaskFlowAuditSeverity;
-  code: TaskFlowAuditCode;
-  detail: string;
-  ageMs?: number;
-  flow?: TaskFlowRecord;
-};
-
-export type TaskFlowAuditSummary = {
-  total: number;
-  warnings: number;
-  errors: number;
-  byCode: Record<TaskFlowAuditCode, number>;
-};
+export type {
+  TaskFlowAuditFinding,
+  TaskFlowAuditSummary,
+} from "./task-flow-registry.audit.types.js";
 
 type TaskFlowAuditOptions = {
   now?: number;
@@ -142,7 +127,8 @@ function createEmptyTaskFlowAuditSummary(): TaskFlowAuditSummary {
 export function listTaskFlowAuditFindings(
   options: TaskFlowAuditOptions = {},
 ): TaskFlowAuditFinding[] {
-  const flows = options.flows ?? listTaskFlowRecords();
+  const restoreFailure = getTaskFlowRegistryRestoreFailure();
+  const flows = options.flows ?? (restoreFailure ? [] : listTaskFlowRecords());
   const now = options.now ?? Date.now();
   const staleRunningMs = options.staleRunningMs ?? DEFAULT_STALE_RUNNING_MS;
   const staleWaitingMs = options.staleWaitingMs ?? DEFAULT_STALE_WAITING_MS;
@@ -150,7 +136,6 @@ export function listTaskFlowAuditFindings(
   const cancelStuckMs = options.cancelStuckMs ?? DEFAULT_CANCEL_STUCK_MS;
   const findings: TaskFlowAuditFinding[] = [];
 
-  const restoreFailure = getTaskFlowRegistryRestoreFailure();
   if (restoreFailure) {
     findings.push(
       createFinding({
@@ -191,7 +176,7 @@ export function listTaskFlowAuditFindings(
       );
     }
 
-    if (flow.status === "blocked" && ageMs >= staleBlockedMs) {
+    if (flow.status === "blocked" && flow.endedAt == null && ageMs >= staleBlockedMs) {
       findings.push(
         createFinding({
           severity: "warn",
@@ -246,7 +231,7 @@ export function listTaskFlowAuditFindings(
       );
     }
 
-    if (flow.blockedTaskId?.trim()) {
+    if (flow.endedAt == null && flow.blockedTaskId?.trim()) {
       const blockedTaskId = flow.blockedTaskId.trim();
       if (!linkedTasks.some((task) => task.taskId === blockedTaskId)) {
         findings.push(
@@ -273,15 +258,5 @@ export function listTaskFlowAuditFindings(
 export function summarizeTaskFlowAuditFindings(
   findings: Iterable<TaskFlowAuditFinding>,
 ): TaskFlowAuditSummary {
-  const summary = createEmptyTaskFlowAuditSummary();
-  for (const finding of findings) {
-    summary.total += 1;
-    summary.byCode[finding.code] += 1;
-    if (finding.severity === "error") {
-      summary.errors += 1;
-    } else {
-      summary.warnings += 1;
-    }
-  }
-  return summary;
+  return summarizeAuditFindings(findings, createEmptyTaskFlowAuditSummary());
 }

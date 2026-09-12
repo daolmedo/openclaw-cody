@@ -1,7 +1,6 @@
 // Covers detached task runtime spawning, events, and cancellation handling.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  cancelDetachedTaskRunById,
   completeTaskRunByRunId,
   createQueuedTaskRun,
   createRunningTaskRun,
@@ -9,16 +8,16 @@ import {
   findDetachedTaskRun,
   finalizeTaskRunByRunId,
   getDetachedTaskLifecycleRuntime,
-  getDetachedTaskLifecycleRuntimeRegistration,
-  registerDetachedTaskRuntime,
   recordTaskRunProgressByRunId,
-  resetDetachedTaskLifecycleRuntimeForTests,
-  setDetachedTaskLifecycleRuntime,
   setDetachedTaskDeliveryStatusByRunId,
   startTaskRunByRunId,
   tryRecoverTaskBeforeMarkLost,
 } from "./detached-task-runtime.js";
 import type { TaskRecord } from "./task-registry.types.js";
+import {
+  resetDetachedTaskLifecycleRuntimeForTests,
+  setDetachedTaskLifecycleRuntime,
+} from "./task-runtime.test-helpers.js";
 
 const { mockFindTaskByRunIdForStatus, mockListTasksForSessionKeyForStatus, mockLogWarn } =
   vi.hoisted(() => ({
@@ -273,7 +272,7 @@ describe("detached-task-runtime", () => {
         createdAtOrAfter: 1,
       }),
     ).toEqual({ lookup: "available", task: runningTask });
-    await cancelDetachedTaskRunById({
+    await getDetachedTaskLifecycleRuntime().cancelDetachedTaskRunById({
       cfg: {} as never,
       taskId: runningTask.taskId,
     });
@@ -327,19 +326,6 @@ describe("detached-task-runtime", () => {
 
     resetDetachedTaskLifecycleRuntimeForTests();
     expect(getDetachedTaskLifecycleRuntime()).toBe(defaultRuntime);
-  });
-
-  it("tracks registered detached runtimes by plugin id", () => {
-    const runtime = {
-      ...getDetachedTaskLifecycleRuntime(),
-    };
-
-    registerDetachedTaskRuntime("tests/detached-runtime", runtime);
-
-    const registration = getDetachedTaskLifecycleRuntimeRegistration();
-    expect(registration?.pluginId).toBe("tests/detached-runtime");
-    expect(registration?.runtime).toBe(runtime);
-    expect(getDetachedTaskLifecycleRuntime()).toBe(runtime);
   });
 
   it("falls back to legacy complete and fail hooks when a runtime has no finalizer", () => {

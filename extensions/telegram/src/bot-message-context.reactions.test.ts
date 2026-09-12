@@ -1,7 +1,10 @@
 // Telegram tests cover bot message context.reactions plugin behavior.
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { TelegramInboundBodyResult } from "./bot-message-context.body.js";
 import type { BuildTelegramMessageContextParams } from "./bot-message-context.types.js";
+
+type ResolveTelegramInboundBody =
+  typeof import("./bot-message-context.body.js").resolveTelegramInboundBody;
+type TelegramInboundBodyResult = NonNullable<Awaited<ReturnType<ResolveTelegramInboundBody>>>;
 
 type InboundBodyMock = (arg: unknown) => Promise<TelegramInboundBodyResult>;
 
@@ -20,7 +23,6 @@ const { createInboundBodyResult, inboundBodyMock } = vi.hoisted(() => {
       wasMentioned: false,
       effectiveWasMentioned: false,
       requireMention: false,
-      shouldSkip: false,
     },
     canDetectMention: true,
     shouldBypassMention: false,
@@ -117,7 +119,7 @@ describe("buildTelegramMessageContext reactions", () => {
     expect(setMessageReaction).not.toHaveBeenCalled();
   });
 
-  it("sends Telegram ack reactions for room events when ack scope is all", async () => {
+  it("sends canonical Telegram ack reactions for room events when ack scope is all", async () => {
     const setMessageReaction = vi.fn(async () => undefined);
     const { createStatusReactionController } = createStatusReactionControllerStub();
     inboundBodyMock.mockResolvedValueOnce(createInboundBodyResult("room_event"));
@@ -141,7 +143,7 @@ describe("buildTelegramMessageContext reactions", () => {
           },
         },
         messages: {
-          ackReaction: "👀",
+          ackReaction: "❤️",
           groupChat: { unmentionedInbound: "room_event", mentionPatterns: [] },
           statusReactions: { enabled: true },
         },
@@ -162,7 +164,7 @@ describe("buildTelegramMessageContext reactions", () => {
     expect(ctx?.statusReactionController).toBeNull();
     expect(createStatusReactionController).not.toHaveBeenCalled();
     expect(setMessageReaction).toHaveBeenCalledWith(-1001234567890, 12, [
-      { type: "emoji", emoji: "👀" },
+      { type: "emoji", emoji: "❤" },
     ]);
   });
 
@@ -221,7 +223,11 @@ describe("buildTelegramMessageContext reactions", () => {
         chat: {
           id: 1234,
           type: "private",
-          available_reactions: [{ type: "emoji", emoji: "👍" }],
+          available_reactions: [
+            { type: "emoji", emoji: "👍" },
+            { type: "custom_emoji", custom_emoji_id: "5231419410191111111" },
+            { type: "emoji", emoji: "❤" },
+          ],
         },
         date: 1_700_000_000,
         text: "hello",
@@ -257,5 +263,9 @@ describe("buildTelegramMessageContext reactions", () => {
     await params?.adapter.setReaction("✅");
 
     expect(setMessageReaction).toHaveBeenCalledWith(1234, 34, [{ type: "emoji", emoji: "👍" }]);
+
+    await params?.adapter.setReaction("❤️");
+
+    expect(setMessageReaction).toHaveBeenCalledWith(1234, 34, [{ type: "emoji", emoji: "❤" }]);
   });
 });

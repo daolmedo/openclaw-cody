@@ -1,8 +1,7 @@
 // Doctor contribution for low disk space around the OpenClaw state directory.
 import os from "node:os";
-import { formatByteSize } from "@openclaw/normalization-core";
+import { expectDefined, formatByteSize } from "@openclaw/normalization-core";
 import { note } from "../../packages/terminal-core/src/note.js";
-import type { OpenClawConfig } from "../config/config.js";
 import { resolveStateDir } from "../config/paths.js";
 import type { HealthFinding } from "../flows/health-checks.js";
 import { tryReadDiskSpace } from "../infra/disk-space.js";
@@ -40,9 +39,8 @@ export function formatBytes(bytes: number): string {
 
 /**
  * Build warning lines based on available disk space.
- * Pure function — exported for testing without FS side effects.
  */
-export function buildDiskSpaceWarnings(params: {
+function buildDiskSpaceWarnings(params: {
   availableBytes: number;
   displayStateDir: string;
 }): string[] {
@@ -97,13 +95,10 @@ function collectDiskSpaceWarnings(params: {
 }
 
 /** Collects read-only structured findings for low disk space around the state directory. */
-export function collectDiskSpaceHealthFindings(
-  _cfg: OpenClawConfig, // reserved for API consistency with other Doctor contributions
-  deps?: {
-    env?: NodeJS.ProcessEnv;
-    readDiskSpace?: (targetPath: string) => { availableBytes: number } | null;
-  },
-): readonly HealthFinding[] {
+export function collectDiskSpaceHealthFindings(deps?: {
+  env?: NodeJS.ProcessEnv;
+  readDiskSpace?: (targetPath: string) => { availableBytes: number } | null;
+}): readonly HealthFinding[] {
   const result = collectDiskSpaceWarnings({
     env: deps?.env,
     readDiskSpace: deps?.readDiskSpace,
@@ -113,15 +108,15 @@ export function collectDiskSpaceHealthFindings(
   }
 
   const [message, ...details] = result.warnings;
+  const critical = result.availableBytes < CRITICAL_BYTES;
   return [
     {
       checkId: DISK_SPACE_CHECK_ID,
-      severity: "warning",
-      message: message.replace(/^- /, ""),
+      severity: critical ? "error" : "warning",
+      message: expectDefined(message, "disk-space warning message").replace(/^- /, ""),
       path: result.stateDir,
       target: formatBytes(result.availableBytes),
-      requirement:
-        result.availableBytes < CRITICAL_BYTES ? "critical-free-space" : "low-free-space",
+      requirement: critical ? "critical-free-space" : "low-free-space",
       fixHint: details.map((line) => line.replace(/^- /, "")).join(" "),
     },
   ];
@@ -140,13 +135,10 @@ export function collectDiskSpaceHealthFindings(
  * The two-tier warning/critical thresholds and Doctor-facing formatting
  * are specific to this health contribution.
  */
-export function noteDiskSpace(
-  _cfg: OpenClawConfig, // reserved for API consistency with other Doctor contributions
-  deps?: {
-    env?: NodeJS.ProcessEnv;
-    readDiskSpace?: (targetPath: string) => { availableBytes: number } | null;
-  },
-): void {
+export function noteDiskSpace(deps?: {
+  env?: NodeJS.ProcessEnv;
+  readDiskSpace?: (targetPath: string) => { availableBytes: number } | null;
+}): void {
   const result = collectDiskSpaceWarnings({
     env: deps?.env,
     readDiskSpace: deps?.readDiskSpace,

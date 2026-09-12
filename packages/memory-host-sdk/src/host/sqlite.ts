@@ -1,4 +1,3 @@
-// Memory Host SDK module implements sqlite behavior.
 import { createRequire } from "node:module";
 import type { DatabaseSync } from "node:sqlite";
 import { formatErrorMessage } from "./error-utils.js";
@@ -14,7 +13,7 @@ import {
 const require = createRequire(import.meta.url);
 const sqliteWalMaintenanceByDb = new WeakMap<DatabaseSync, SqliteWalMaintenance>();
 
-export function requireNodeSqlite(): typeof import("node:sqlite") {
+function requireMemoryHostNodeSqlite(): typeof import("node:sqlite") {
   installProcessWarningFilter();
   try {
     return require("node:sqlite") as typeof import("node:sqlite");
@@ -28,6 +27,8 @@ export function requireNodeSqlite(): typeof import("node:sqlite") {
     );
   }
 }
+
+export { requireMemoryHostNodeSqlite as requireNodeSqlite };
 
 export function configureMemorySqliteWalMaintenance(
   db: DatabaseSync,

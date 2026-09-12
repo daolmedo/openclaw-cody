@@ -2,6 +2,9 @@ import { createHash } from "node:crypto";
 import { escapeRegExp } from "./regexp.mjs";
 
 const STABLE_RELEASE_TAG_RE = /^v(?<version>\d{4}\.\d{1,2}\.\d{1,2})(?:-[1-9]\d*)?$/u;
+const STABLE_PACKAGE_VERSION_RE =
+  /^(?<year>\d{4})\.(?<month>\d{1,2})\.(?<patch>\d{1,2})(?:-(?<correction>[1-9]\d*))?$/u;
+const SHA256_HEX_RE = /^[a-f0-9]{64}$/u;
 const MAX_ROLLBACK_DRILL_AGE_MS = 90 * 24 * 60 * 60 * 1000;
 
 function parseStableReleaseTagDetails(tag) {
@@ -19,8 +22,42 @@ function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+export function verifyReleaseEvidenceChecksum({ assetName, assetBytes, checksum }) {
+  const entry = /^([a-f0-9]{64}) {2}([^\r\n]+)\r?\n?$/u.exec(checksum);
+  if (!entry || entry[2] !== assetName || entry[1] !== sha256(assetBytes)) {
+    throw new Error(`Release evidence checksum must bind exactly ${assetName} and its bytes.`);
+  }
+}
+
 export function parseStableReleaseTag(tag) {
   return parseStableReleaseTagDetails(tag).baseVersion;
+}
+
+function parseStablePackageVersion(version) {
+  const match = STABLE_PACKAGE_VERSION_RE.exec(version);
+  if (!match?.groups) {
+    return null;
+  }
+  return [
+    Number.parseInt(match.groups.year, 10),
+    Number.parseInt(match.groups.month, 10),
+    Number.parseInt(match.groups.patch, 10),
+    Number.parseInt(match.groups.correction ?? "0", 10),
+  ];
+}
+
+function isStableMainVersionAtLeast(mainVersion, shippedVersion) {
+  const main = parseStablePackageVersion(mainVersion);
+  const shipped = parseStablePackageVersion(shippedVersion);
+  if (!main || !shipped) {
+    return false;
+  }
+  for (let index = 0; index < main.length; index += 1) {
+    if (main[index] !== shipped[index]) {
+      return main[index] > shipped[index];
+    }
+  }
+  return true;
 }
 
 export function extractStableChangelogSection(changelog, version) {
@@ -49,6 +86,42 @@ function readReleaseAssets(release) {
   return Array.isArray(release?.assets)
     ? release.assets.filter((asset) => asset && typeof asset.name === "string")
     : [];
+}
+
+function isSha256Hex(value) {
+  return typeof value === "string" && value.length === 64 && SHA256_HEX_RE.test(value);
+}
+
+function isCanonicalAssetDigest(value) {
+  return (
+    typeof value === "string" &&
+    value.length === 71 &&
+    value.startsWith("sha256:") &&
+    isSha256Hex(value.slice(7))
+  );
+}
+
+function readVerifiedAssetNames(assets) {
+  return new Set(
+    assets.filter((asset) => isCanonicalAssetDigest(asset.digest)).map((asset) => asset.name),
+  );
+}
+
+function copyOwnFields(source, ...keys) {
+  return Object.fromEntries(
+    keys.filter((key) => Object.hasOwn(source, key)).map((key) => [key, source[key]]),
+  );
+}
+
+function recordsEqual(actual, expected) {
+  if (!actual || typeof actual !== "object" || Array.isArray(actual)) {
+    return false;
+  }
+  const expectedEntries = Object.entries(expected);
+  return (
+    Object.keys(actual).length === expectedEntries.length &&
+    expectedEntries.every(([key, value]) => actual[key] === value)
+  );
 }
 
 function isCloseoutEvidenceAsset(assetName, tag) {
@@ -96,8 +169,7 @@ export function verifyStableMainCloseout(params) {
   const errors = [];
   const mainVersion = readVersion(params.mainPackageJson, "main", errors);
   const tagPackageVersion = readVersion(params.tagPackageJson, "release tag", errors);
-  const fallbackCorrection =
-    tagVersion !== baseVersion && mainVersion === baseVersion && tagPackageVersion === baseVersion;
+  const fallbackCorrection = tagVersion !== baseVersion && tagPackageVersion === baseVersion;
   const version = fallbackCorrection ? baseVersion : tagVersion;
 
   const fullReleaseValidationRunAttempt = params.fullReleaseValidationRunAttempt ?? "";
@@ -107,9 +179,9 @@ export function verifyStableMainCloseout(params) {
     );
   }
 
-  if (mainVersion && mainVersion !== version) {
+  if (mainVersion && !isStableMainVersionAtLeast(mainVersion, version)) {
     errors.push(
-      `main package.json version is ${mainVersion}, expected shipped version ${version}.`,
+      `main package.json version is ${mainVersion}, expected shipped version ${version} or a later stable OpenClaw CalVer.`,
     );
   }
   if (tagPackageVersion && tagPackageVersion !== version) {
@@ -150,50 +222,168 @@ export function verifyStableMainCloseout(params) {
     `OpenClaw-${macAssetVersion}.dmg`,
     `OpenClaw-${macAssetVersion}.dSYM.zip`,
   ];
-  const assetNames = new Set(readReleaseAssets(params.release).map((asset) => asset.name));
-  const missingMacAssets = expectedMacAssets.filter((asset) => !assetNames.has(asset));
-  if (missingMacAssets.length > 0) {
-    errors.push(
-      `GitHub release ${params.tag} is missing required macOS asset(s): ${missingMacAssets.join(", ")}.`,
-    );
-  } else {
-    const macZip = expectedMacAssets[0];
-    if (!params.mainAppcast.includes(`/releases/download/${params.tag}/${macZip}`)) {
-      errors.push(`main appcast.xml does not point at ${macZip} from ${params.tag}.`);
+  const platformAssets = {
+    macos: expectedMacAssets,
+    android: ["OpenClaw-Android-SHA256SUMS.txt", "OpenClaw-Android.apk"],
+    windows: [
+      "OpenClawCompanion-SHA256SUMS.txt",
+      "OpenClawCompanion-Setup-arm64.exe",
+      "OpenClawCompanion-Setup-x64.exe",
+    ],
+  };
+  const expectedAppAssets = new Set(Object.values(platformAssets).flat());
+  const observedAssets = readReleaseAssets(params.release).filter(
+    (asset) => !isCloseoutEvidenceAsset(asset.name, params.tag),
+  );
+  const existingManifest = params.existingManifest;
+  const releaseAssets =
+    existingManifest?.githubReleaseAssets ??
+    observedAssets.map((asset) => ({
+      name: asset.name,
+      digest: typeof asset.digest === "string" ? asset.digest : null,
+    }));
+  if (existingManifest) {
+    // Closeout records a publication-time snapshot. Later app attachments may
+    // extend it, but must never rewrite recorded assets or release evidence.
+    for (const recorded of releaseAssets) {
+      const observed = observedAssets.find((asset) => asset.name === recorded.name);
+      const observedDigest =
+        observed && typeof observed.digest === "string" ? observed.digest : null;
+      if (!observed || observedDigest !== recorded.digest) {
+        errors.push(`Recorded release asset changed or disappeared: ${recorded.name}.`);
+      }
+    }
+    for (const observed of observedAssets) {
+      if (
+        !releaseAssets.some((asset) => asset.name === observed.name) &&
+        !expectedAppAssets.has(observed.name)
+      ) {
+        errors.push(`Unexpected release asset added after closeout: ${observed.name}.`);
+      }
+    }
+  }
+  const verifiedAssetNames = readVerifiedAssetNames(releaseAssets);
+  const verifiedObservedAssetNames = readVerifiedAssetNames(observedAssets);
+  const macAttachedAtCloseout = expectedMacAssets.every((asset) => verifiedAssetNames.has(asset));
+  const macPublished = expectedMacAssets.every((name) => verifiedObservedAssetNames.has(name));
+  const appcastVerifiedAtCloseout = existingManifest
+    ? existingManifest.appcast === "verified" ||
+      (!Object.hasOwn(existingManifest, "appcast") &&
+        Object.hasOwn(existingManifest, "appcastSha256"))
+    : macAttachedAtCloseout;
+  // Fresh closeout must validate the same main snapshot it hashes. Only a
+  // pending recorded closeout may use the current feed for late publication.
+  const appcast =
+    existingManifest && !appcastVerifiedAtCloseout
+      ? (params.publishedAppcast ?? params.mainAppcast)
+      : params.mainAppcast;
+  if (
+    macPublished &&
+    (!existingManifest || !appcastVerifiedAtCloseout) &&
+    !appcast.includes(`/releases/download/${params.tag}/${expectedMacAssets[0]}`)
+  ) {
+    errors.push(`main appcast.xml does not point at ${expectedMacAssets[0]} from ${params.tag}.`);
+  }
+  const appPlatforms = Object.fromEntries(
+    Object.entries(platformAssets).map(([platform, assets]) => [
+      platform,
+      assets.every((asset) => verifiedAssetNames.has(asset)) ? "attached" : "pending",
+    ]),
+  );
+  const apps = Object.values(appPlatforms).every((state) => state === "attached")
+    ? "attached"
+    : "pending";
+  if (existingManifest) {
+    if (
+      Object.hasOwn(existingManifest, "appPlatforms") &&
+      !recordsEqual(existingManifest.appPlatforms, appPlatforms)
+    ) {
+      errors.push("Recorded app platform states do not match canonical release asset digests.");
+    }
+    if (Object.hasOwn(existingManifest, "apps") && existingManifest.apps !== apps) {
+      errors.push("Recorded aggregate app state does not match canonical release asset digests.");
+    }
+    const expectedAppcastState = macAttachedAtCloseout ? "verified" : "pending";
+    if (
+      Object.hasOwn(existingManifest, "appcast") &&
+      existingManifest.appcast !== expectedAppcastState
+    ) {
+      errors.push("Recorded appcast state does not match canonical macOS release asset digests.");
+    }
+    const hasAppcastSha256 = Object.hasOwn(existingManifest, "appcastSha256");
+    if (
+      hasAppcastSha256 !== macAttachedAtCloseout ||
+      (hasAppcastSha256 && !isSha256Hex(existingManifest.appcastSha256))
+    ) {
+      errors.push(
+        "Recorded appcast hash presence or format does not match canonical macOS release asset state.",
+      );
     }
   }
 
+  if (
+    params.publishRecovery &&
+    (!params.allowFailedPublishRecovery ||
+      params.publishRecovery.mode !== "split-publication-v1" ||
+      params.publishRecovery.releaseTag !== params.tag ||
+      params.publishRecovery.sourceSha !== params.releaseTagSha ||
+      params.publishRecovery.originalParent?.runId !== params.releasePublishRunId ||
+      params.publishRecovery.fullReleaseValidation?.runId !== params.fullReleaseValidationRunId ||
+      params.publishRecovery.fullReleaseValidation?.runAttempt !== fullReleaseValidationRunAttempt)
+  ) {
+    errors.push("Verified publication recovery does not match the closeout identity.");
+  }
+  if (
+    params.existingManifest?.releasePublishRecovery?.mode === "split-publication-v1" &&
+    JSON.stringify(params.publishRecovery) !==
+      JSON.stringify(params.existingManifest.releasePublishRecovery)
+  ) {
+    errors.push(
+      "Recorded split publication recovery must be independently reverified without changes.",
+    );
+  }
   verifyRollbackDrill(params, errors);
 
   if (errors.length > 0) {
     return { errors, manifest: null };
   }
 
-  return {
-    errors,
-    manifest: {
-      version: 2,
-      releaseTag: params.tag,
-      releaseVersion: version,
-      releaseTagSha: params.releaseTagSha,
-      mainSha: params.mainSha,
-      mainPackageVersion: mainVersion,
-      releaseTagPackageVersion: tagPackageVersion,
-      changelogSha256: sha256(mainChangelog),
-      appcastSha256: sha256(params.mainAppcast),
-      fullReleaseValidationRunId: params.fullReleaseValidationRunId,
-      fullReleaseValidationRunAttempt,
-      releasePublishRunId: params.releasePublishRunId,
-      rollbackDrill: {
-        id: params.rollbackDrillId,
-        date: params.rollbackDrillDate,
-      },
-      githubReleaseAssets: readReleaseAssets(params.release)
-        .filter((asset) => !isCloseoutEvidenceAsset(asset.name, params.tag))
-        .map((asset) => ({
-          name: asset.name,
-          digest: typeof asset.digest === "string" ? asset.digest : null,
-        })),
+  const manifest = {
+    version: 2,
+    releaseTag: params.tag,
+    releaseVersion: version,
+    releaseTagSha: params.releaseTagSha,
+    mainSha: params.mainSha,
+    mainPackageVersion: mainVersion,
+    releaseTagPackageVersion: tagPackageVersion,
+    changelogSha256: sha256(mainChangelog),
+    ...(existingManifest
+      ? copyOwnFields(existingManifest, "apps", "appPlatforms", "appcast", "appcastSha256")
+      : {
+          apps,
+          appPlatforms,
+          appcast: macAttachedAtCloseout ? "verified" : "pending",
+          ...(macAttachedAtCloseout ? { appcastSha256: sha256(params.mainAppcast) } : {}),
+        }),
+    fullReleaseValidationRunId: params.fullReleaseValidationRunId,
+    fullReleaseValidationRunAttempt,
+    releasePublishRunId: params.releasePublishRunId,
+    ...(existingManifest
+      ? copyOwnFields(existingManifest, "releasePublishRecovery")
+      : params.allowFailedPublishRecovery
+        ? { releasePublishRecovery: params.publishRecovery ?? { npmDockerVerified: true } }
+        : {}),
+    rollbackDrill: {
+      id: params.rollbackDrillId,
+      date: params.rollbackDrillDate,
     },
+    githubReleaseAssets: releaseAssets,
   };
+  if (existingManifest && JSON.stringify(manifest) !== JSON.stringify(existingManifest)) {
+    return {
+      errors: ["Recorded closeout manifest does not match the verified release state."],
+      manifest: null,
+    };
+  }
+  return { errors, manifest };
 }

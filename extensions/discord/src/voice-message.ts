@@ -14,19 +14,19 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
 import {
   parseFfprobeCodecAndSampleRate,
   runFfmpeg,
   runFfprobe,
+  MEDIA_FFMPEG_MAX_AUDIO_DURATION_SECS,
+  unlinkIfExists,
 } from "openclaw/plugin-sdk/media-runtime";
-import { MEDIA_FFMPEG_MAX_AUDIO_DURATION_SECS } from "openclaw/plugin-sdk/media-runtime";
-import { unlinkIfExists } from "openclaw/plugin-sdk/media-runtime";
 import { parseStrictFiniteNumber } from "openclaw/plugin-sdk/number-runtime";
 import {
   readProviderJsonResponse,
   readResponseTextLimited,
 } from "openclaw/plugin-sdk/provider-http";
-import type { RetryRunner } from "openclaw/plugin-sdk/retry-runtime";
 import { writeExternalFileWithinRoot } from "openclaw/plugin-sdk/security-runtime";
 import { fetchWithSsrFGuard, type SsrFPolicy } from "openclaw/plugin-sdk/ssrf-runtime";
 import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
@@ -34,6 +34,13 @@ import { resolvePreferredOpenClawTmpDir } from "openclaw/plugin-sdk/temp-path";
 import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { DiscordError, RateLimitError, type RequestClient } from "./internal/discord.js";
 import { readDiscordMessage, readRetryAfter } from "./internal/rest-errors.js";
+import { DISCORD_ATTACHMENT_TOTAL_TIMEOUT_MS } from "./monitor/timeouts.js";
+import {
+  classifyDiscordDeliveryFailure,
+  recordDiscordMessageCreateAmbiguity,
+  type DiscordRetryRunner,
+} from "./retry.js";
+import { createDiscordMessageNonce } from "./send.message-request.js";
 
 const DISCORD_VOICE_MESSAGE_FLAG = 1 << 13;
 const SUPPRESS_NOTIFICATIONS_FLAG = 1 << 12;
@@ -63,22 +70,11 @@ async function runFfmpegToOutput(params: {
 function createRateLimitError(
   response: Response,
   body: { message: string; retry_after: number; global: boolean },
-  request?: Request,
 ): RateLimitError {
-  const fallbackRequest =
-    request ??
-    new Request("https://discord.com/api/v10/channels/voice/messages", {
-      method: "POST",
-    });
-  const RateLimitErrorCtor = RateLimitError as unknown as new (
-    response: Response,
-    body: { message: string; retry_after: number; global: boolean },
-    request?: Request,
-  ) => RateLimitError;
-  return new RateLimitErrorCtor(response, body, fallbackRequest);
+  return new RateLimitError(response, body);
 }
 
-export type VoiceMessageMetadata = {
+type VoiceMessageMetadata = {
   durationSecs: number;
   waveform: string; // base64 encoded
 };
@@ -166,7 +162,7 @@ async function generateWaveformFromPcm(filePath: string): Promise<string> {
       let sum = 0;
       let count = 0;
       for (let j = 0; j < step && i * step + j < samples.length; j++) {
-        sum += Math.abs(samples[i * step + j]);
+        sum += Math.abs(expectDefined(samples.at(i * step + j), "bounded PCM waveform sample"));
         count++;
       }
       const avg = count > 0 ? sum / count : 0;
@@ -348,6 +344,9 @@ async function requestVoiceUploadUrl(params: {
   const { response: res, release } = await fetchWithSsrFGuard({
     url,
     init: uploadUrlInit,
+    // Keep control-plane negotiation on the REST budget; the binary upload below
+    // needs the longer attachment-transfer budget.
+    timeoutMs: params.rest.options.timeout,
     policy: DISCORD_VOICE_UPLOAD_SSRF_POLICY,
     auditContext: "discord.voice.upload-url",
   });
@@ -374,6 +373,7 @@ async function uploadVoiceAttachment(params: {
       },
       body: new Uint8Array(params.audioBuffer),
     },
+    timeoutMs: DISCORD_ATTACHMENT_TOTAL_TIMEOUT_MS,
     policy: DISCORD_VOICE_UPLOAD_SSRF_POLICY,
     auditContext: "discord.voice.attachment-upload",
   });
@@ -382,6 +382,7 @@ async function uploadVoiceAttachment(params: {
     if (!uploadResponse.ok) {
       throw await createVoiceRequestError(uploadResponse, "Failed to upload voice message");
     }
+    await uploadResponse.body?.cancel().catch(() => undefined);
   } finally {
     await release();
   }
@@ -401,9 +402,11 @@ export async function sendDiscordVoiceMessage(
   audioBuffer: Buffer,
   metadata: VoiceMessageMetadata,
   replyTo: string | undefined,
-  request: RetryRunner,
+  request: DiscordRetryRunner,
   silent?: boolean,
   token?: string,
+  onPlatformSendDispatch?: () => Promise<void>,
+  assertPlatformSendAuthorized?: () => void,
 ): Promise<{ id: string; channel_id: string }> {
   const filename = "voice-message.ogg";
   const fileSize = audioBuffer.byteLength;
@@ -442,6 +445,8 @@ export async function sendDiscordVoiceMessage(
     : DISCORD_VOICE_MESSAGE_FLAG;
   const messagePayload: {
     flags: number;
+    nonce: string;
+    enforce_nonce: true;
     attachments: Array<{
       id: string;
       filename: string;
@@ -452,6 +457,8 @@ export async function sendDiscordVoiceMessage(
     message_reference?: { message_id: string; fail_if_not_exists: boolean };
   } = {
     flags,
+    nonce: createDiscordMessageNonce(),
+    enforce_nonce: true,
     attachments: [
       {
         id: "0",
@@ -471,13 +478,29 @@ export async function sendDiscordVoiceMessage(
     };
   }
 
-  const res = (await request(
-    () =>
-      rest.post(`/channels/${channelId}/messages`, {
-        body: messagePayload,
-      }) as Promise<{ id: string; channel_id: string }>,
-    "voice-message",
-  )) as { id: string; channel_id: string };
-
-  return res;
+  let messageCreateMayHaveCommitted = false;
+  try {
+    return (await request(
+      async () => {
+        await onPlatformSendDispatch?.();
+        assertPlatformSendAuthorized?.();
+        try {
+          return (await rest.post(`/channels/${channelId}/messages`, {
+            body: messagePayload,
+          })) as { id: string; channel_id: string };
+        } catch (error) {
+          messageCreateMayHaveCommitted ||= classifyDiscordDeliveryFailure(error) === "ambiguous";
+          throw error;
+        }
+      },
+      "voice-message",
+      { safety: "nonce-protected-create" },
+    )) as { id: string; channel_id: string };
+  } catch (error) {
+    // Only this final request can commit a message; upload/preflight failures cannot.
+    if (messageCreateMayHaveCommitted) {
+      recordDiscordMessageCreateAmbiguity(error);
+    }
+    throw error;
+  }
 }

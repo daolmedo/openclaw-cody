@@ -1,16 +1,12 @@
 import { definePage } from "@openclaw/uirouter";
 import { html } from "lit";
+import { routePageSpec } from "../../app-route-paths.ts";
 import type { ApplicationContext } from "../../app/context.ts";
-import {
-  createSkillWorkshopState,
-  loadSkillWorkshopProposals,
-  skillWorkshopRouteData,
-  type SkillWorkshopRouteData,
-} from "./proposals.ts";
+import type { SkillWorkshopRouteData } from "./proposals.ts";
+import { loadSkillWorkshopMode } from "./storage.ts";
 
 export const page = definePage({
-  id: "skill-workshop",
-  path: "/skills/workshop",
+  ...routePageSpec("skill-workshop"),
   component: () =>
     import("./skill-workshop-page.ts").then(() => ({
       render: (data: unknown) => html`
@@ -20,8 +16,11 @@ export const page = definePage({
       `,
     })),
   loader: async (context: ApplicationContext) => {
+    const { loadSkillWorkshopProposals, createSkillWorkshopState, skillWorkshopRouteData } =
+      await import("./proposals.ts");
     const state = createSkillWorkshopState();
-    await loadSkillWorkshopProposals(state, context);
+    state.skillWorkshopMode = loadSkillWorkshopMode();
+    await loadSkillWorkshopProposals(state, context, { force: true });
     return skillWorkshopRouteData(state);
   },
 });

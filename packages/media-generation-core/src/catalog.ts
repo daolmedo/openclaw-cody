@@ -1,5 +1,4 @@
-// Media Generation Core module implements catalog behavior.
-import { uniqueTrimmedStrings } from "./string.js";
+import { normalizeUniqueTrimmedStringList } from "@openclaw/normalization-core/string-normalization";
 
 // Shared media-generation catalog contracts and static entry synthesis.
 
@@ -30,6 +29,12 @@ export type MediaGenerationCatalogEntry<TCapabilities = unknown> = {
   warnings?: readonly string[];
 };
 
+/** Static catalog metadata that overrides provider defaults for one model. */
+export type MediaGenerationCatalogModelEntry<TCapabilities = unknown> = {
+  capabilities?: TCapabilities;
+  modes?: readonly string[];
+};
+
 /** Provider metadata used to synthesize static media generation catalog entries. */
 export type MediaGenerationCatalogProvider<TCapabilities = unknown> = {
   id: string;
@@ -38,11 +43,12 @@ export type MediaGenerationCatalogProvider<TCapabilities = unknown> = {
   defaultModel?: string;
   models?: readonly string[];
   capabilities: TCapabilities;
+  catalogByModel?: Readonly<Record<string, MediaGenerationCatalogModelEntry<TCapabilities>>>;
 };
 
 /** Return unique configured models with default model first when present. */
 function uniqueModels(provider: { defaultModel?: string; models?: readonly string[] }): string[] {
-  return uniqueTrimmedStrings([provider.defaultModel, ...(provider.models ?? [])]);
+  return normalizeUniqueTrimmedStringList([provider.defaultModel, ...(provider.models ?? [])]);
 }
 
 /** Synthesize static catalog entries from provider metadata. */
@@ -51,14 +57,15 @@ export function synthesizeMediaGenerationCatalogEntries<TCapabilities>(params: {
   provider: MediaGenerationCatalogProvider<TCapabilities>;
   modes?: readonly string[];
 }): Array<MediaGenerationCatalogEntry<TCapabilities>> {
-  const defaultModel = uniqueTrimmedStrings([params.provider.defaultModel])[0];
+  const defaultModel = normalizeUniqueTrimmedStringList([params.provider.defaultModel])[0];
   return uniqueModels(params.provider).map((model) => {
+    const modelCatalogEntry = params.provider.catalogByModel?.[model];
     const entry: MediaGenerationCatalogEntry<TCapabilities> = {
       kind: params.kind,
       provider: params.provider.id,
       model,
       source: "static",
-      capabilities: params.provider.capabilities,
+      capabilities: modelCatalogEntry?.capabilities ?? params.provider.capabilities,
     };
     if (params.provider.label) {
       entry.label = params.provider.label;
@@ -66,8 +73,9 @@ export function synthesizeMediaGenerationCatalogEntries<TCapabilities>(params: {
     if (model === defaultModel) {
       entry.default = true;
     }
-    if (params.modes) {
-      entry.modes = params.modes;
+    const modes = modelCatalogEntry?.modes ?? params.modes;
+    if (modes) {
+      entry.modes = modes;
     }
     return entry;
   });

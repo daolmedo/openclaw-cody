@@ -1,6 +1,7 @@
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { GatewayBrowserClient } from "../api/gateway.ts";
+import { fetchAgentIdentity } from "../lib/agents/identity.ts";
 import { normalizeAssistantIdentity, type AssistantIdentity } from "../lib/assistant-identity.ts";
-import { normalizeOptionalString } from "../lib/string-coerce.ts";
 import { getSafeLocalStorage } from "../local-storage.ts";
 
 const LOCAL_ASSISTANT_IDENTITY_KEY = "openclaw.control.assistant.v1";
@@ -63,7 +64,7 @@ export function loadLocalAssistantIdentity(opts?: {
       avatars[agentId] = legacyAvatar;
       persistLocalAssistantAvatarMap(storage, avatars);
     }
-    return { avatar: Object.hasOwn(avatars, agentId) ? avatars[agentId] : null, agentId };
+    return { avatar: Object.hasOwn(avatars, agentId) ? (avatars[agentId] ?? null) : null, agentId };
   } catch {
     return { avatar: null };
   }
@@ -71,12 +72,9 @@ export function loadLocalAssistantIdentity(opts?: {
 
 export async function fetchAssistantIdentity(
   client: GatewayBrowserClient,
-  sessionKey?: string,
+  agentId: string,
 ): Promise<AssistantIdentity | null> {
-  const result = await client.request<Partial<AssistantIdentity>>(
-    "agent.identity.get",
-    sessionKey?.trim() ? { sessionKey: sessionKey.trim() } : {},
-  );
+  const result = await fetchAgentIdentity(client, agentId);
   if (!result) {
     return null;
   }

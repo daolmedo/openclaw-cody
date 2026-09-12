@@ -1,10 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const normalizeProviderModelIdWithManifestMock = vi.hoisted(() => vi.fn());
+const resolveManifestModelIdNormalizationPoliciesMock = vi.hoisted(() => vi.fn());
 const normalizeProviderModelIdWithRuntimeMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../plugins/manifest-model-id-normalization.js", () => ({
-  normalizeProviderModelIdWithManifest: normalizeProviderModelIdWithManifestMock,
+  resolveManifestModelIdNormalizationPolicies: resolveManifestModelIdNormalizationPoliciesMock,
 }));
 
 vi.mock("../agents/provider-model-normalization.runtime.js", () => ({
@@ -14,12 +14,12 @@ vi.mock("../agents/provider-model-normalization.runtime.js", () => ({
 describe("statusSummaryRuntime configured model normalization", () => {
   beforeEach(() => {
     vi.resetModules();
-    normalizeProviderModelIdWithManifestMock.mockReset();
+    resolveManifestModelIdNormalizationPoliciesMock.mockReset();
     normalizeProviderModelIdWithRuntimeMock.mockReset();
   });
 
   it("skips manifest and plugin model normalization for configured model refs", async () => {
-    const { statusSummaryRuntime } = await import("./status.summary.runtime.js");
+    const { statusSummaryRuntime } = await import("../status/summary.runtime.js");
 
     expect(
       statusSummaryRuntime.resolveConfiguredStatusModelRef({
@@ -58,12 +58,12 @@ describe("statusSummaryRuntime configured model normalization", () => {
       model: "gpt-5.5",
     });
 
-    expect(normalizeProviderModelIdWithManifestMock).not.toHaveBeenCalled();
+    expect(resolveManifestModelIdNormalizationPoliciesMock).not.toHaveBeenCalled();
     expect(normalizeProviderModelIdWithRuntimeMock).not.toHaveBeenCalled();
   });
 
   it("skips manifest and plugin model normalization for providerless persisted session models", async () => {
-    const { statusSummaryRuntime } = await import("./status.summary.runtime.js");
+    const { statusSummaryRuntime } = await import("../status/summary.runtime.js");
     const cfg = {
       agents: {
         defaults: {
@@ -72,7 +72,6 @@ describe("statusSummaryRuntime configured model normalization", () => {
       },
     } as never;
 
-    normalizeProviderModelIdWithManifestMock.mockReturnValue("claude-opus-4-6");
     normalizeProviderModelIdWithRuntimeMock.mockReturnValue("runtime-normalized-opus");
 
     expect(
@@ -112,7 +111,7 @@ describe("statusSummaryRuntime configured model normalization", () => {
       model: "claude-opus-4-6",
     });
 
-    expect(normalizeProviderModelIdWithManifestMock).not.toHaveBeenCalled();
+    expect(resolveManifestModelIdNormalizationPoliciesMock).not.toHaveBeenCalled();
     expect(normalizeProviderModelIdWithRuntimeMock).not.toHaveBeenCalled();
   });
 });

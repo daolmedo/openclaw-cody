@@ -1,25 +1,23 @@
-// Codex tests cover config plugin behavior.
 import fs from "node:fs/promises";
 import path from "node:path";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { MAX_TIMER_TIMEOUT_MS } from "openclaw/plugin-sdk/number-runtime";
 import { withTempDir } from "openclaw/plugin-sdk/test-env";
+// Codex tests cover config plugin behavior.
+import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { describe, expect, it, vi } from "vitest";
+import { codexAppServerStartOptionsKey } from "./config-runtime.js";
 import {
-  CODEX_APP_SERVER_CONFIG_KEYS,
-  CODEX_APP_SERVER_EXPERIMENTAL_CONFIG_KEYS,
-  CODEX_COMPUTER_USE_CONFIG_KEYS,
-  CODEX_PLUGIN_ENTRY_CONFIG_KEYS,
-  CODEX_PLUGINS_CONFIG_KEYS,
   canUseCodexModelBackedApprovalsReviewerForModel,
-  codexAppServerStartOptionsKey,
-  fingerprintCodexAppServerNetworkProxyConfigPatch,
+  codexSandboxPolicyForTurn,
+  isCodexSandboxExecServerEnabled,
   readCodexPluginConfig,
   resolveCodexAppServerRuntimeOptions,
+  resolveCodexAppServerStartOptionsForAgent,
   resolveCodexAppServerUserHomeDir,
+  resolveCodexSupervisionAppServerRuntimeOptions,
   resolveCodexComputerUseConfig,
   resolveCodexModelBackedReviewerPolicyContext,
-  resolveOpenClawExecModeForCodexAppServer,
-  resolveOpenClawExecModeFromConfig,
   resolveOpenClawExecPolicyForCodexAppServer,
   resolveCodexPluginsPolicy,
   shouldAutoApproveCodexAppServerApprovals,
@@ -27,12 +25,21 @@ import {
 } from "./config.js";
 
 type RuntimeOptionsParams = NonNullable<Parameters<typeof resolveCodexAppServerRuntimeOptions>[0]>;
+const retiredTurnIdleTimeoutKeys = [
+  "turnCompletionIdleTimeoutMs",
+  "turnAssistantCompletionIdleTimeoutMs",
+  "postToolRawAssistantCompletionIdleTimeoutMs",
+];
 
 function resolveRuntimeForTest(params: RuntimeOptionsParams = {}) {
   return resolveCodexAppServerRuntimeOptions({ env: {}, requirementsToml: null, ...params });
 }
 
 describe("withMcpElicitationsApprovalPolicy", () => {
+  it("preserves managed per-command approvals that already allow MCP elicitation", () => {
+    expect(withMcpElicitationsApprovalPolicy("untrusted")).toBe("untrusted");
+  });
+
   it("returns every field required by Codex granular approval policy", () => {
     expect(withMcpElicitationsApprovalPolicy("never")).toEqual({
       granular: {
@@ -50,12 +57,7 @@ function envRef(id: string) {
   return { source: "env" as const, provider: "default", id };
 }
 
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`Expected ${label}`);
-  }
-  return value as Record<string, unknown>;
-}
+const requireRecord = createRequireRecord("record", "expected-label-capitalized");
 
 function expectFields(
   value: unknown,
@@ -78,12 +80,6 @@ function expectRuntimePolicy(
   },
 ) {
   expectFields(runtime, "runtime policy", fields);
-}
-
-function expectUiHintLabel(manifest: { uiHints: Record<string, unknown> }, key: string) {
-  const hint = requireRecord(manifest.uiHints[key], `${key} UI hint`);
-  expect(typeof hint.label).toBe("string");
-  expect((hint.label as string).length).toBeGreaterThan(0);
 }
 
 describe("Codex app-server config", () => {
@@ -136,8 +132,7 @@ describe("Codex app-server config", () => {
           approvalsReviewer: "guardian_subagent",
           serviceTier: "flex",
           codeModeOnly: true,
-          turnCompletionIdleTimeoutMs: 120_000,
-          postToolRawAssistantCompletionIdleTimeoutMs: 180_000,
+          loopDetectionPreToolUseRelay: false,
         },
       },
       env: {
@@ -153,14 +148,17 @@ describe("Codex app-server config", () => {
       approvalsReviewer: "guardian_subagent",
       serviceTier: "flex",
       codeModeOnly: true,
-      turnCompletionIdleTimeoutMs: 120_000,
-      postToolRawAssistantCompletionIdleTimeoutMs: 180_000,
+      loopDetectionPreToolUseRelay: false,
     });
     expectFields(runtime.start, "runtime start", {
       transport: "websocket",
       url: "ws://127.0.0.1:39175",
       headers: { "X-Test": "yes" },
     });
+  });
+
+  it("keeps the Codex loop-detection PreToolUse relay enabled by default", () => {
+    expect(resolveRuntimeForTest().loopDetectionPreToolUseRelay).toBe(true);
   });
 
   it("builds Codex permissions-profile config for app-server network proxy", () => {
@@ -231,9 +229,6 @@ describe("Codex app-server config", () => {
         },
       },
     });
-    expect(networkProxy.configFingerprint).toBe(
-      fingerprintCodexAppServerNetworkProxyConfigPatch(networkProxy.configPatch),
-    );
   });
 
   it("uses read-only filesystem rules for read-only network proxy profiles", () => {
@@ -264,16 +259,12 @@ describe("Codex app-server config", () => {
       pluginConfig: {
         appServer: {
           requestTimeoutMs: Number.MAX_SAFE_INTEGER,
-          turnCompletionIdleTimeoutMs: Number.MAX_SAFE_INTEGER,
-          postToolRawAssistantCompletionIdleTimeoutMs: Number.MAX_SAFE_INTEGER,
         },
       },
     });
 
     expectFields(runtime, "runtime", {
       requestTimeoutMs: MAX_TIMER_TIMEOUT_MS,
-      turnCompletionIdleTimeoutMs: MAX_TIMER_TIMEOUT_MS,
-      postToolRawAssistantCompletionIdleTimeoutMs: MAX_TIMER_TIMEOUT_MS,
     });
   });
 
@@ -282,14 +273,12 @@ describe("Codex app-server config", () => {
       pluginConfig: {
         appServer: {
           requestTimeoutMs: 0,
-          turnCompletionIdleTimeoutMs: -1,
         },
       },
     });
 
     expectFields(runtime, "runtime", {
       requestTimeoutMs: 60_000,
-      turnCompletionIdleTimeoutMs: 60_000,
     });
   });
 
@@ -368,16 +357,55 @@ describe("Codex app-server config", () => {
     ).toStrictEqual({});
   });
 
-  it("rejects unknown app-server fields", () => {
+  it("parses named native session discovery homes and rejects empty labels", () => {
     expect(
       readCodexPluginConfig({
-        appServer: {
-          postToolRawAssistantCompletionIdleTimeoutMs: 180_000,
-          unknownTimeoutMs: 1,
+        sessionCatalog: {
+          enabled: false,
+          homes: [
+            " /srv/codex-string ",
+            { path: " /srv/codex-named ", label: " Named store " },
+            { path: " /srv/codex-default " },
+          ],
         },
-      }),
+      }).sessionCatalog,
+    ).toEqual({
+      enabled: false,
+      homes: [
+        "/srv/codex-string",
+        { path: "/srv/codex-named", label: "Named store" },
+        { path: "/srv/codex-default" },
+      ],
+    });
+    expect(
+      readCodexPluginConfig({ sessionCatalog: { homes: [{ path: "/srv/codex", label: " " }] } }),
     ).toStrictEqual({});
   });
+
+  it.each([
+    { transport: "unix", homeScope: "user" },
+    { transport: "websocket", url: "ws://127.0.0.1:39175" },
+  ] as const)("rejects additional session homes for $transport app servers", (appServer) => {
+    expect(() =>
+      resolveRuntimeForTest({
+        pluginConfig: { appServer, sessionCatalog: { homes: ["/srv/codex-extra"] } },
+        env: {},
+      }),
+    ).toThrow(
+      "plugins.entries.codex.config.sessionCatalog.homes requires appServer.transport=stdio",
+    );
+  });
+
+  it.each(["unknownTimeoutMs", ...retiredTurnIdleTimeoutKeys])(
+    "rejects unknown or retired app-server field %s",
+    (key) => {
+      expect(
+        readCodexPluginConfig({
+          appServer: { requestTimeoutMs: 120_000, [key]: 1 },
+        }),
+      ).toStrictEqual({});
+    },
+  );
 
   it("rejects removed app-server topology fields", () => {
     expect(
@@ -509,6 +537,30 @@ describe("Codex app-server config", () => {
     });
   });
 
+  it.each([
+    ["ws://localhost:4242", "local-loopback"],
+    ["ws://127.0.0.1:4242", "local-loopback"],
+    ["ws://127.0.0.2:4242", "local-loopback"],
+    ["ws://127.255.255.254:4242", "local-loopback"],
+    ["ws://[::1]:4242", "local-loopback"],
+    ["ws://[::ffff:127.0.0.2]:4242", "local-loopback"],
+    ["wss://128.0.0.1:4242", "remote"],
+    ["wss://10.0.0.1:4242", "remote"],
+    ["wss://127.0.0.1.evil.com:4242", "remote"],
+  ] as const)("classifies app-server URL %s as %s", (url, connectionClass) => {
+    const runtime = resolveRuntimeForTest({
+      pluginConfig: {
+        appServer: {
+          transport: "websocket",
+          url,
+          ...(connectionClass === "remote" ? { authToken: "capability-token" } : {}),
+        },
+      },
+    });
+
+    expectFields(runtime, "runtime", { connectionClass });
+  });
+
   it("rejects remote websocket app-servers without identity-bearing auth", () => {
     expect(() =>
       resolveRuntimeForTest({
@@ -542,6 +594,272 @@ describe("Codex app-server config", () => {
     });
   });
 
+  it("does not let private-QA environment flags override native sandbox policy", () => {
+    const privateQaCodexEnv = {
+      OPENCLAW_BUILD_PRIVATE_QA: "1",
+      OPENCLAW_QA_FORCE_RUNTIME: "codex",
+    };
+    const runtime = resolveRuntimeForTest({
+      pluginConfig: {
+        appServer: {
+          mode: "yolo",
+          approvalPolicy: "never",
+          sandbox: "danger-full-access",
+        },
+      },
+      env: privateQaCodexEnv,
+    });
+
+    expectRuntimePolicy(runtime, {
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+      approvalsReviewer: "user",
+    });
+    expect(codexSandboxPolicyForTurn(runtime.sandbox, "/qa/workspace", runtime.start.args)).toEqual(
+      {
+        type: "dangerFullAccess",
+      },
+    );
+  });
+
+  it("honors explicitly configured native workspace temporary-root exclusions", () => {
+    const runtime = resolveRuntimeForTest({
+      pluginConfig: {
+        appServer: {
+          sandbox: "workspace-write",
+          args: [
+            "app-server",
+            "-c",
+            "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+            "-c",
+            "sandbox_workspace_write.exclude_slash_tmp=true",
+          ],
+        },
+      },
+    });
+
+    expectRuntimePolicy(runtime, {
+      approvalPolicy: "never",
+      sandbox: "workspace-write",
+      approvalsReviewer: "user",
+    });
+    expect(codexSandboxPolicyForTurn(runtime.sandbox, "/qa/workspace", runtime.start.args)).toEqual(
+      {
+        type: "workspaceWrite",
+        writableRoots: ["/qa/workspace"],
+        networkAccess: false,
+        excludeTmpdirEnvVar: true,
+        excludeSlashTmp: true,
+      },
+    );
+  });
+
+  it("preserves an explicitly read-only sandbox for forced private-QA Codex runtime", () => {
+    const privateQaCodexEnv = {
+      OPENCLAW_BUILD_PRIVATE_QA: "1",
+      OPENCLAW_QA_FORCE_RUNTIME: "codex",
+    };
+    const runtime = resolveRuntimeForTest({
+      pluginConfig: {
+        appServer: {
+          mode: "yolo",
+          approvalPolicy: "never",
+          sandbox: "read-only",
+        },
+      },
+      env: privateQaCodexEnv,
+    });
+
+    expectRuntimePolicy(runtime, {
+      approvalPolicy: "never",
+      sandbox: "read-only",
+      approvalsReviewer: "user",
+    });
+    expect(codexSandboxPolicyForTurn(runtime.sandbox, "/qa/workspace", runtime.start.args)).toEqual(
+      {
+        type: "readOnly",
+        networkAccess: false,
+      },
+    );
+  });
+
+  it.each([
+    { label: "ordinary production", env: {} },
+    { label: "private build without a forced runtime", env: { OPENCLAW_BUILD_PRIVATE_QA: "1" } },
+    {
+      label: "forced runtime without a private build",
+      env: { OPENCLAW_QA_FORCE_RUNTIME: "codex" },
+    },
+    {
+      label: "forced private-QA Codex runtime without explicit sandbox configuration",
+      env: { OPENCLAW_BUILD_PRIVATE_QA: "1", OPENCLAW_QA_FORCE_RUNTIME: "codex" },
+    },
+    {
+      label: "forced private-QA OpenClaw runtime",
+      env: { OPENCLAW_BUILD_PRIVATE_QA: "1", OPENCLAW_QA_FORCE_RUNTIME: "openclaw" },
+    },
+  ])("preserves production yolo filesystem policy for $label", ({ env }) => {
+    const runtime = resolveRuntimeForTest({ pluginConfig: {}, env });
+
+    expectRuntimePolicy(runtime, {
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+      approvalsReviewer: "user",
+    });
+    expect(
+      codexSandboxPolicyForTurn("workspace-write", "/qa/workspace", runtime.start.args),
+    ).toEqual({
+      type: "workspaceWrite",
+      writableRoots: ["/qa/workspace"],
+      networkAccess: false,
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: false,
+    });
+  });
+
+  it.each([
+    {
+      label: "long config arguments",
+      args: [
+        "--config",
+        "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+        "--config",
+        "sandbox_workspace_write.exclude_slash_tmp=true",
+      ],
+      excludeTmpdirEnvVar: true,
+      excludeSlashTmp: true,
+    },
+    {
+      label: "inline config arguments",
+      args: [
+        "--config=sandbox_workspace_write.exclude_tmpdir_env_var=true",
+        "--config=sandbox_workspace_write.exclude_slash_tmp=true",
+      ],
+      excludeTmpdirEnvVar: true,
+      excludeSlashTmp: true,
+    },
+    {
+      label: "the last native config override",
+      args: [
+        "-c",
+        "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+        "-c",
+        "sandbox_workspace_write.exclude_tmpdir_env_var=false",
+        "-c",
+        "sandbox_workspace_write.exclude_slash_tmp=true",
+      ],
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: true,
+    },
+  ])(
+    "preserves native workspace root policy from $label",
+    ({ args, excludeTmpdirEnvVar, excludeSlashTmp }) => {
+      expect(codexSandboxPolicyForTurn("workspace-write", "/qa/workspace", args)).toEqual({
+        type: "workspaceWrite",
+        writableRoots: ["/qa/workspace"],
+        networkAccess: false,
+        excludeTmpdirEnvVar,
+        excludeSlashTmp,
+      });
+    },
+  );
+
+  it("does not change ordinary harness connection defaults when supervision is enabled", () => {
+    const runtime = resolveRuntimeForTest({
+      pluginConfig: { supervision: { enabled: true } },
+    });
+
+    expectFields(runtime.start, "runtime start", {
+      transport: "stdio",
+      homeScope: "agent",
+    });
+    expect(runtime.start).not.toHaveProperty("url");
+  });
+
+  it("uses shared user-home defaults only for supervision control connections", () => {
+    const runtime = resolveCodexSupervisionAppServerRuntimeOptions({
+      pluginConfig: { supervision: { enabled: true } },
+      env: {},
+      requirementsToml: null,
+    });
+
+    expectFields(runtime.start, "runtime start", {
+      transport: "stdio",
+      homeScope: "user",
+    });
+    expect(runtime.start).not.toHaveProperty("url");
+  });
+
+  it("honors explicit app-server settings for supervision control connections", () => {
+    const runtime = resolveCodexSupervisionAppServerRuntimeOptions({
+      pluginConfig: {
+        supervision: { enabled: true },
+        appServer: {
+          transport: "websocket",
+          url: "ws://127.0.0.1:39175",
+        },
+      },
+      env: {},
+      requirementsToml: null,
+    });
+
+    expectFields(runtime.start, "runtime start", {
+      transport: "websocket",
+      homeScope: "agent",
+      url: "ws://127.0.0.1:39175",
+    });
+  });
+
+  it("honors explicit app-server connection settings when supervision is enabled", () => {
+    const runtime = resolveRuntimeForTest({
+      pluginConfig: {
+        supervision: { enabled: true },
+        appServer: {
+          transport: "websocket",
+          homeScope: "agent",
+          url: "ws://127.0.0.1:39175",
+        },
+      },
+    });
+
+    expectFields(runtime.start, "runtime start", {
+      transport: "websocket",
+      homeScope: "agent",
+      url: "ws://127.0.0.1:39175",
+    });
+  });
+
+  it("rejects Unix app-server connections outside the shared user home", () => {
+    expect(() =>
+      resolveRuntimeForTest({
+        pluginConfig: {
+          appServer: {
+            transport: "unix",
+            homeScope: "agent",
+          },
+        },
+      }),
+    ).toThrow(
+      "plugins.entries.codex.config.appServer.transport=unix requires appServer.homeScope=user",
+    );
+  });
+
+  it("rejects non-Unix URLs for Unix app-server connections", () => {
+    expect(() =>
+      resolveRuntimeForTest({
+        pluginConfig: {
+          appServer: {
+            transport: "unix",
+            homeScope: "user",
+            url: "ws://127.0.0.1:39175",
+          },
+        },
+      }),
+    ).toThrow(
+      "plugins.entries.codex.config.appServer.url must use unix:// when appServer.transport is unix",
+    );
+  });
+
   it("resolves opt-in user-home coexistence only for local stdio", () => {
     const runtime = resolveRuntimeForTest({
       pluginConfig: { appServer: { homeScope: "user" } },
@@ -559,7 +877,7 @@ describe("Codex app-server config", () => {
         },
       }),
     ).toThrow(
-      "plugins.entries.codex.config.appServer.homeScope=user requires appServer.transport=stdio",
+      "plugins.entries.codex.config.appServer.homeScope=user requires appServer.transport=stdio or unix",
     );
   });
 
@@ -610,6 +928,20 @@ describe("Codex app-server config", () => {
         model: "gpt-5.5",
       }),
     ).toBe(false);
+    for (const codexConfigToml of [
+      'openai_base_url = """http://localhost:8080/v1"""\n',
+      "openai_base_url = '''http://localhost:8080/v1'''\n",
+      'chatgpt_base_url = """http://localhost:8080/backend-api"""\n',
+      "[model_providers.openai]\nbase_url = '''http://localhost:8080/v1'''\n",
+    ]) {
+      expect(
+        canUseCodexModelBackedApprovalsReviewerForModel({
+          modelProvider: "openai",
+          model: "gpt-5.5",
+          codexConfigToml,
+        }),
+      ).toBe(false);
+    }
     expect(
       canUseCodexModelBackedApprovalsReviewerForModel({
         modelProvider: "openrouter",
@@ -889,6 +1221,27 @@ describe("Codex app-server config", () => {
     });
   });
 
+  it.each([
+    { policies: ["untrusted"], description: "only the managed internal policy" },
+    { policies: ["untrusted", "never"], description: "managed and unrestricted policies" },
+  ])("preserves $description without weakening Codex approvals", ({ policies }) => {
+    const runtime = resolveRuntimeForTest({
+      pluginConfig: {},
+      modelProvider: "openai",
+      requirementsToml: `allowed_approval_policies = [${policies
+        .map((policy) => `"${policy}"`)
+        .join(", ")}]\n`,
+    });
+
+    expectRuntimePolicy(runtime, {
+      approvalPolicy: "untrusted",
+      sandbox: "workspace-write",
+      approvalsReviewer: "auto_review",
+    });
+    expect(runtime.approvalPolicySource).toBe("requirements");
+    expect(withMcpElicitationsApprovalPolicy(runtime.approvalPolicy)).toBe("untrusted");
+  });
+
   it("normalizes the deprecated requirements on-failure alias to on-request", () => {
     const runtime = resolveRuntimeForTest({
       pluginConfig: {},
@@ -1138,6 +1491,11 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
         },
       }).appServer?.experimental,
     ).toEqual({ sandboxExecServer: true });
+    expect(
+      isCodexSandboxExecServerEnabled(undefined, {
+        placementExecutionMode: "remote-exec",
+      }),
+    ).toBe(true);
   });
 
   it("rejects the retired dynamic tool profile key", () => {
@@ -1359,20 +1717,92 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
     });
   });
 
-  it("rejects non-curated native plugin identities", () => {
+  it("parses workspace-directory native plugin identities", () => {
+    const config = readCodexPluginConfig({
+      codexPlugins: {
+        enabled: true,
+        plugins: {
+          workspaceData: {
+            marketplaceName: "workspace-directory",
+            pluginName: "workspace-data@workspace-directory",
+            allow_destructive_actions: "ask",
+          },
+        },
+      },
+    });
+
+    expect(resolveCodexPluginsPolicy(config).pluginPolicies).toStrictEqual([
+      {
+        configKey: "workspaceData",
+        marketplaceName: "workspace-directory",
+        pluginName: "workspace-data@workspace-directory",
+        enabled: true,
+        allowDestructiveActions: true,
+        destructiveApprovalMode: "ask",
+      },
+    ]);
+  });
+
+  it.each([
+    "openai-curated",
+    "openai-curated-remote",
+    "openai-api-curated",
+    "workspace-directory",
+    "company-tools",
+    "openai-bundled",
+    "openai-primary-runtime",
+    "custom_market-42",
+  ])("accepts valid native plugin marketplace identity %s", (marketplaceName) => {
     const config = readCodexPluginConfig({
       codexPlugins: {
         enabled: true,
         plugins: {
           gmail: {
-            marketplaceName: "custom-market",
+            marketplaceName,
             pluginName: "gmail",
           },
         },
       },
     });
 
-    expect(config.codexPlugins).toBeUndefined();
+    expect(resolveCodexPluginsPolicy(config).pluginPolicies).toStrictEqual([
+      expect.objectContaining({ marketplaceName, pluginName: "gmail" }),
+    ]);
+  });
+
+  it.each(["", "../marketplace", "market/place", "market@place", " white-space", "trail "])(
+    "rejects unsafe native plugin marketplace identity %j",
+    (marketplaceName) => {
+      const config = readCodexPluginConfig({
+        codexPlugins: {
+          enabled: true,
+          plugins: {
+            gmail: {
+              marketplaceName,
+              pluginName: "gmail",
+            },
+          },
+        },
+      });
+
+      expect(config.codexPlugins).toBeUndefined();
+      expect(resolveCodexPluginsPolicy(config).pluginPolicies).toStrictEqual([]);
+    },
+  );
+
+  it("ignores an invalid marketplace identity when resolving raw native plugin policy", () => {
+    const config = {
+      codexPlugins: {
+        enabled: true,
+        plugins: {
+          gmail: {
+            marketplaceName: "../unsafe-marketplace",
+            pluginName: "gmail",
+          },
+        },
+      },
+    };
+
     expect(resolveCodexPluginsPolicy(config).pluginPolicies).toStrictEqual([]);
   });
 
@@ -1440,6 +1870,145 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
     );
   });
 
+  it("uses the pinned managed package for ordinary turns and desktop ownership for Computer Use", () => {
+    expect(resolveRuntimeForTest({ pluginConfig: {} }).start.managedCommandOrder).toBeUndefined();
+    expect(
+      resolveRuntimeForTest({
+        pluginConfig: { appServer: { homeScope: "user" } },
+      }).start.managedCommandOrder,
+    ).toBe("desktop-first");
+    expect(
+      resolveRuntimeForTest({
+        pluginConfig: { computerUse: { enabled: true } },
+      }).start.managedCommandOrder,
+    ).toBe("desktop-first");
+    expect(
+      resolveRuntimeForTest({
+        pluginConfig: {},
+        managedCommandOrder: "desktop-first",
+      }).start.managedCommandOrder,
+    ).toBe("desktop-first");
+    expect(
+      resolveRuntimeForTest({
+        pluginConfig: { appServer: { homeScope: "user" } },
+        managedCommandOrder: "package-first",
+      }).start.managedCommandOrder,
+    ).toBe("package-first");
+  });
+
+  it("reads effective native Computer Use state before managed spawn", () => {
+    const startOptions = resolveRuntimeForTest({ pluginConfig: {} }).start;
+    const resolveForConfig = (codexConfigToml: string) =>
+      resolveCodexAppServerStartOptionsForAgent({
+        startOptions,
+        agentDir: "/tmp/openclaw-agent",
+        codexConfigToml,
+      }).managedCommandOrder;
+
+    expect(
+      resolveForConfig('[plugins."computer-use@openai-bundled"]\nenabled = false\n'),
+    ).toBeUndefined();
+    for (const codexConfigToml of [
+      '[plugins."computer-use@openai-bundled"]\n',
+      'plugins."computer-use@openai-bundled".enabled = true\n',
+      'plugins = { "computer-use@openai-bundled" = { enabled = true } }\n',
+      '["plugins"."computer-use@openai-bundled".mcp_servers.computer_use]\n',
+    ]) {
+      expect(resolveForConfig(codexConfigToml)).toBe("desktop-first");
+    }
+    expect(
+      resolveForConfig(
+        'model_context_window = 9223372036854775807\ndeveloper_instructions = """\n[plugins."computer-use@openai-bundled"]\nenabled = true\n"""\n',
+      ),
+    ).toBeUndefined();
+    expect(resolveForConfig("[plugins.invalid")).toBe("desktop-first");
+
+    const customIdentityStartOptions = resolveRuntimeForTest({
+      pluginConfig: { computerUse: { pluginName: "custom-computer-use" } },
+    }).start;
+    expect(customIdentityStartOptions.managedCommandOrder).toBe("desktop-first");
+    expect(customIdentityStartOptions.managedComputerUsePluginNames).toEqual([
+      "computer-use",
+      "custom-computer-use",
+    ]);
+    expect(
+      resolveCodexAppServerStartOptionsForAgent({
+        startOptions: customIdentityStartOptions,
+        agentDir: "/tmp/openclaw-agent",
+        codexConfigToml: '[plugins."computer-use@openai-bundled"]\nenabled = true\n',
+      }).managedCommandOrder,
+    ).toBe("desktop-first");
+    expect(
+      resolveCodexAppServerStartOptionsForAgent({
+        startOptions: customIdentityStartOptions,
+        agentDir: "/tmp/openclaw-agent",
+        codexConfigToml:
+          '[plugins."computer-use@openai-bundled"]\nenabled = false\n[plugins."custom-computer-use@local"]\nenabled = true\n',
+      }).managedCommandOrder,
+    ).toBe("desktop-first");
+
+    const privateStartOptions = resolveRuntimeForTest({
+      pluginConfig: { appServer: { homeScope: "user" } },
+      managedCommandOrder: "package-first",
+    }).start;
+    expect(
+      resolveCodexAppServerStartOptionsForAgent({
+        startOptions: privateStartOptions,
+        agentDir: "/tmp/openclaw-agent",
+        codexConfigToml: '[plugins."computer-use@openai-bundled"]\nenabled = true\n',
+      }).managedCommandOrder,
+    ).toBe("package-first");
+  });
+
+  it("keeps desktop ownership for Computer Use persisted in an agent Codex home", async () => {
+    await withTempDir("openclaw-codex-agent-home-", async (agentDir) => {
+      const startOptions = resolveRuntimeForTest({ pluginConfig: {} }).start;
+      const codexHome = path.join(agentDir, "codex-home");
+      await fs.mkdir(codexHome);
+      await fs.writeFile(
+        path.join(codexHome, "config.toml"),
+        '[plugins."computer-use@openai-bundled"]\nenabled = true\n',
+      );
+
+      expect(
+        resolveCodexAppServerStartOptionsForAgent({
+          startOptions,
+          agentDir,
+        }).managedCommandOrder,
+      ).toBe("desktop-first");
+    });
+  });
+
+  it("uses desktop-first when persisted Codex state cannot be read", async () => {
+    await withTempDir("openclaw-codex-unreadable-home-", async (agentDir) => {
+      const startOptions = resolveRuntimeForTest({ pluginConfig: {} }).start;
+      await fs.mkdir(path.join(agentDir, "codex-home"), { recursive: true });
+      await fs.mkdir(path.join(agentDir, "codex-home", "config.toml"));
+
+      expect(
+        resolveCodexAppServerStartOptionsForAgent({
+          startOptions,
+          agentDir,
+        }).managedCommandOrder,
+      ).toBe("desktop-first");
+    });
+  });
+
+  it("does not change explicit commands when Computer Use is enabled", () => {
+    const start = resolveRuntimeForTest({
+      pluginConfig: {
+        appServer: { command: "/opt/codex/bin/codex" },
+        computerUse: { enabled: true },
+      },
+    }).start;
+
+    expectFields(start, "configured Computer Use start", {
+      command: "/opt/codex/bin/codex",
+      commandSource: "config",
+    });
+    expect(start.managedCommandOrder).toBeUndefined();
+  });
+
   it("rejects Codex app-server command overrides that include inline arguments", () => {
     expect(() =>
       resolveRuntimeForTest({
@@ -1490,6 +2059,13 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
       enabled: true,
       autoInstall: true,
       marketplaceDiscoveryTimeoutMs: 60_000,
+      liveTestTimeoutMs: 60_000,
+      toolCallTimeoutMs: 60_000,
+      healthCheckEnabled: false,
+      healthCheckIntervalMinutes: 60,
+      pluginCacheMode: "independent",
+      strictReadiness: false,
+      autoRepair: false,
       pluginName: "env-fallback-plugin",
       mcpServerName: "computer-use",
       marketplaceName: "desktop-tools",
@@ -1510,6 +2086,13 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
         enabled: true,
         autoInstall: true,
         marketplaceDiscoveryTimeoutMs: 30_000,
+        liveTestTimeoutMs: 60_000,
+        toolCallTimeoutMs: 60_000,
+        healthCheckEnabled: false,
+        healthCheckIntervalMinutes: 60,
+        pluginCacheMode: "independent",
+        strictReadiness: false,
+        autoRepair: false,
         marketplaceSource: "github:example/plugins",
       },
     );
@@ -1527,9 +2110,73 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
         {
           enabled: true,
           marketplaceDiscoveryTimeoutMs: 60_000,
+          liveTestTimeoutMs: 60_000,
+          toolCallTimeoutMs: 60_000,
+          healthCheckEnabled: false,
+          healthCheckIntervalMinutes: 60,
+          pluginCacheMode: "independent",
+          strictReadiness: false,
+          autoRepair: false,
         },
       );
     }
+  });
+
+  it("resolves Computer Use operational policy knobs", () => {
+    expectFields(
+      resolveCodexComputerUseConfig({
+        pluginConfig: {
+          computerUse: {
+            enabled: true,
+            liveTestTimeoutMs: 45_000,
+            toolCallTimeoutMs: 55_000,
+            healthCheckEnabled: true,
+            healthCheckIntervalMinutes: 120,
+            pluginCacheMode: "independent",
+            strictReadiness: true,
+            autoRepair: true,
+          },
+        },
+        env: {
+          OPENCLAW_CODEX_COMPUTER_USE_HEALTH_CHECK_ENABLED: "false",
+          OPENCLAW_CODEX_COMPUTER_USE_HEALTH_CHECK_INTERVAL_MINUTES: "240",
+          OPENCLAW_CODEX_COMPUTER_USE_STRICT_READINESS: "false",
+          OPENCLAW_CODEX_COMPUTER_USE_AUTO_REPAIR: "false",
+        },
+      }),
+      "computer use config",
+      {
+        enabled: true,
+        liveTestTimeoutMs: 45_000,
+        toolCallTimeoutMs: 55_000,
+        healthCheckEnabled: true,
+        healthCheckIntervalMinutes: 120,
+        pluginCacheMode: "independent",
+        strictReadiness: true,
+        autoRepair: true,
+      },
+    );
+
+    expectFields(
+      resolveCodexComputerUseConfig({
+        pluginConfig: { computerUse: { enabled: true } },
+        env: {
+          OPENCLAW_CODEX_COMPUTER_USE_HEALTH_CHECK_ENABLED: "1",
+          OPENCLAW_CODEX_COMPUTER_USE_HEALTH_CHECK_INTERVAL_MINUTES: "90",
+          OPENCLAW_CODEX_COMPUTER_USE_STRICT_READINESS: "true",
+          OPENCLAW_CODEX_COMPUTER_USE_AUTO_REPAIR: "true",
+          OPENCLAW_CODEX_COMPUTER_USE_PLUGIN_CACHE_MODE: "stale-copy",
+        },
+      }),
+      "computer use config",
+      {
+        healthCheckEnabled: true,
+        healthCheckIntervalMinutes: 60,
+        pluginCacheMode: "independent",
+        strictReadiness: true,
+        autoRepair: true,
+      },
+    );
   });
 
   it("allows plugin config to opt in to guardian-reviewed local execution", () => {
@@ -1665,7 +2312,7 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
           execMode,
         }),
       ).toThrow(
-        `Codex app-server local execution is not available when tools.exec.mode=${execMode}`,
+        `Codex app-server local execution is unavailable because effective tools.exec.mode=${execMode}`,
       );
     },
   );
@@ -1810,13 +2457,19 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
   });
 
   it.each([
-    { execMode: "auto", policies: ["never"] },
-    { execMode: "auto", policies: ["untrusted"] },
-    { execMode: "ask", policies: ["never"] },
-    { execMode: "ask", policies: ["untrusted"] },
+    {
+      execMode: "auto",
+      policies: ["never"],
+      error: "tools.exec.mode=auto requires Codex app-server prompting approvals",
+    },
+    {
+      execMode: "ask",
+      policies: ["never"],
+      error: "tools.exec.mode=ask requires Codex app-server prompting approvals",
+    },
   ] as const)(
     "fails closed when normalized OpenClaw $execMode mode can only use $policies approvals",
-    ({ execMode, policies }) => {
+    ({ execMode, policies, error }) => {
       expect(() =>
         resolveRuntimeForTest({
           pluginConfig: {},
@@ -1825,9 +2478,27 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
             .map((policy) => `"${policy}"`)
             .join(", ")}]\n`,
         }),
-      ).toThrow(`tools.exec.mode=${execMode} requires Codex app-server prompting approvals`);
+      ).toThrow(error);
     },
   );
+
+  it.each([
+    { execMode: "auto" as const, approvalsReviewer: "auto_review" },
+    { execMode: "ask" as const, approvalsReviewer: "user" },
+  ])("honors managed prompting approvals for OpenClaw $execMode mode", (expected) => {
+    const runtime = resolveRuntimeForTest({
+      pluginConfig: {},
+      execMode: expected.execMode,
+      modelProvider: "openai",
+      requirementsToml: 'allowed_approval_policies = ["untrusted", "never"]\n',
+    });
+
+    expectRuntimePolicy(runtime, {
+      approvalPolicy: "untrusted",
+      sandbox: "workspace-write",
+      approvalsReviewer: expected.approvalsReviewer,
+    });
+  });
 
   it("keeps normalized OpenClaw full exec mode on default Codex yolo", () => {
     const runtime = resolveRuntimeForTest({
@@ -1840,6 +2511,21 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
       sandbox: "danger-full-access",
       approvalsReviewer: "user",
     });
+  });
+
+  it("enforces canonical per-agent exec deny before starting Codex app-server", () => {
+    const execPolicy = resolveOpenClawExecPolicyForCodexAppServer({
+      config: {
+        tools: { exec: { mode: "full" } },
+        agents: { entries: { reviewer: { tools: { exec: { mode: "deny" } } } } },
+      },
+      agentId: "reviewer",
+    });
+
+    expect(execPolicy.mode).toBe("deny");
+    expect(() => resolveRuntimeForTest({ execPolicy })).toThrow(
+      "Codex app-server local execution is unavailable because effective tools.exec.mode=deny",
+    );
   });
 
   it("keeps auto mode prompting when requirements use the on-failure alias", () => {
@@ -1920,7 +2606,6 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
           mode: "yolo",
           transport: "stdio",
           requestTimeoutMs: 60_000,
-          turnCompletionIdleTimeoutMs: 60_000,
         },
         codexDynamicToolsLoading: "searchable",
         codexDynamicToolsExclude: [],
@@ -1966,60 +2651,8 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
     });
   });
 
-  it("resolves agent-scoped normalized OpenClaw exec mode for Codex app-server mapping", () => {
-    const config = {
-      tools: {
-        exec: {
-          mode: "ask",
-        },
-      },
-      agents: {
-        list: [
-          {
-            id: "Codex-Agent",
-            tools: {
-              exec: {
-                mode: "auto",
-              },
-            },
-          },
-        ],
-      },
-    };
-
-    expect(resolveOpenClawExecModeFromConfig({ config, agentId: "codex-agent" })).toBe("auto");
-    expect(resolveOpenClawExecModeFromConfig({ config, agentId: "other-agent" })).toBe("ask");
-  });
-
-  it("keeps legacy exec security overrides ahead of normalized OpenClaw exec mode", () => {
-    expect(
-      resolveOpenClawExecModeFromConfig({
-        config: {
-          tools: {
-            exec: {
-              mode: "auto",
-            },
-          },
-          agents: {
-            list: [
-              {
-                id: "codex-agent",
-                tools: {
-                  exec: {
-                    security: "full",
-                  },
-                },
-              },
-            ],
-          },
-        },
-        agentId: "codex-agent",
-      }),
-    ).toBe("full");
-  });
-
   it.each(["always"] as const)(
-    "keeps legacy full exec security with ask=%s on prompting Codex policy",
+    "keeps legacy full exec security with ask=%s on per-command Codex policy",
     (ask) => {
       const config = {
         tools: {
@@ -2028,10 +2661,9 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
             ask,
           },
         },
-      };
+      } satisfies OpenClawConfig;
       const execPolicy = resolveOpenClawExecPolicyForCodexAppServer({ config });
 
-      expect(resolveOpenClawExecModeForCodexAppServer({ config })).toBe("ask");
       expectRuntimePolicy(
         resolveRuntimeForTest({
           pluginConfig: {
@@ -2045,7 +2677,7 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
           execPolicy,
         }),
         {
-          approvalPolicy: "on-request",
+          approvalPolicy: "untrusted",
           sandbox: "danger-full-access",
           approvalsReviewer: "user",
         },
@@ -2061,10 +2693,9 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
           ask: "on-miss",
         },
       },
-    };
+    } satisfies OpenClawConfig;
     const execPolicy = resolveOpenClawExecPolicyForCodexAppServer({ config });
 
-    expect(resolveOpenClawExecModeForCodexAppServer({ config })).toBe("full");
     expectRuntimePolicy(resolveRuntimeForTest({ execPolicy }), {
       approvalPolicy: "never",
       sandbox: "danger-full-access",
@@ -2080,7 +2711,7 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
           ask: "always",
         },
       },
-    };
+    } satisfies OpenClawConfig;
 
     expect(() =>
       resolveRuntimeForTest({
@@ -2088,6 +2719,37 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
         requirementsToml: 'allowed_sandbox_modes = ["read-only", "workspace-write"]\n',
       }),
     ).toThrow("legacy full exec security with ask requires Codex app-server danger-full-access");
+  });
+
+  it("fails closed when managed policy forbids mandatory per-command approvals", () => {
+    const config = {
+      tools: { exec: { security: "full", ask: "always" } },
+    } satisfies OpenClawConfig;
+
+    expect(() =>
+      resolveRuntimeForTest({
+        execPolicy: resolveOpenClawExecPolicyForCodexAppServer({ config }),
+        requirementsToml: 'allowed_approval_policies = ["on-request", "never"]',
+      }),
+    ).toThrow("tools.exec.ask=always requires Codex app-server per-command approvals");
+  });
+
+  it("honors managed policy that permits mandatory per-command approvals", () => {
+    const config = {
+      tools: { exec: { security: "full", ask: "always" } },
+    } satisfies OpenClawConfig;
+
+    expectRuntimePolicy(
+      resolveRuntimeForTest({
+        execPolicy: resolveOpenClawExecPolicyForCodexAppServer({ config }),
+        requirementsToml: 'allowed_approval_policies = ["on-request", "untrusted"]',
+      }),
+      {
+        approvalPolicy: "untrusted",
+        sandbox: "danger-full-access",
+        approvalsReviewer: "user",
+      },
+    );
   });
 
   it("clamps legacy full exec with ask when an OpenClaw sandbox is active", () => {
@@ -2098,7 +2760,7 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
           ask: "always",
         },
       },
-    };
+    } satisfies OpenClawConfig;
 
     expectRuntimePolicy(
       resolveRuntimeForTest({
@@ -2107,7 +2769,7 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
         requirementsToml: 'allowed_sandbox_modes = ["read-only", "workspace-write"]\n',
       }),
       {
-        approvalPolicy: "on-request",
+        approvalPolicy: "untrusted",
         sandbox: "workspace-write",
         approvalsReviewer: "user",
       },
@@ -2133,7 +2795,8 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
     });
 
     expect(execPolicy.mode).toBe("deny");
-    expect(() =>
+    let error: unknown;
+    try {
       resolveRuntimeForTest({
         pluginConfig: {
           appServer: {
@@ -2143,8 +2806,18 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
           },
         },
         execPolicy,
-      }),
-    ).toThrow("Codex app-server local execution is not available when tools.exec.mode=deny");
+      });
+    } catch (cause) {
+      error = cause;
+    }
+    expect(error).toMatchObject({
+      name: "AgentHarnessPreflightError",
+      scope: "harness",
+      message: expect.stringContaining(
+        "inspect them with `openclaw approvals get --gateway` and update that same target with `openclaw approvals set --gateway --stdin`",
+      ),
+    });
+    expect((error as Error).message).not.toContain("--node");
   });
 
   it("applies host exec approval ask floors before starting Codex app-server", () => {
@@ -2179,11 +2852,33 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
         execPolicy,
       }),
       {
-        approvalPolicy: "on-request",
+        approvalPolicy: "untrusted",
         sandbox: "danger-full-access",
         approvalsReviewer: "user",
       },
     );
+  });
+
+  it("does not apply host exec approval floors to an explicit full session", () => {
+    const execPolicy = resolveOpenClawExecPolicyForCodexAppServer({
+      permissionMode: "full",
+      config: {
+        tools: {
+          exec: {
+            mode: "ask",
+          },
+        },
+      },
+      approvals: {
+        version: 1,
+        defaults: {
+          ask: "always",
+        },
+        agents: {},
+      },
+    });
+
+    expect(execPolicy).toMatchObject({ mode: "full", security: "full", ask: "off" });
   });
 
   it("preserves explicit read-only sandbox for host exec approval ask floors", () => {
@@ -2218,7 +2913,7 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
         execPolicy,
       }),
       {
-        approvalPolicy: "on-request",
+        approvalPolicy: "untrusted",
         sandbox: "read-only",
         approvalsReviewer: "user",
       },
@@ -2260,7 +2955,9 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
         },
         execPolicy,
       }),
-    ).toThrow("Codex app-server local execution is not available when tools.exec.mode=deny");
+    ).toThrow(
+      "Codex app-server local execution is unavailable because effective tools.exec.mode=deny",
+    );
   });
 
   it("applies agent-scoped exec approval ask floors before starting Codex app-server", () => {
@@ -2300,132 +2997,11 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
         execPolicy,
       }),
       {
-        approvalPolicy: "on-request",
+        approvalPolicy: "untrusted",
         sandbox: "danger-full-access",
         approvalsReviewer: "user",
       },
     );
-  });
-
-  it("treats ask-only legacy overrides as normalized mode overrides", () => {
-    const config = {
-      tools: {
-        exec: {
-          mode: "auto",
-        },
-      },
-      agents: {
-        list: [
-          {
-            id: "codex-agent",
-            tools: {
-              exec: {
-                ask: "off",
-              },
-            },
-          },
-        ],
-      },
-    };
-
-    expect(resolveOpenClawExecModeFromConfig({ config, agentId: "codex-agent" })).toBe("allowlist");
-    const execMode = resolveOpenClawExecModeForCodexAppServer({
-      config,
-      agentId: "main",
-      execOverrides: {
-        ask: "always",
-      },
-    });
-    expect(execMode).toBe("ask");
-    expectRuntimePolicy(resolveRuntimeForTest({ execMode }), {
-      approvalPolicy: "on-request",
-      sandbox: "workspace-write",
-      approvalsReviewer: "user",
-    });
-  });
-
-  it("keeps current legacy exec security overrides ahead of configured normalized mode", () => {
-    const config = {
-      tools: {
-        exec: {
-          mode: "auto",
-        },
-      },
-    };
-
-    expect(
-      resolveOpenClawExecModeForCodexAppServer({
-        config,
-        agentId: "main",
-        execOverrides: {
-          security: "full",
-        },
-      }),
-    ).toBe("full");
-    expect(
-      resolveOpenClawExecModeForCodexAppServer({
-        config,
-        agentId: "main",
-        execOverrides: {
-          ask: "always",
-        },
-      }),
-    ).toBe("ask");
-    expect(
-      resolveOpenClawExecModeForCodexAppServer({
-        config,
-        agentId: "main",
-        execOverrides: {
-          security: "full",
-          ask: "off",
-        },
-      }),
-    ).toBe("full");
-  });
-
-  it("preserves legacy full exec security before applying current ask overrides", () => {
-    expect(
-      resolveOpenClawExecModeForCodexAppServer({
-        config: {
-          tools: {
-            exec: {
-              security: "full",
-              ask: "on-miss",
-            },
-          },
-        },
-      }),
-    ).toBe("full");
-    expect(
-      resolveOpenClawExecModeForCodexAppServer({
-        config: {
-          tools: {
-            exec: {
-              security: "full",
-              ask: "always",
-            },
-          },
-        },
-        execOverrides: {
-          ask: "off",
-        },
-      }),
-    ).toBe("full");
-    expect(
-      resolveOpenClawExecModeForCodexAppServer({
-        config: {
-          tools: {
-            exec: {
-              security: "full",
-              ask: "on-miss",
-            },
-          },
-        },
-        execOverrides: {
-          ask: "off",
-        },
-      }),
-    ).toBe("full");
   });
 
   it("accepts the latest auto_review reviewer and legacy guardian_subagent alias", () => {
@@ -2488,6 +3064,24 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
     });
   });
 
+  it("rejects the retired untrusted approval policy at runtime", () => {
+    expect(() =>
+      readCodexPluginConfig({
+        appServer: { approvalPolicy: "untrusted" },
+      }),
+    ).toThrow(
+      'plugins.entries.codex.config.appServer.approvalPolicy="untrusted" is retired; run "openclaw doctor --fix" to migrate it to "on-request".',
+    );
+    expect(() =>
+      resolveRuntimeForTest({
+        pluginConfig: {},
+        env: { OPENCLAW_CODEX_APP_SERVER_APPROVAL_POLICY: "untrusted" },
+      }),
+    ).toThrow(
+      'Codex app-server approval policy "untrusted" is retired; run "openclaw doctor --fix" and use "on-request".',
+    );
+  });
+
   it("derives distinct shared-client keys for distinct auth tokens without exposing them", () => {
     const first = codexAppServerStartOptionsKey({
       transport: "websocket",
@@ -2521,6 +3115,25 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
     expect(second).not.toContain("tok_second");
   });
 
+  it("derives distinct shared-client keys for distinct auth binding fingerprints", () => {
+    const options = {
+      transport: "stdio" as const,
+      command: "codex",
+      args: ["app-server"],
+      headers: {},
+    };
+    const first = codexAppServerStartOptionsKey(options, {
+      authProfileId: "openai:work",
+      authBindingFingerprint: "auth-fingerprint-a",
+    });
+    const second = codexAppServerStartOptionsKey(options, {
+      authProfileId: "openai:work",
+      authBindingFingerprint: "auth-fingerprint-b",
+    });
+
+    expect(first).not.toEqual(second);
+  });
+
   it("derives distinct shared-client keys for distinct env values without exposing them", () => {
     const first = codexAppServerStartOptionsKey({
       transport: "stdio",
@@ -2549,6 +3162,40 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
     ).toEqual(first);
     expect(first).not.toContain("sk-first");
     expect(second).not.toContain("sk-second");
+  });
+
+  it("derives distinct shared-client keys for managed binary order", () => {
+    const packageFirst = codexAppServerStartOptionsKey({
+      transport: "stdio",
+      command: "codex",
+      commandSource: "managed",
+      args: ["app-server"],
+      headers: {},
+    });
+    const desktopFirst = codexAppServerStartOptionsKey({
+      transport: "stdio",
+      command: "codex",
+      commandSource: "managed",
+      managedCommandOrder: "desktop-first",
+      args: ["app-server"],
+      headers: {},
+    });
+
+    expect(packageFirst).not.toEqual(desktopFirst);
+  });
+
+  it("derives distinct shared-client keys for native Computer Use identities", () => {
+    const keyFor = (pluginName: string) =>
+      codexAppServerStartOptionsKey({
+        transport: "stdio",
+        command: "codex",
+        commandSource: "managed",
+        managedComputerUsePluginNames: ["computer-use", pluginName],
+        args: ["app-server"],
+        headers: {},
+      });
+
+    expect(keyFor("custom-a")).not.toEqual(keyFor("custom-b"));
   });
 
   it("derives distinct shared-client keys for distinct headers without exposing them", () => {
@@ -2605,7 +3252,7 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
     const first = codexAppServerStartOptionsKey(startOptions);
 
     vi.resetModules();
-    const reloaded = await import("./config.js");
+    const reloaded = await import("./config-runtime.js");
 
     expect(reloaded.codexAppServerStartOptionsKey(startOptions)).toEqual(first);
     expect(first).not.toContain("tok_reload");
@@ -2625,66 +3272,20 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
     );
   });
 
-  it("keeps runtime config keys aligned with manifest schema and UI hints", async () => {
-    const manifest = JSON.parse(
-      await fs.readFile(new URL("../../openclaw.plugin.json", import.meta.url), "utf8"),
-    ) as {
-      configSchema: {
-        properties: {
-          appServer: { properties: Record<string, unknown> };
-          computerUse: { properties: Record<string, unknown> };
-          codexPlugins: {
-            properties: Record<string, unknown>;
-            additionalProperties: boolean;
-          };
-        };
-      };
-      uiHints: Record<string, unknown>;
+  it("derives distinct shared-client keys for distinct process working directories", () => {
+    const startOptions = {
+      transport: "stdio" as const,
+      command: "codex",
+      args: ["app-server"],
+      headers: {},
     };
-    const manifestKeys = Object.keys(
-      manifest.configSchema.properties.appServer.properties,
-    ).toSorted();
 
-    expect(manifestKeys).toEqual([...CODEX_APP_SERVER_CONFIG_KEYS].toSorted());
-    for (const key of CODEX_APP_SERVER_CONFIG_KEYS) {
-      expectUiHintLabel(manifest, `appServer.${key}`);
-    }
-    const appServerExperimentalProperties = (
-      manifest.configSchema.properties.appServer.properties.experimental as {
-        properties: Record<string, unknown>;
-      }
-    ).properties;
-    expect(Object.keys(appServerExperimentalProperties).toSorted()).toEqual([
-      ...CODEX_APP_SERVER_EXPERIMENTAL_CONFIG_KEYS,
-    ]);
-    for (const key of CODEX_APP_SERVER_EXPERIMENTAL_CONFIG_KEYS) {
-      expectUiHintLabel(manifest, `appServer.experimental.${key}`);
-    }
-    const computerUseManifestKeys = Object.keys(
-      manifest.configSchema.properties.computerUse.properties,
-    ).toSorted();
-    expect(computerUseManifestKeys).toEqual([...CODEX_COMPUTER_USE_CONFIG_KEYS].toSorted());
-    for (const key of CODEX_COMPUTER_USE_CONFIG_KEYS) {
-      expectUiHintLabel(manifest, `computerUse.${key}`);
-    }
-    const codexPluginsProperties = manifest.configSchema.properties.codexPlugins;
-    const codexPluginsManifestKeys = Object.keys(codexPluginsProperties.properties).toSorted();
-    expect(codexPluginsManifestKeys).toEqual([...CODEX_PLUGINS_CONFIG_KEYS].toSorted());
-    expect(codexPluginsProperties.additionalProperties).toBe(false);
-    for (const key of CODEX_PLUGINS_CONFIG_KEYS) {
-      expectUiHintLabel(manifest, `codexPlugins.${key}`);
-    }
-    const pluginEntryProperties = (
-      codexPluginsProperties.properties.plugins as {
-        additionalProperties: { properties: Record<string, unknown> };
-      }
-    ).additionalProperties.properties;
-    expect(Object.keys(pluginEntryProperties).toSorted()).toEqual(
-      [...CODEX_PLUGIN_ENTRY_CONFIG_KEYS].toSorted(),
+    expect(codexAppServerStartOptionsKey({ ...startOptions, cwd: "/tmp/project-a" })).not.toEqual(
+      codexAppServerStartOptionsKey({ ...startOptions, cwd: "/tmp/project-b" }),
     );
   });
 
-  it("does not schema-default mode-derived policy fields", async () => {
+  it("publishes stable defaults without schema-defaulting mode-derived policy fields", async () => {
     const manifest = JSON.parse(
       await fs.readFile(new URL("../../openclaw.plugin.json", import.meta.url), "utf8"),
     ) as {
@@ -2695,13 +3296,22 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
           };
         };
       };
+      uiHints: Record<string, unknown>;
     };
     const appServerProperties = manifest.configSchema.properties.appServer.properties;
+    const runtime = resolveRuntimeForTest();
+    for (const key of retiredTurnIdleTimeoutKeys) {
+      expect(appServerProperties).not.toHaveProperty(key);
+      expect(manifest.uiHints).not.toHaveProperty([`appServer.${key}`]);
+      expect(runtime).not.toHaveProperty(key);
+    }
 
     expect(appServerProperties.mode?.default).toBeUndefined();
     expect(appServerProperties.command?.default).toBeUndefined();
     expect(appServerProperties.approvalPolicy?.default).toBeUndefined();
     expect(appServerProperties.sandbox?.default).toBeUndefined();
     expect(appServerProperties.approvalsReviewer?.default).toBeUndefined();
+    expect(appServerProperties.loopDetectionPreToolUseRelay?.default).toBe(true);
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

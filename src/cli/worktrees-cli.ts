@@ -1,7 +1,9 @@
 import type { Command } from "commander";
 import { getTerminalTableWidth, renderTable } from "../../packages/terminal-core/src/table.js";
-import { managedWorktrees } from "../agents/worktrees/service.js";
+import { createManagedWorktreeOwnerPolicy } from "../agents/worktrees/owner-protection.js";
+import { managedWorktrees, resolveWorktreeCleanupLimits } from "../agents/worktrees/service.js";
 import type { ManagedWorktreeRecord } from "../agents/worktrees/types.js";
+import { getRuntimeConfig } from "../config/config.js";
 import { defaultRuntime } from "../runtime.js";
 import { applyParentDefaultHelpAction } from "./program/parent-default-help.js";
 
@@ -88,7 +90,7 @@ export function registerWorktreesCli(program: Command): void {
       const result = await managedWorktrees.remove({
         id,
         reason: "manual-delete",
-        force: opts.force,
+        allowSnapshotLoss: opts.force,
       });
       if (opts.json) {
         printJson(result);
@@ -115,7 +117,12 @@ export function registerWorktreesCli(program: Command): void {
     .description("Run managed worktree cleanup now")
     .option("--json", "Output JSON", false)
     .action(async (opts: JsonOption) => {
-      const result = await managedWorktrees.gc();
+      const cfg = getRuntimeConfig();
+      const limits = resolveWorktreeCleanupLimits();
+      const result = await managedWorktrees.gc({
+        limits,
+        ...createManagedWorktreeOwnerPolicy(cfg),
+      });
       if (opts.json) {
         printJson(result);
       } else {

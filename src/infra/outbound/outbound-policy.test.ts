@@ -1,8 +1,7 @@
 // Covers message action allowlists plus cross-context marker/decorator policy
 // for same-provider and cross-provider sends.
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { vi } from "vitest";
-import type { ChannelMessageActionName } from "../../channels/plugins/types.js";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ChannelMessageActionName } from "../../channels/plugins/types.public.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import type { CrossContextDecoration } from "./outbound-policy.js";
 
