@@ -8,6 +8,7 @@ import {
   expectRecordFields,
   makeCompletionsChunk,
   makeCompletionsModel,
+  streamChunks,
 } from "./openai-completions.test-support.js";
 
 function geminiToolReplayContext(
@@ -86,13 +87,7 @@ describe("openai completions params", () => {
           "tool_calls" as const,
         ),
       ] as const;
-      async function* mockStream() {
-        for (const chunk of chunks) {
-          yield chunk as never;
-        }
-      }
-
-      await processCompletionsStream(mockStream(), output, geminiModel, {
+      await processCompletionsStream(streamChunks(chunks), output, geminiModel, {
         push() {},
       });
 
@@ -128,13 +123,7 @@ describe("openai completions params", () => {
         }),
         makeCompletionsChunk({}, "tool_calls" as const),
       ] as const;
-      async function* mockStream() {
-        for (const chunk of chunks) {
-          yield chunk as never;
-        }
-      }
-
-      await processCompletionsStream(mockStream(), output, veniceGeminiModel, {
+      await processCompletionsStream(streamChunks(chunks), output, veniceGeminiModel, {
         push() {},
       });
 
@@ -185,20 +174,24 @@ describe("openai completions params", () => {
       );
     });
 
-    it("uses the Gemini skip-validator signature when no thought_signature was captured", () => {
-      const params = buildOpenAICompletionsParams(
-        geminiModel,
-        geminiToolReplayContext(geminiModel),
-        undefined,
-      ) as { messages: Array<Record<string, unknown>> };
+    it.each(["gemini-3-flash-preview", "gemini-3.8-flash", "gemini-4-argon"])(
+      "uses the skip-validator signature for unsigned %s replay",
+      (id) => {
+        const target = { ...geminiModel, id };
+        const params = buildOpenAICompletionsParams(
+          target,
+          geminiToolReplayContext(target),
+          undefined,
+        ) as { messages: Array<Record<string, unknown>> };
 
-      const assistant = params.messages.find((message) => message.role === "assistant") as
-        | { tool_calls?: Array<{ extra_content?: { google?: { thought_signature?: string } } }> }
-        | undefined;
-      expect(assistant?.tool_calls?.[0]?.extra_content?.google?.thought_signature).toBe(
-        "skip_thought_signature_validator",
-      );
-    });
+        const assistant = params.messages.find((message) => message.role === "assistant") as
+          | { tool_calls?: Array<{ extra_content?: { google?: { thought_signature?: string } } }> }
+          | undefined;
+        expect(assistant?.tool_calls?.[0]?.extra_content?.google?.thought_signature).toBe(
+          "skip_thought_signature_validator",
+        );
+      },
+    );
 
     it("falls back to skip_thought_signature_validator when a captured same-route Gemini 3 signature is truncated", () => {
       // Compaction-truncated sig: 109 chars, length mod 4 == 1.

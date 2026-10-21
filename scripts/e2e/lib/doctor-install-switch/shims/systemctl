@@ -10,18 +10,6 @@ fi
 cmd="${args[0]:-}"
 
 case "$cmd" in
-  daemon-reload)
-    [ "$scope" = user ] || exit 1
-    # Only an explicit manager reload publishes changed unit bytes. Passive
-    # GetUnit/command inspection must not manufacture loaded service state.
-    shopt -s nullglob
-    for loaded in "$HOME"/.config/systemd/user/*.service.loaded-unit; do
-      [ -f "${loaded%.loaded-unit}" ] || rm -f "$loaded"
-    done
-    for unit in "$HOME"/.config/systemd/user/*.service; do
-      cp "$unit" "$unit.loaded-unit"
-    done
-    ;;
   status) ;;
   is-active)
     echo "inactive" >&2

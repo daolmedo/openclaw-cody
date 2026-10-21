@@ -257,6 +257,23 @@ afterEach(() => {
 });
 
 describe("loginMiniMaxPortalOAuth", () => {
+  it("delivers the pairing code before polling for credentials", async () => {
+    const deviceCode = vi.fn(async () => {});
+    stubOAuthFetch(
+      (_input, init) => authorizationResponse(init),
+      () => {
+        expect(deviceCode).toHaveBeenCalledExactlyOnceWith({
+          title: "MiniMax OAuth",
+          code: "CODE",
+          expiresInMinutes: 1,
+          message: "Enter this one-time code to approve access.",
+        });
+        return tokenResponse();
+      },
+    );
+    await loginMiniMax({ deviceCode });
+  });
+
   it.each([
     [3600, 1_700_003_600_000],
     [1_700_000_000, 1_700_000_000_000],
@@ -394,7 +411,7 @@ describe("loginMiniMaxPortalOAuth", () => {
     expect(textSpy).not.toHaveBeenCalled();
   });
 
-  it("uses MiniMax account OAuth endpoints directly for global and CN login", async () => {
+  it("records the issuing account endpoint for Global and CN credentials", async () => {
     for (const [region, expectedHosts] of [
       [
         "global",
@@ -419,6 +436,7 @@ describe("loginMiniMaxPortalOAuth", () => {
       await expect(loginMiniMax({ region })).resolves.toMatchObject({
         access: "access",
         refresh: "refresh",
+        tokenEndpoint: expectedHosts[1],
       });
       expect(
         fetchMock.mock.calls.map(([input]) =>

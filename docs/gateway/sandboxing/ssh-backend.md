@@ -11,11 +11,29 @@ The remote utility contract, authentication material, and the remote-canonical w
 Use `backend: "ssh"` to sandbox `exec`, file tools, and media reads on an arbitrary SSH-accessible machine.
 
 The remote environment must provide `/bin/sh`, `python3`, and GNU-compatible
-`stat` (`-c`) and `readlink` (`-f`) for the filesystem bridge. These utilities
+`stat` (`-c`) and `readlink` (`-f`, `-n`) for the filesystem bridge. These utilities
 must be available to the non-interactive SSH command, not just an interactive
 login shell. The Gateway host does not need these remote utilities: a macOS or
 Windows Gateway can use an SSH target that supplies them. This is a remote
 utility contract, not a Linux-only Gateway requirement.
+
+Canonical workspace and parent-directory paths retain their whitespace, including
+embedded and trailing newlines, during remote reads and writes.
+Remove and rename operations follow in-mount parent-directory aliases while acting
+on the final entry itself. Removing a final symlink leaves its target intact;
+parents that resolve outside the allowed mounts are rejected.
+
+New remote workspaces are uploaded into a private staging directory before
+publication. When supported, fs-safe publishes with atomic no-replace directory
+rename: `renameat2` on Linux or `renameatx_np` on macOS.
+
+On Linux filesystems that reject `RENAME_NOREPLACE`, including gVisor volume
+mounts, fs-safe checks that the destination is absent and falls back to directory
+rename. This never exposes an empty claim as a completed workspace. Targets
+present at the check are preserved, and file or nonempty-directory competitors
+cannot be replaced. An empty directory created after that check can be replaced.
+macOS still requires its native no-replace primitive. Existing remote workspaces
+continue to be adopted without reseeding.
 
 ```json5
 {

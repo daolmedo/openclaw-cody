@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { parseSystemdExecStart } from "./systemd-exec-start.mjs";
 
@@ -21,13 +20,17 @@ function parseWords(value) {
   }
 }
 
-function readUnitContent(unitPath, missingUnitName) {
+function readUnitContent(unitPath, missingUnitName, missingUnitFile = false) {
   try {
     return fs.readFileSync(unitPath, "utf8");
   } catch (error) {
-    // Only a validated LoadUnit request may confirm absence; other read errors stay unavailable.
+    // Only a validated unit request may confirm absence; other read errors stay unavailable.
     if (missingUnitName && error.code === "ENOENT") {
-      process.stderr.write(`Call failed: Unit ${missingUnitName} not found.\n`);
+      process.stderr.write(
+        missingUnitFile
+          ? `Call failed: Unit file ${missingUnitName} does not exist.\n`
+          : `Call failed: Unit ${missingUnitName} not found.\n`,
+      );
       process.exit(1);
     }
     return fail();
@@ -46,49 +49,63 @@ function writeProperties(properties) {
   process.stdout.write(properties.map((property) => JSON.stringify(property)).join("\n") + "\n");
 }
 
-const options = args.slice(1, args[2]?.startsWith("--") ? 3 : 2);
-if (
-  args[0] !== "--user" ||
-  !options.includes("--json=short") ||
-  options.some((option) => !["--json=short", "--auto-start=no"].includes(option)) ||
-  new Set(options).size !== options.length
-) {
+if (args[0] !== "--user") {
   fail();
 }
-
-const invocation = args.slice(1 + options.length);
-const passive = options.includes("--auto-start=no");
-// This fixture manager deliberately keeps every installed service inactive.
-// Its broker identity belongs to the fixture account, never an environment selector.
-const owner = ":1.1";
+const flags = new Set();
+let commandIndex = 1;
+while (args[commandIndex]?.startsWith("--")) {
+  const flag = args[commandIndex++];
+  if (!["--json=short", "--auto-start=no"].includes(flag) || flags.has(flag)) {
+    fail();
+  }
+  flags.add(flag);
+}
+// This fixture owns a stopped, loaded user service and never starts a manager.
+const owner = ":1.42";
 const bus = "org.freedesktop.DBus";
-const matches = (expected) =>
-  invocation.length === expected.length &&
-  invocation.every((value, index) => value === expected[index]);
-if (passive && matches(["call", bus, "/org/freedesktop/DBus", bus, "GetNameOwner", "s", manager])) {
-  writeProperties([{ type: "s", data: [owner] }]);
+const invocation = args.slice(commandIndex);
+if (
+  flags.has("--auto-start=no") &&
+  flags.size === 1 &&
+  invocation.length === 5 &&
+  invocation.join(" ") === `get-property ${manager} ${rootObjectPath} ${manager}.Manager Version`
+) {
+  process.stdout.write('s "252.39-1~deb12u2"\n');
   process.exit(0);
 }
-if (
-  passive &&
-  matches(["call", bus, "/org/freedesktop/DBus", bus, "GetConnectionUnixUser", "s", owner])
-) {
-  writeProperties([{ type: "u", data: [os.userInfo().uid] }]);
-  process.exit(0);
+if (!flags.has("--json=short")) {
+  fail();
 }
 const unitName = `${process.env.OPENCLAW_SYSTEMD_UNIT || "openclaw-gateway"}`.replace(
   /(?:\.service)?$/u,
   ".service",
 );
 const unitPath = path.join(process.env.HOME, ".config/systemd/user", unitName);
-const loadedPath = `${unitPath}.loaded-unit`;
 if (invocation[0] === "call") {
   const [command, destination, objectPath, interfaceName, method, signature, requestedUnit] =
     invocation;
   if (
+    invocation.length === 7 &&
+    destination === bus &&
+    objectPath === "/org/freedesktop/DBus" &&
+    interfaceName === bus &&
+    signature === "s"
+  ) {
+    if (method === "GetNameOwner" && requestedUnit === manager) {
+      writeProperties([{ type: "s", data: [owner] }]);
+      process.exit(0);
+    }
+    if (method === "GetConnectionUnixUser" && requestedUnit === owner) {
+      writeProperties([{ type: "u", data: [process.getuid()] }]);
+      process.exit(0);
+    }
+    fail();
+  }
+  if (
     invocation.length !== 7 ||
     command !== "call" ||
-    (destination !== manager && (!passive || destination !== owner)) ||
+    ![manager, owner].includes(destination) ||
     objectPath !== rootObjectPath ||
     interfaceName !== `${manager}.Manager` ||
     !["LoadUnit", "GetUnit", "GetUnitFileState"].includes(method) ||
@@ -98,29 +115,16 @@ if (invocation[0] === "call") {
   ) {
     fail();
   }
-  if (method === "GetUnitFileState") {
-    if (!fs.existsSync(unitPath)) {
-      process.stderr.write(`Call failed: Unit file ${unitName} does not exist.\n`);
-      process.exit(1);
-    }
-    writeProperties([{ type: "s", data: ["enabled"] }]);
-    process.exit(0);
-  }
-  if (method === "LoadUnit") {
-    const content = readUnitContent(unitPath, unitName);
-    if (!fs.existsSync(loadedPath)) fs.writeFileSync(loadedPath, content);
-  } else if (!fs.existsSync(loadedPath)) {
-    process.stderr.write(`Call failed: Unit ${unitName} not loaded.\n`);
-    process.exit(1);
-  }
-  writeProperties([{ type: "o", data: [`${rootObjectPath}/unit/${encodeUnitName(unitName)}`] }]);
+  readUnitContent(unitPath, unitName, method === "GetUnitFileState");
+  writeProperties([
+    method === "GetUnitFileState"
+      ? { type: "s", data: ["enabled"] }
+      : { type: "o", data: [`${rootObjectPath}/unit/${encodeUnitName(unitName)}`] },
+  ]);
   process.exit(0);
 }
 
-if (
-  invocation[0] !== "get-property" ||
-  (invocation[1] !== manager && (!passive || invocation[1] !== owner))
-) {
+if (invocation[0] !== "get-property" || ![manager, owner].includes(invocation[1])) {
   fail();
 }
 
@@ -128,55 +132,50 @@ if (invocation[2] !== `${rootObjectPath}/unit/${encodeUnitName(unitName)}`) {
   fail();
 }
 
-const content = readUnitContent(loadedPath);
-const names = invocation.slice(4).join(" ");
-if (passive && invocation[1] === owner) {
-  if (
-    invocation[3] === `${manager}.Unit` &&
-    names ===
-      "Id LoadState ActiveState SubState StartLimitBurst ActiveEnterTimestampMonotonic InactiveEnterTimestampMonotonic"
-  ) {
-    writeProperties([
-      { type: "s", data: unitName },
-      { type: "s", data: "loaded" },
-      { type: "s", data: "inactive" },
-      { type: "s", data: "dead" },
-      { type: "u", data: 5 },
-      { type: "t", data: 0 },
-      { type: "t", data: 0 },
-    ]);
-    process.exit(0);
-  }
-  if (
-    invocation[3] === `${manager}.Service` &&
-    names ===
-      "Result NRestarts MainPID ExecMainStatus ExecMainCode KillMode TasksCurrent MemoryCurrent"
-  ) {
-    writeProperties([
-      { type: "s", data: "success" },
-      { type: "u", data: 0 },
-      { type: "u", data: 0 },
-      { type: "i", data: 0 },
-      { type: "i", data: 0 },
-      { type: "s", data: "control-group" },
-      { type: "t", data: 0 },
-      { type: "t", data: 0 },
-    ]);
-    process.exit(0);
-  }
-}
+const content = readUnitContent(unitPath);
+const requestedProperties = invocation.slice(4).join(" ");
 if (invocation[3] === `${manager}.Unit`) {
-  if (
-    invocation.length !== 8 ||
-    invocation.slice(4).join(" ") !== "FragmentPath DropInPaths NeedDaemonReload LoadState"
-  ) {
+  const properties = {
+    Id: { type: "s", data: unitName },
+    LoadState: { type: "s", data: "loaded" },
+    ActiveState: { type: "s", data: "inactive" },
+    SubState: { type: "s", data: "dead" },
+    StartLimitBurst: { type: "u", data: 5 },
+    ActiveEnterTimestampMonotonic: { type: "t", data: 0 },
+    InactiveEnterTimestampMonotonic: { type: "t", data: 1 },
+    UnitFileState: { type: "s", data: "enabled" },
+    RefuseManualStart: { type: "b", data: false },
+    CanStart: { type: "b", data: true },
+    FragmentPath: { type: "s", data: unitPath },
+    DropInPaths: { type: "as", data: [] },
+    NeedDaemonReload: { type: "b", data: false },
+  };
+  const names = invocation.slice(4);
+  if (!names.length || names.some((name) => !Object.hasOwn(properties, name))) {
     fail();
   }
+  writeProperties(names.map((name) => properties[name]));
+  process.exit(0);
+}
+const runtimeProperties =
+  "Result NRestarts MainPID ExecMainStatus ExecMainCode KillMode TasksCurrent MemoryCurrent";
+const includeControlGroup =
+  invocation.length === 13 && requestedProperties === `${runtimeProperties} ControlGroup`;
+if (
+  invocation[3] === `${manager}.Service` &&
+  ((invocation.length === 12 && requestedProperties === runtimeProperties) || includeControlGroup)
+) {
   writeProperties([
-    { type: "s", data: unitPath },
-    { type: "as", data: [] },
-    { type: "b", data: content !== readUnitContent(unitPath) },
-    { type: "s", data: "loaded" },
+    { type: "s", data: "success" },
+    { type: "u", data: 0 },
+    { type: "u", data: 0 },
+    { type: "i", data: 0 },
+    { type: "i", data: 0 },
+    { type: "s", data: "control-group" },
+    { type: "t", data: 0 },
+    { type: "t", data: 0 },
+    // This stopped fixture owns no native systemd cgroup.
+    ...(includeControlGroup ? [{ type: "s", data: "" }] : []),
   ]);
   process.exit(0);
 }

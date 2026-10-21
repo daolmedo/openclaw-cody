@@ -9,7 +9,7 @@ import type {
 } from "../../../../packages/gateway-protocol/src/index.js";
 import { GatewayRequestError, resolveGatewayErrorDetailCode } from "../../api/gateway.ts";
 import { applicationContext, type ApplicationContext } from "../../app/context.ts";
-import { showConfirmDialog } from "../../components/confirm-dialog.ts";
+import { showConfirmDialog, type ConfirmDialogOptions } from "../../components/confirm-dialog.ts";
 import {
   renderSettingsEmpty,
   renderSettingsPage,
@@ -20,6 +20,7 @@ import {
 import { t } from "../../i18n/index.ts";
 import { registerSettingsEnglish } from "../../i18n/locales/en-settings.ts";
 import { formatUiError } from "../../lib/format-error.ts";
+import type { GatewayConnectionScope } from "../../lib/gateway-connection-lifecycle.ts";
 import { canCallGatewayMethod, isGatewayMethodAdvertised } from "../../lib/gateway-methods.ts";
 import { showToast } from "../../lib/toast.ts";
 import { GatewayPageController } from "../../lit/gateway-page-controller.ts";
@@ -54,7 +55,9 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
   @state() private repositoriesLoading = false;
   @state() private buildError: string | null = null;
   @state() private preparing = false;
-  @state() private cancelling: string | null = null;
+  @state() private destroying: string | null = null;
+  /** Failed builds the operator cleared; the Gateway keeps their records until retention. */
+  private dismissed = new Set<string>();
   private refreshAgain = false;
   private pickerGeneration = 0;
   private pollTimer: ReturnType<typeof setTimeout> | undefined;
@@ -69,7 +72,8 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
       this.builds = [];
       this.failedBuilds = [];
       this.preparing = false;
-      this.cancelling = null;
+      this.destroying = null;
+      this.dismissed.clear();
       this.result = null;
       this.loading = false;
       this.recovering = null;
@@ -83,6 +87,16 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
 
   private canCall(method: string) {
     return canCallGatewayMethod(this.gateway.snapshot, method, "operator.admin");
+  }
+
+  private async confirm(options: ConfirmDialogOptions) {
+    const confirmation = new AbortController();
+    this.confirmation = confirmation;
+    const confirmed = await showConfirmDialog({ ...options, signal: confirmation.signal });
+    if (this.confirmation === confirmation) {
+      this.confirmation = null;
+    }
+    return confirmed;
   }
 
   private async load() {
@@ -117,7 +131,9 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
       );
       this.failedBuilds = builds.filter(
         (environment) =>
-          environment.worker && ["failed", "orphaned"].includes(environment.worker.state),
+          environment.worker &&
+          ["failed", "orphaned"].includes(environment.worker.state) &&
+          !this.dismissed.has(environment.id),
       );
       if (this.failedBuilds.length) {
         this.notice = null;
@@ -251,11 +267,7 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
               : code === "invalid_profile" || code === "profile_not_found"
                 ? t("cloudWorkersPage.snapshots.invalidProfile")
                 : formatUiError(error);
-        if (fromDialog) {
-          this.buildError = message;
-        } else {
-          this.error = message;
-        }
+        this[fromDialog ? "buildError" : "error"] = message;
       }
     } finally {
       if (this.gateway.isCurrent(scope)) {
@@ -264,59 +276,57 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
     }
   }
 
-  private async cancelBuild(environment: EnvironmentSummary) {
+  /** Both build actions call environments.destroy; only dismissal clears a terminal row. */
+  private async destroyBuild(environment: EnvironmentSummary, dismiss: boolean) {
     const scope = this.gateway.capture();
-    if (!scope || this.cancelling || this.confirmation || !this.canCall("environments.destroy")) {
+    if (!scope || this.destroying || this.confirmation || !this.canCall("environments.destroy")) {
       return;
     }
-    const confirmation = new AbortController();
-    this.confirmation = confirmation;
-    const confirmed = await showConfirmDialog({
-      title: t("cloudWorkersPage.snapshots.cancelBuild"),
-      message: t("cloudWorkersPage.snapshots.cancelBuildMessage"),
+    const confirmed = await this.confirm({
+      title: t(`cloudWorkersPage.snapshots.${dismiss ? "dismissBuild" : "cancelBuild"}`),
+      message: t(
+        `cloudWorkersPage.snapshots.${dismiss ? "dismissBuildMessage" : "cancelBuildMessage"}`,
+      ),
       details: environment.id,
-      confirmLabel: t("cloudWorkersPage.snapshots.cancelBuild"),
-      danger: true,
-      signal: confirmation.signal,
+      confirmLabel: t(`cloudWorkersPage.snapshots.${dismiss ? "dismiss" : "cancelBuild"}`),
+      danger: !dismiss,
     });
-    if (this.confirmation === confirmation) {
-      this.confirmation = null;
-    }
     if (!confirmed || !this.gateway.isCurrent(scope) || !this.canCall("environments.destroy")) {
       return;
     }
-    this.cancelling = environment.id;
+    this.destroying = environment.id;
     this.error = null;
     this.notice = null;
-    try {
+    await this.runSnapshotMutation(scope, "destroying", async () => {
       await scope.client.request("environments.destroy", { environmentId: environment.id });
       if (this.gateway.isCurrent(scope)) {
-        this.notice = t("cloudWorkersPage.snapshots.buildCancelled");
+        // The Gateway keeps a terminal build record until its retention window ends, so
+        // clearing the row is a local view decision that lasts until this page reloads.
+        if (dismiss) {
+          this.dismissed.add(environment.id);
+          this.failedBuilds = this.failedBuilds.filter((build) => build.id !== environment.id);
+        }
+        this.notice = t(
+          `cloudWorkersPage.snapshots.${dismiss ? "buildDismissed" : "buildCancelled"}`,
+        );
         await this.load();
       }
-    } catch (error) {
-      if (this.gateway.isCurrent(scope)) {
-        this.error = formatUiError(error);
-      }
-    } finally {
-      if (this.gateway.isCurrent(scope)) {
-        this.cancelling = null;
-      }
-    }
+    });
   }
 
   private renderBuildDialog() {
     if (!this.buildDialog) {
       return nothing;
     }
+    const profiles = this.result?.profiles ?? [];
+    const preparing = this.preparing;
     const valid =
-      this.result?.profiles.some(
-        (profile) => profile.id === this.buildProfile && profile.warmImages === "on",
-      ) && this.repositories.some((repository) => repository.root === this.buildProject);
+      profiles.some((profile) => profile.id === this.buildProfile && profile.warmImages === "on") &&
+      this.repositories.some((repository) => repository.root === this.buildProject);
     return html`<openclaw-modal-dialog
       label=${t("cloudWorkersPage.snapshots.buildSnapshot")}
       @modal-cancel=${(event: Event) => {
-        if (this.preparing) {
+        if (preparing) {
           event.preventDefault();
         } else {
           this.closeBuildDialog();
@@ -331,15 +341,13 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
           <select
             class="settings-select"
             .value=${this.buildProfile}
-            ?disabled=${this.preparing}
-            @change=${(event: Event) => {
-              if (event.currentTarget instanceof HTMLSelectElement) {
-                this.buildProfile = event.currentTarget.value;
-              }
+            ?disabled=${preparing}
+            @change=${(event: Event & { currentTarget: HTMLSelectElement }) => {
+              this.buildProfile = event.currentTarget.value;
             }}
           >
             <option value="">${t("cloudWorkersPage.snapshots.chooseProfile")}</option>
-            ${this.result?.profiles.map((profile) => html`<option value=${profile.id} ?disabled=${profile.warmImages !== "on"}>${profile.id}${profile.warmImages === "on" ? "" : ` — ${profile.reason}`}</option>`)}
+            ${profiles.map((profile) => html`<option value=${profile.id} ?disabled=${profile.warmImages !== "on"}>${profile.id}${profile.warmImages === "on" ? "" : ` — ${profile.reason}`}</option>`)}
           </select>
         </label>
         <label class="field"
@@ -347,11 +355,9 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
           <select
             class="settings-select"
             .value=${this.buildProject}
-            ?disabled=${this.preparing || this.repositoriesLoading}
-            @change=${(event: Event) => {
-              if (event.currentTarget instanceof HTMLSelectElement) {
-                this.buildProject = event.currentTarget.value;
-              }
+            ?disabled=${preparing || this.repositoriesLoading}
+            @change=${(event: Event & { currentTarget: HTMLSelectElement }) => {
+              this.buildProject = event.currentTarget.value;
             }}
           >
             <option value="">
@@ -366,7 +372,7 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
           <button
             class="btn primary"
             type="button"
-            ?disabled=${!valid || this.preparing || !this.canCall("environments.prepare")}
+            ?disabled=${!valid || preparing || !this.canCall("environments.prepare")}
             @click=${() => void this.prepare(this.buildProfile, this.buildProject, true)}
           >
             ${t("cloudWorkersPage.snapshots.buildSnapshot")}
@@ -374,7 +380,7 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
           <button
             class="btn"
             type="button"
-            ?disabled=${this.preparing}
+            ?disabled=${preparing}
             @click=${() => this.closeBuildDialog()}
           >
             ${t("common.cancel")}
@@ -384,7 +390,7 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
     </openclaw-modal-dialog>`;
   }
 
-  private async recover(image: SnapshotImage) {
+  private async recoverCapture(image: SnapshotImage) {
     const scope = this.gateway.capture();
     const selector = image.capture?.selector;
     if (
@@ -398,19 +404,13 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
     ) {
       return;
     }
-    const confirmation = new AbortController();
-    this.confirmation = confirmation;
-    const confirmed = await showConfirmDialog({
+    const confirmed = await this.confirm({
       title: t("cloudWorkersPage.snapshots.recoverTitle"),
       message: t("cloudWorkersPage.snapshots.recoverMessage"),
       details: selector,
       confirmLabel: t("cloudWorkersPage.snapshots.recover"),
       requiredAcknowledgement: t("cloudWorkersPage.snapshots.acknowledgement"),
-      signal: confirmation.signal,
     });
-    if (this.confirmation === confirmation) {
-      this.confirmation = null;
-    }
     if (!confirmed) {
       return;
     }
@@ -421,7 +421,7 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
     this.recovering = selector;
     this.error = null;
     this.notice = null;
-    try {
+    await this.runSnapshotMutation(scope, "recovering", async () => {
       await scope.client.request("crabbox.images.recover", {
         selector,
         acknowledgeProviderCleanup: true,
@@ -430,15 +430,7 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
         this.notice = t("cloudWorkersPage.snapshots.recovered");
         await this.load();
       }
-    } catch (error) {
-      if (this.gateway.isCurrent(scope)) {
-        this.error = formatUiError(error);
-      }
-    } finally {
-      if (this.gateway.isCurrent(scope)) {
-        this.recovering = null;
-      }
-    }
+    });
   }
 
   private deleteReason(image: SnapshotImage) {
@@ -478,21 +470,15 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
       return;
     }
     this.mutating = checkpointId;
-    try {
+    await this.runSnapshotMutation(scope, "mutating", async () => {
       if (action !== "pin") {
-        const confirmation = new AbortController();
-        this.confirmation = confirmation;
-        const confirmed = await showConfirmDialog({
+        const confirmed = await this.confirm({
           title: t(`cloudWorkersPage.snapshots.${action}Title`),
           message: t(`cloudWorkersPage.snapshots.${action}Message`),
           details: checkpointId,
           confirmLabel: t(`cloudWorkersPage.snapshots.${action}`),
           danger: action === "delete",
-          signal: confirmation.signal,
         });
-        if (this.confirmation === confirmation) {
-          this.confirmation = null;
-        }
         if (!confirmed) {
           return;
         }
@@ -518,15 +504,40 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
         this.notice = notice;
         await this.load();
       }
+    });
+  }
+
+  private async runSnapshotMutation(
+    scope: GatewayConnectionScope,
+    busy: "mutating" | "recovering" | "destroying",
+    mutate: () => Promise<void>,
+  ) {
+    try {
+      await mutate();
     } catch (error) {
       if (this.gateway.isCurrent(scope)) {
-        showToast({ message: formatUiError(error) });
+        if (busy === "mutating") {
+          showToast({ message: formatUiError(error) });
+        } else {
+          this.error = formatUiError(error);
+        }
       }
     } finally {
       if (this.gateway.isCurrent(scope)) {
-        this.mutating = null;
+        this[busy] = null;
       }
     }
+  }
+
+  private renderBuildRow(environment: EnvironmentSummary) {
+    // Orphaned records still track provider artifacts awaiting cleanup, so only a failed
+    // build offers dismissal; an active one still offers cancellation.
+    const action = !this.canCall("environments.destroy")
+      ? {}
+      : environment.worker?.state === "failed"
+        ? { onDismiss: () => void this.destroyBuild(environment, true) }
+        : { onCancel: () => void this.destroyBuild(environment, false) };
+    return renderSnapshotBuildRow(environment, { busy: this.destroying !== null, ...action });
   }
 
   private renderImage(image: SnapshotImage, showMachineFacts: boolean) {
@@ -546,7 +557,7 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
         ? () => void this.mutateImage(image, "delete")
         : undefined,
       onRecover: this.canCall("crabbox.images.recover")
-        ? () => void this.recover(image)
+        ? () => void this.recoverCapture(image)
         : undefined,
       onRebuild:
         projectRoot &&
@@ -560,12 +571,12 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
     });
   }
 
-  private renderImages(result: SnapshotsResult) {
+  private renderImages(result: SnapshotsResult | null) {
     const groups = new Map<
       string | undefined,
       { profile?: SnapshotProfile; images: SnapshotImage[]; builds: EnvironmentSummary[] }
-    >(result.profiles.map((profile) => [profile.id, { profile, images: [], builds: [] }]));
-    for (const image of result.images) {
+    >((result?.profiles ?? []).map((profile) => [profile.id, { profile, images: [], builds: [] }]));
+    for (const image of result?.images ?? []) {
       const group = groups.get(image.profileId) ?? { images: [], builds: [] };
       group.images.push(image);
       groups.set(image.profileId, group);
@@ -582,36 +593,42 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
       ),
     );
     return html`
-      ${renderSettingsSummary([
-        {
-          label: t("cloudWorkersPage.snapshots.images"),
-          value: result.images.filter((image) => image.checkpointId).length,
-        },
-        {
-          label: t("cloudWorkersPage.snapshots.building"),
-          value:
-            this.builds.length +
-            result.images.filter(
-              (image) =>
-                image.capture &&
-                image.capture.phase !== "uncertain" &&
-                (!image.capture.leaseId || !buildLeases.has(image.capture.leaseId)),
-            ).length,
-        },
-        {
-          label: t("cloudWorkersPage.snapshots.held"),
-          value: result.images.filter((image) => image.held).length,
-        },
-        {
-          label: t("cloudWorkersPage.snapshots.attention"),
-          value:
-            this.failedBuilds.length +
-            result.images.filter(
-              (image) =>
-                image.retirement || image.capture?.phase === "uncertain" || image.capture?.stale,
-            ).length,
-        },
-      ])}
+      ${
+        result
+          ? renderSettingsSummary([
+              {
+                label: t("cloudWorkersPage.snapshots.images"),
+                value: result.images.filter((image) => image.checkpointId).length,
+              },
+              {
+                label: t("cloudWorkersPage.snapshots.building"),
+                value:
+                  this.builds.length +
+                  result.images.filter(
+                    (image) =>
+                      image.capture &&
+                      image.capture.phase !== "uncertain" &&
+                      (!image.capture.leaseId || !buildLeases.has(image.capture.leaseId)),
+                  ).length,
+              },
+              {
+                label: t("cloudWorkersPage.snapshots.held"),
+                value: result.images.filter((image) => image.held).length,
+              },
+              {
+                label: t("cloudWorkersPage.snapshots.attention"),
+                value:
+                  this.failedBuilds.length +
+                  result.images.filter(
+                    (image) =>
+                      image.retirement ||
+                      image.capture?.phase === "uncertain" ||
+                      image.capture?.stale,
+                  ).length,
+              },
+            ])
+          : nothing
+      }
       ${
         groups.size
           ? [...groups].map(([id, group]) => {
@@ -641,14 +658,14 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
                   count: group.images.length + group.builds.length,
                 },
                 group.images.length || group.builds.length
-                  ? html`${group.builds.map((entry) => renderSnapshotBuildRow(entry, this.cancelling !== null, this.canCall("environments.destroy") ? () => void this.cancelBuild(entry) : undefined))}${group.images.map((entry) => this.renderImage(entry, mixedMetadata))}`
+                  ? html`${group.builds.map((entry) => this.renderBuildRow(entry))}${group.images.map((entry) => this.renderImage(entry, mixedMetadata))}`
                   : renderSettingsEmpty(t("cloudWorkersPage.snapshots.profileEmpty")),
               );
             })
           : renderSettingsEmpty(t("cloudWorkersPage.snapshots.empty"))
       }
       ${
-        result.legacyLeases.length
+        result?.legacyLeases.length
           ? renderSettingsSection(
               {
                 title: t("cloudWorkersPage.snapshots.migration"),
@@ -694,7 +711,7 @@ class CloudWorkerSnapshots extends OpenClawLightDomElement {
       )}
       ${this.error ? html`<div class="callout warning" role="alert">${this.error}</div>` : nothing}
       ${this.notice ? html`<div class="callout" role="status">${this.notice}</div>` : nothing}
-      ${this.result ? this.renderImages(this.result) : this.loading ? renderSettingsEmpty(t("common.loading")) : nothing}
+      ${this.result || this.builds.length || this.failedBuilds.length ? this.renderImages(this.result) : this.loading ? renderSettingsEmpty(t("common.loading")) : nothing}
       <openclaw-cloud-worker-snapshot-policy></openclaw-cloud-worker-snapshot-policy>
       ${this.renderBuildDialog()}
     `);

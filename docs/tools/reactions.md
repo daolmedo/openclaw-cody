@@ -9,6 +9,8 @@ title: "Reactions"
 The agent adds and removes emoji reactions with the `message` tool's `react`
 action. Behavior varies by channel.
 
+[Control UI reactions](/concepts/multi-user#reactions) on channel-origin prompts mirror the bot's reaction through the same `react` action.
+
 ## How it works
 
 ```json
@@ -96,7 +98,7 @@ action. Behavior varies by channel.
 Per-channel `reactionLevel` throttles how often the agent sends its own
 reactions. Values: `off`, `ack`, `minimal`, or `extensive`.
 
-- [Telegram reaction notifications](/channels/telegram#feature-reference) - `channels.telegram.reactionLevel` (default `minimal`)
+- [Telegram reaction level](/channels/telegram#feature-reference) - `channels.telegram.reactionLevel` (default `minimal`)
 - [WhatsApp reaction level](/channels/whatsapp#reaction-level) - `channels.whatsapp.reactionLevel` (default `minimal`)
 - [Signal reactions](/channels/signal#reactions-message-tool) - `channels.signal.reactionLevel` (default `minimal`)
 

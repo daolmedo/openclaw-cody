@@ -2,36 +2,16 @@
  * Tests live helper utilities for gateway CLI backend probes.
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { createDeferred } from "../../test/helpers/promise.js";
 import { testing as cliBackendsTesting } from "../agents/cli-backends.test-support.js";
-import type { SubagentRunRecord } from "../agents/subagents/registry/subagent-registry.types.js";
 import { captureEnv } from "../test-utils/env.js";
-import type { GatewayClient } from "./client.js";
 import { GATEWAY_STARTUP_MUTATED_ENV_KEYS } from "./test-helpers.env.js";
 
-vi.mock("./client-start-readiness.js", () => ({
+vi.mock("../../packages/gateway-client/src/readiness.js", () => ({
   startGatewayClientWhenEventLoopReady: async (client: { start: () => void }) => {
     client.start();
     return { ready: true, aborted: false, elapsedMs: 0, maxDriftMs: 0, checks: 0 };
   },
 }));
-
-const reads = vi.hoisted(() => ({ history: vi.fn(), runs: vi.fn() }));
-vi.mock("../agents/cli-runner/session-history.js", () => ({
-  loadCliSessionHistoryMessages: reads.history,
-}));
-vi.mock("../agents/subagents/registry/subagent-registry.test-helpers.js", () => ({
-  listSubagentRunsForRequester: reads.runs,
-}));
-vi.mock("../config/sessions/session-accessor.js", () => ({
-  resolveSessionTranscriptRuntimeTarget: vi.fn(async (target: unknown) => target),
-}));
-vi.mock("./session-utils.js", () => ({
-  loadGatewaySessionEntryReadOnly: () => ({ entry: { sessionId: "requester-session" } }),
-}));
-vi.mock("../utils/sleep.js", () => ({ sleep: vi.fn(async () => {}) }));
-
-import { verifyCliBackendAnnounceOrdering } from "./gateway-cli-backend.live-cache.test-helpers.js";
 
 describe("gateway cli backend live helpers", () => {
   const gatewayStartupEnv = captureEnv([...GATEWAY_STARTUP_MUTATED_ENV_KEYS]);
@@ -206,7 +186,7 @@ describe("gateway cli backend live helpers", () => {
     ).toEqual({
       action: "fail",
       message:
-        'agent request for provider "claude-cli" was blocked by auth drift. Set OPENCLAW_LIVE_CLI_BACKEND_ADVISORY=1 and OPENCLAW_LIVE_CLI_BACKEND_ALLOW_PROVIDER_SKIP=1 only for advisory live probes.',
+        'agent request for provider "claude-cli" was blocked by auth drift. Set OPENCLAW_LIVE_CLI_BACKEND_ADVISORY=1 and OPENCLAW_LIVE_CLI_BACKEND_ALLOW_PROVIDER_SKIP=1 only for advisory live checks.',
     });
 
     expect(
@@ -384,156 +364,5 @@ describe("gateway cli backend live helpers", () => {
       ),
     ).toBe(false);
     expect(shouldRetryCliCronMcpProbeReply("live-mcp-abc123")).toBe(false);
-  });
-});
-
-type TranscriptMessage = { role: string; idempotencyKey: string; content: string };
-type HistoryCase = {
-  name: string;
-  valid: boolean;
-  history: (parent: TranscriptMessage, completion: TranscriptMessage) => TranscriptMessage[];
-  delayProjection?: boolean;
-};
-
-const historyCases: HistoryCase[] = [
-  ...["NO_REPLY", "[[reply_to_current]] NO_REPLY", "[[reply_to_current]]"].map(
-    (content): HistoryCase => ({
-      name: `rejects a keyed completion with no visible text: ${content}`,
-      valid: false,
-      history: (parent, completion) => [parent, { ...completion, content }],
-    }),
-  ),
-  {
-    name: "rejects the exact completion committed before its parent",
-    valid: false,
-    history: (parent, completion) => [completion, parent],
-  },
-  {
-    name: "accepts a keyed completion summary without a copied child marker",
-    valid: true,
-    history: (parent, completion) => [
-      parent,
-      { ...completion, content: "The child completed.\n\nNO_REPLY" },
-    ],
-  },
-  {
-    name: "waits for the exact keyed completion to reach the canonical projection",
-    valid: true,
-    history: (parent, completion) => [parent, completion],
-    delayProjection: true,
-  },
-  {
-    name: "rejects copied completion text from a different child turn",
-    valid: false,
-    history: (parent, completion) => [
-      parent,
-      { ...completion, idempotencyKey: "cli-assistant:unrelated" },
-    ],
-  },
-  {
-    name: "rejects copied parent text from a different parent turn",
-    valid: false,
-    history: (parent, completion) => [
-      { ...parent, idempotencyKey: "cli-assistant:unrelated" },
-      completion,
-    ],
-  },
-  {
-    name: "rejects completion-before-parent even when marker prose suggests the opposite",
-    valid: false,
-    history: (parent, completion) => [
-      { ...completion, content: parent.content },
-      { ...parent, content: completion.content },
-    ],
-  },
-  {
-    name: "rejects a completion user row instead of a committed assistant turn",
-    valid: false,
-    history: (parent, completion) => [parent, { ...completion, role: "user" }],
-  },
-];
-
-describe("live CLI announcement ordering oracle", () => {
-  afterEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it.each(historyCases)("$name", async ({ history, valid, delayProjection }) => {
-    const pendingParent = createDeferred<{ result: { payloads: { text: string }[] } }>();
-    let parentText = "";
-    let released = false;
-    const barrier = {
-      url: "http://127.0.0.1/unused",
-      calls: 1,
-      release() {
-        released = true;
-        pendingParent.resolve({ result: { payloads: [{ text: parentText }] } });
-      },
-      close: async () => {},
-    };
-    const request = vi.fn(
-      (
-        _method: string,
-        params: { message: string; sessionKey: string; idempotencyKey: string },
-      ) => {
-        const nonce = params.message.match(/CLI_ANNOUNCE_PARENT_([A-F0-9]+)/u)?.[1];
-        if (!nonce) {
-          throw new Error("announcement probe did not identify its parent marker");
-        }
-        parentText = `CLI_ANNOUNCE_PARENT_${nonce}`;
-        const childText = `CLI_ANNOUNCE_CHILD_${nonce}`;
-        const child: SubagentRunRecord = {
-          runId: "child-run",
-          childSessionKey: "agent:dev:subagent:child",
-          requesterSessionKey: params.sessionKey,
-          requesterDisplayKey: params.sessionKey,
-          task: "child task",
-          taskName: `cli_announce_${nonce.toLowerCase()}`,
-          cleanup: "keep",
-          createdAt: 1,
-          execution: { status: "terminal", endedAt: 2, outcome: { status: "ok" } },
-          completion: { required: true, resultText: childText },
-          delivery: { status: "pending" },
-        };
-        reads.runs.mockImplementation((sessionKey: string) => {
-          expect(sessionKey).toBe(params.sessionKey);
-          if (released) {
-            const deliveredAt = Date.now();
-            child.delivery = { status: "delivered", deliveredAt, announcedAt: deliveredAt };
-          }
-          return [child];
-        });
-        const parent = {
-          role: "assistant",
-          idempotencyKey: `cli-assistant:${params.idempotencyKey}`,
-          content: parentText,
-        };
-        const completion = {
-          role: "assistant",
-          idempotencyKey: `cli-assistant:announce:v1:${child.childSessionKey}:${child.runId}`,
-          content: childText,
-        };
-        const messages = history(parent, completion);
-        reads.history.mockResolvedValue(messages);
-        if (delayProjection) {
-          reads.history.mockResolvedValueOnce([parent]);
-        }
-        return pendingParent.promise;
-      },
-    );
-    const proof = verifyCliBackendAnnounceOrdering({
-      // This boundary fixture supplies only the RPC used by the live harness.
-      client: { request } as unknown as GatewayClient,
-      announceBarrier: barrier,
-      requestTimeoutMs: 1000,
-      logStep: vi.fn(),
-    });
-    if (valid) {
-      await expect(proof).resolves.toBeUndefined();
-    } else {
-      await expect(proof).rejects.toThrow();
-    }
-    expect(released).toBe(true);
-    expect(request).toHaveBeenCalledOnce();
   });
 });

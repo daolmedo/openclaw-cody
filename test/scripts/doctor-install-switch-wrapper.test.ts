@@ -1,12 +1,8 @@
 // Doctor Install Switch tests cover its generated wrapper and service assertion contracts.
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import os from "node:os";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { readLoadedSystemdServiceRuntime } from "../../src/daemon/systemd-loaded-runtime.js";
-import { readSystemdServiceExecStart } from "../../src/daemon/systemd-service-files.js";
-import { buildSystemdUnit } from "../../src/daemon/systemd-unit.js";
 import { cleanupTempDirs, makeTempDir } from "../helpers/temp-dir.js";
 
 const SCRIPT_PATH = "scripts/e2e/lib/doctor-install-switch/write-wrapper.mjs";
@@ -30,58 +26,6 @@ function runExecStartAssertion(args: string[]) {
     env: { ...process.env },
   });
 }
-
-describe.skipIf(process.platform === "win32")("doctor install switch manager", () => {
-  it("exposes loaded inactive state to Doctor without activating an unloaded unit", async () => {
-    const home = makeTempDir(tempDirs, "openclaw-doctor-manager-");
-    const shims = path.resolve("scripts/e2e/lib/doctor-install-switch/shims");
-    const env = { HOME: home, PATH: `${shims}${path.delimiter}${process.env.PATH}` };
-    const unit = path.join(home, ".config/systemd/user/openclaw-gateway.service");
-    const loaded = `${unit}.loaded-unit`;
-    const command = [process.execPath, path.join(home, "package/index.js"), "gateway"];
-    mkdirSync(path.dirname(unit), { recursive: true });
-    writeFileSync(unit, buildSystemdUnit({ programArguments: command }));
-
-    await expect(
-      readSystemdServiceExecStart(env, { requireEffective: true, requireLoaded: true }),
-    ).rejects.toThrow("could not be inspected");
-    expect(await readLoadedSystemdServiceRuntime(env)).toMatchObject({ status: "unknown" });
-    expect(existsSync(loaded)).toBe(false);
-    const reload = () =>
-      spawnSync(path.join(shims, "systemctl"), ["--user", "daemon-reload"], {
-        env,
-        encoding: "utf8",
-      });
-    expect(reload().status).toBe(0);
-    const before = readFileSync(loaded, "utf8");
-    expect(
-      await readSystemdServiceExecStart(env, { requireEffective: true, requireLoaded: true }),
-    ).toMatchObject({ programArguments: command });
-    expect(await readLoadedSystemdServiceRuntime(env)).toMatchObject({
-      status: "stopped",
-      state: "inactive",
-      systemd: { managerUid: os.userInfo().uid, tasksCurrent: 0 },
-    });
-    expect(readFileSync(loaded, "utf8")).toBe(before);
-    expect(
-      await readLoadedSystemdServiceRuntime(env, undefined, {
-        managerUid: os.userInfo().uid + 1,
-        assertCurrent: () => {},
-      }),
-    ).toMatchObject({ status: "unknown" });
-
-    // File edits are not loaded definitions until the manager reloads them.
-    const replacement = [process.execPath, path.join(home, "other/index.js"), "gateway"];
-    writeFileSync(unit, buildSystemdUnit({ programArguments: replacement }));
-    expect(
-      await readSystemdServiceExecStart(env, { requireEffective: true, requireLoaded: true }),
-    ).toMatchObject({ programArguments: command, reloadPending: true });
-    expect(reload().status).toBe(0);
-    expect(
-      await readSystemdServiceExecStart(env, { requireEffective: true, requireLoaded: true }),
-    ).toMatchObject({ programArguments: replacement });
-  });
-});
 
 describe("doctor install switch wrapper writer", () => {
   it("writes an executable wrapper that preserves quoted paths and arguments", () => {

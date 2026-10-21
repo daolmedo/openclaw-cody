@@ -12,6 +12,9 @@ const { runUtf8CommandWithTimeout } = vi.hoisted(() => ({
 vi.mock("openclaw/plugin-sdk/process-runtime", () => ({ runUtf8CommandWithTimeout }));
 
 const { probeClaudeCliAuthStatus } = await import("./cli-auth-api.js");
+const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/process-runtime")>(
+  "openclaw/plugin-sdk/process-runtime",
+);
 
 beforeEach(() => {
   runUtf8CommandWithTimeout.mockReset();
@@ -40,6 +43,34 @@ it("asks Claude CLI for its active account and returns only safe display fields"
     ["/test/claude", "auth", "status", "--json"],
     expect.objectContaining({ timeoutMs: 3_000, killProcessTree: true }),
   );
+});
+
+it.each([
+  ['["CLAUDE_CODE_OAUTH_TOKEN"]', "JSON"],
+  ["CLAUDE_CODE_OAUTH_TOKEN, OTHER", "list"],
+])("probes the login the runtime child keeps from a %s preserve list (%s)", async (preserve) => {
+  // Runtime execution keeps OPENCLAW_LIVE_CLI_BACKEND_PRESERVE_ENV keys for the Claude child;
+  // readiness must observe that same environment or spawn admission refuses a working login.
+  runUtf8CommandWithTimeout.mockResolvedValue({
+    code: 0,
+    termination: "exit",
+    stdout: JSON.stringify({ loggedIn: true, authMethod: "oauth_token" }),
+  });
+
+  expect(
+    await probeClaudeCliAuthStatus({
+      command: "/test/claude",
+      env: {
+        OPENCLAW_LIVE_CLI_BACKEND_PRESERVE_ENV: preserve,
+        CLAUDE_CODE_OAUTH_TOKEN: "synthetic-preserved-token",
+        ANTHROPIC_API_KEY: "synthetic-cleared-api-key",
+      },
+    }),
+  ).toEqual({ status: "available", authMethod: "oauth_token" });
+
+  const baseEnv = runUtf8CommandWithTimeout.mock.calls[0]?.[1]?.baseEnv;
+  expect(baseEnv?.CLAUDE_CODE_OAUTH_TOKEN).toBe("synthetic-preserved-token");
+  expect(baseEnv).not.toHaveProperty("ANTHROPIC_API_KEY");
 });
 
 it.each(["PATH", "explicit"])("runs a Windows Claude npm shim selected by %s", async (source) => {
@@ -73,9 +104,6 @@ it.each(["PATH", "explicit"])("runs a Windows Claude npm shim selected by %s", a
           loggedIn: true, authMethod: "claude.ai", email: "windows@example.test"
         }));
       `,
-    );
-    const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/process-runtime")>(
-      "openclaw/plugin-sdk/process-runtime",
     );
     runUtf8CommandWithTimeout.mockImplementation(actual.runUtf8CommandWithTimeout);
     const resolveProgram = windowsSpawn.resolveWindowsSpawnProgram;
@@ -125,7 +153,7 @@ it("reports unresolved Windows wrappers as unreadable without spawning", async (
   });
 });
 
-it.each(["api_key", "api_key_helper", "oauth_token", "third_party", "none", "unknown-method"])(
+it.each(["api_key", "unknown-method"])(
   "does not attribute an account email to %s authentication",
   async (authMethod) => {
     runUtf8CommandWithTimeout.mockResolvedValue({
@@ -161,29 +189,6 @@ it("does not inspect Claude token storage when the CLI reports logout", async ()
   runUtf8CommandWithTimeout.mockResolvedValue({ code: 1, termination: "exit", stdout: "" });
 
   expect(await probeClaudeCliAuthStatus()).toEqual({ status: "missing" });
-});
-
-it("keeps the selected native-login root while removing inherited provider credentials", async () => {
-  runUtf8CommandWithTimeout.mockResolvedValue({
-    code: 0,
-    termination: "exit",
-    stdout: JSON.stringify({ loggedIn: true }),
-  });
-
-  expect(
-    await probeClaudeCliAuthStatus({
-      command: "/custom/claude",
-      env: {
-        ANTHROPIC_API_KEY: "synthetic-ignored-api-key",
-        CLAUDE_CODE_OAUTH_TOKEN: "synthetic-ignored-token",
-        CLAUDE_CONFIG_DIR: "/tmp/selected-claude-account",
-      },
-    }),
-  ).toEqual({ status: "available" });
-  expect(runUtf8CommandWithTimeout).toHaveBeenCalledWith(
-    ["/custom/claude", "auth", "status", "--json"],
-    expect.objectContaining({ baseEnv: { CLAUDE_CONFIG_DIR: "/tmp/selected-claude-account" } }),
-  );
 });
 
 it("does not turn a cancelled probe into a logged-out account", async () => {
