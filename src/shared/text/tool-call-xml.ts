@@ -1,20 +1,16 @@
 import { expectDefined } from "@openclaw/normalization-core";
-import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import {
   consumeLineBreak,
   skipHorizontalWhitespace,
   skipWhitespace,
 } from "../../../packages/tool-call-repair/src/grammar.js";
 import { findCodeRegions, isInsideCode } from "./code-regions.js";
+import { isGlmArgPayload } from "./glm-arg-key-payload.js";
 import { createConditionalTextProjector, type TextFilter } from "./text-projection.js";
+import { createQuotedStringScanner, parseXmlTagAt, type ParsedToolCallTag } from "./xml-tag-at.js";
 
-/**
- * Strip XML-style tool call tags that models sometimes emit as plain text.
- * This stateful pass hides content from an opening tag through the matching
- * closing tag, or to end-of-string if the stream was truncated mid-tag.
- */
 const TOOL_CALL_QUICK_RE =
-  /<\s*\/?\s*(?:antml:)?(?:tool_call|tool_result|function_calls?|function_response|function|tool_calls|invoke|parameter)\b/i;
+  /<\s*(?:\/\s*)?(?:(?:antml|mm):)?(?:tool_call|tool_result|function_calls?|function_response|function|tool_calls|invoke|parameter)\b/i;
 const TOOL_CALL_TAG_NAMES = new Set([
   "tool_call",
   "tool_result",
@@ -23,90 +19,52 @@ const TOOL_CALL_TAG_NAMES = new Set([
   "function_response",
   "function",
   "tool_calls",
+  "invoke",
   "antml:invoke",
   "antml:parameter",
+  "antml:function_calls",
+  "mm:tool_call",
+  "mm:function_calls",
+  "mm:invoke",
+  "mm:parameter",
 ]);
+const TOOL_CALL_PREFIX_NAMES = [...TOOL_CALL_TAG_NAMES, "parameter", "parameters", "arguments"];
 const TOOL_CALL_JSON_PAYLOAD_START_RE =
   /^(?:\s+[A-Za-z_:][-A-Za-z0-9_:.]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))*\s*(?:\r?\n\s*)?[[{]/;
 const TOOL_CALL_XML_PAYLOAD_START_RE =
-  /^\s*(?:\r?\n\s*)?<(?:antml:)?(?:function_call|tool_call|function|invoke|parameters?|arguments?)\b/i;
+  /^\s*(?:\r?\n\s*)?<(?:antml:|mm:)?(?:function_call|tool_call|function|invoke|parameters?|arguments?)\b/i;
 const NESTED_JSON_TOOL_CALL_PAYLOAD_START_RE = /^\s*(?:\r?\n\s*)?<(?:function_call|tool_call)\b/i;
 
 type ToolCallPayloadKind = "json" | "xml" | null;
 
-function createQuotedStringScanner(text: string, start: number): (end: number) => boolean {
-  let quoteChar: "'" | '"' | null = null;
-  let isEscaped = false;
-  // Candidate closing tags share one monotonic scan through their payload.
-  let cursor = start;
-  return (end) => {
-    for (; cursor < end; cursor += 1) {
-      const char = text[cursor];
-      if (quoteChar === null) {
-        if (char === '"' || char === "'") {
-          quoteChar = char;
-        }
-      } else if (isEscaped) {
-        isEscaped = false;
-      } else if (char === "\\") {
-        isEscaped = true;
-      } else if (char === quoteChar) {
-        quoteChar = null;
-      }
-    }
-    return quoteChar !== null;
-  };
-}
-
-interface ParsedToolCallTag {
-  contentStart: number;
-  end: number;
-  isClose: boolean;
-  isSelfClosing: boolean;
-  tagName: string;
-  isTruncated: boolean;
-}
-
-// Match only the tag head; quote-aware scanning owns the close boundary.
-const XML_TAG_HEAD_RE = /<\s*(?:(\/)\s*)?([A-Za-z_:][A-Za-z0-9_.:-]*)(?=$|[\s/>])/y;
-
-function parseXmlTagAt(text: string, start: number): ParsedToolCallTag | null {
-  XML_TAG_HEAD_RE.lastIndex = start;
-  const match = XML_TAG_HEAD_RE.exec(text);
+function isToolCallTagPrefix(text: string, start: number): boolean {
+  if (start < 0) {
+    return false;
+  }
+  const match = /^<\s*(?:\/\s*)?([\w:]*)$/.exec(text.slice(start));
   if (!match) {
-    return null;
+    return false;
   }
-  const contentStart = XML_TAG_HEAD_RE.lastIndex;
-  const isClose = match[1] === "/";
-  const closeIndex = findTagCloseIndex(text, contentStart);
-  const isTruncated = closeIndex === -1;
-  return {
-    contentStart,
-    end: isTruncated ? text.length : closeIndex + 1,
-    isClose,
-    isSelfClosing: !isTruncated && !isClose && /\/\s*$/.test(text.slice(contentStart, closeIndex)),
-    tagName: normalizeLowercaseStringOrEmpty(match[2]),
-    isTruncated,
-  };
+  const name = (match[1] ?? "").toLowerCase();
+  return TOOL_CALL_PREFIX_NAMES.some((candidate) => candidate.startsWith(name));
 }
 
-function findTagCloseIndex(text: string, start: number): number {
-  const isInsideQuote = createQuotedStringScanner(text, start);
-  for (let idx = start; idx < text.length; idx += 1) {
-    const char = text[idx];
-    if ((char === "<" || char === ">") && !isInsideQuote(idx)) {
-      return char === ">" ? idx : -1;
-    }
-  }
-  return -1;
-}
-
-function detectToolCallPayloadKind(text: string, start: number): ToolCallPayloadKind {
+function detectToolCallPayloadKind(
+  text: string,
+  start: number,
+  streaming = false,
+): ToolCallPayloadKind {
   const rest = text.slice(start);
   if (TOOL_CALL_JSON_PAYLOAD_START_RE.test(rest)) {
     return "json";
   }
-  if (TOOL_CALL_XML_PAYLOAD_START_RE.test(rest)) {
+  if (
+    TOOL_CALL_XML_PAYLOAD_START_RE.test(rest) ||
+    (streaming && isToolCallTagPrefix(text, skipWhitespace(text, start)))
+  ) {
+    return "xml";
+  }
+  if (isGlmArgPayload(rest, streaming)) {
     return "xml";
   }
   return null;
@@ -134,11 +92,11 @@ function isLikelyStandaloneFunctionToolCall(
   tagStart: number,
   tag: ParsedToolCallTag,
 ): boolean {
-  if (tag.tagName !== "function" || tag.isClose || tag.isSelfClosing || tag.isTruncated) {
+  if (tag.isClose || tag.isSelfClosing || tag.isTruncated) {
     return false;
   }
 
-  if (!/\bname\s*=/.test(text.slice(tag.contentStart, tag.end))) {
+  if (tag.tagName === "function" && !/\bname\s*=/.test(text.slice(tag.contentStart, tag.end))) {
     return false;
   }
 
@@ -319,15 +277,20 @@ type StripToolCallXmlOptions = {
 };
 
 export function stripToolCallXmlTags(input: string, options: StripToolCallXmlOptions = {}): string {
-  return stripToolCallXmlTagsInternal(input, options);
+  return stripToolCallXmlTagsInternal(input, options, false);
 }
 
 function stripToolCallXmlTagsInternal(
   text: string,
   options: StripToolCallXmlOptions,
+  streaming: boolean,
   resolveCodeRegions = findCodeRegions,
 ): string {
-  if (!text || !TOOL_CALL_QUICK_RE.test(text)) {
+  if (
+    !text ||
+    (!TOOL_CALL_QUICK_RE.test(text) &&
+      !(streaming && isToolCallTagPrefix(text, text.lastIndexOf("<"))))
+  ) {
     return text;
   }
 
@@ -349,6 +312,13 @@ function stripToolCallXmlTagsInternal(
     }
 
     const tag = parseToolCallTagAt(text, idx);
+    if (
+      streaming &&
+      toolCallBlockTagName === null &&
+      ((tag?.isTruncated && !tag.isClose) || isToolCallTagPrefix(text, idx))
+    ) {
+      return unwrapStandaloneParameterTags(result + text.slice(lastIndex, idx));
+    }
     if (!tag) {
       continue;
     }
@@ -380,7 +350,7 @@ function stripToolCallXmlTagsInternal(
       }
       const payloadStart = tag.isTruncated ? tag.contentStart : tag.end;
       const isPluralToolCallWrapper =
-        tag.tagName === "function_calls" || tag.tagName === "tool_calls";
+        tag.tagName.endsWith("function_calls") || tag.tagName === "tool_calls";
       const matchingCloseStart = isPluralToolCallWrapper
         ? findMatchingToolCallCloseIndex(text, tag.end, tag.tagName)
         : -1;
@@ -393,18 +363,22 @@ function stripToolCallXmlTagsInternal(
         findAdjacentOpeningToolCallTag(text, matchingCloseTag.end, "function_response") !== null;
       const shouldDetectXmlPayload =
         tag.tagName === "tool_call" ||
+        tag.tagName === "mm:tool_call" ||
         tag.tagName === "function" ||
-        tag.tagName === "antml:invoke" ||
-        ((options.stripFunctionCallsXmlPayloads === true ||
+        tag.tagName.endsWith("invoke") ||
+        ((tag.tagName.includes(":") ||
+          isLineStartAt(text, idx) ||
+          options.stripFunctionCallsXmlPayloads === true ||
           shouldStripPluralWrapperBeforeResponse) &&
           isPluralToolCallWrapper);
       const payloadKind = shouldDetectXmlPayload
-        ? detectToolCallPayloadKind(text, payloadStart)
+        ? detectToolCallPayloadKind(text, payloadStart, streaming)
         : TOOL_CALL_JSON_PAYLOAD_START_RE.test(text.slice(payloadStart))
           ? "json"
           : null;
       const shouldStripStandaloneFunction =
-        tag.tagName !== "function" || isLikelyStandaloneFunctionToolCall(text, idx, tag);
+        (tag.tagName !== "function" && tag.tagName !== "invoke") ||
+        isLikelyStandaloneFunctionToolCall(text, idx, tag);
       const functionResponseCloseStart =
         tag.tagName === "function_response"
           ? findMatchingToolCallCloseIndex(text, tag.end, tag.tagName)
@@ -462,9 +436,12 @@ function stripToolCallXmlTagsInternal(
   return unwrapStandaloneParameterTags(result);
 }
 
-export function toolCallXmlTextFilter(options: StripToolCallXmlOptions = {}): TextFilter {
+export function toolCallXmlTextFilter(
+  options: StripToolCallXmlOptions = {},
+  streaming = false,
+): TextFilter {
   return {
-    transform: (text) => stripToolCallXmlTagsInternal(text, options),
+    transform: (text) => stripToolCallXmlTagsInternal(text, options, streaming),
     create: () => {
       let scannedThrough = 0;
       let active = false;
@@ -476,6 +453,7 @@ export function toolCallXmlTextFilter(options: StripToolCallXmlOptions = {}): Te
           return stripToolCallXmlTagsInternal(
             text,
             options,
+            streaming,
             () => regions ?? findCodeRegions(text),
           );
         },
@@ -505,11 +483,9 @@ export function toolCallXmlTextFilter(options: StripToolCallXmlOptions = {}): Te
               active = true;
               return true;
             }
-            if (!protectedBlock && next === -1 && /^<[\s/]*[\w:]*$/.test(candidate)) {
-              // An unfinished tag name can still become tool markup; rescan it on the next append.
+            if (!protectedBlock && isToolCallTagPrefix(candidate, 0)) {
               scannedThrough = start;
-              codeRegions = undefined;
-              return false;
+              return true;
             }
             start = next;
           }

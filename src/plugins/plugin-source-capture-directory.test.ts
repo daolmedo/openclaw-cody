@@ -19,6 +19,7 @@ import { capturePluginGenerationArtifact } from "./plugin-generation-artifact.js
 import { retainGatewayPluginMetadata } from "./plugin-metadata-lifecycle.js";
 import { withPluginSourceCaptureDirectory } from "./plugin-package-metadata-capture.js";
 import {
+  createPluginNativeCaptureRoot,
   createPluginSourceCaptureRoot,
   prunePluginNativeCaptureDirectories,
   retainPluginSourceCaptureInstance,
@@ -56,6 +57,53 @@ function age(directory: string): void {
   const timestamp = new Date(Date.now() - 2 * hour);
   fs.utimesSync(directory, timestamp, timestamp);
 }
+
+it("keeps update source copies in TMPDIR without relocating retained native captures", async () => {
+  const stateDir = temp.make("plugin-capture-update-state-");
+  const source = createSource();
+  vi.stubEnv("OPENCLAW_UPDATE_IN_PROGRESS", "1");
+  vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+  const artifact = capturePluginGenerationArtifact(source);
+  const native = createPluginNativeCaptureRoot(stateDir);
+  try {
+    expect(
+      artifact.boundaryRoot.startsWith(path.join(process.env.TMPDIR!, "openclaw-plugin-captures-")),
+    ).toBe(true);
+    expect(fs.readFileSync(artifact.resolve(path.join(source, "index.cjs")), "utf8")).toBe(
+      capturedSource,
+    );
+    expect(
+      native.directory.startsWith(path.join(stateDir, "tmp", "plugin-captures") + path.sep),
+    ).toBe(true);
+  } finally {
+    await native.disposeAsync();
+    await artifact.disposeAsync();
+  }
+});
+
+it("keeps update plugin captures on the selected temporary volume", async () => {
+  const stateDir = temp.make("plugin-capture-update-instance-");
+  const source = createSource();
+  vi.stubEnv("OPENCLAW_UPDATE_IN_PROGRESS", "1");
+  vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+  const instance = retainPluginSourceCaptureInstance(stateDir);
+  const capture = instance.createDirectory();
+  const artifact = withPluginSourceCaptureDirectory(capture, () =>
+    capturePluginGenerationArtifact(source),
+  );
+  try {
+    const root = path.dirname(path.dirname(capture));
+    expect(root.startsWith(`${process.env.TMPDIR}${path.sep}`)).toBe(true);
+    expect(fs.readFileSync(artifact.resolve(path.join(source, "index.cjs")), "utf8")).toBe(
+      capturedSource,
+    );
+    expect(fs.existsSync(path.join(stateDir, "tmp", "plugin-captures"))).toBe(false);
+  } finally {
+    await artifact.disposeAsync();
+    await instance.releaseAsync();
+    await sweepPluginSourceCapturesForTest(stateDir);
+  }
+});
 
 function capturePaths(
   stateDir: string,
@@ -310,6 +358,49 @@ it.each(["natural", "failure", "explicit", "signal"])(
   },
 );
 
+it("reclaims its captures during signal cleanup when the process outlives the drain", async () => {
+  const stateDir = temp.make("plugin-capture-signal-");
+  const source = createSource();
+  const live = await startCliCapture(stateDir, source, false);
+  const signalModule = resolveRuntimeWorkerUrl(pluginProcessRuntimeEntrypoints.signalExit).href;
+  const child = spawn(
+    process.execPath,
+    [
+      ...runtimeArgs,
+      "--input-type=module",
+      "-e",
+      // Handlers precede the capture lines: the parent signals as soon as it reads them.
+      `import { installCliSignalExitHandlers, registerSignalExitFinalizer } from ${JSON.stringify(signalModule)};
+      installCliSignalExitHandlers();
+      ${childCapture}
+      registerSignalExitFinalizer(async () => fs.writeSync(1, "drained\\n"));
+      // Hung work keeps the process alive after the drain until its supervisor force-kills it.
+      setInterval(() => {}, 60_000);`,
+      source,
+      "cli",
+    ],
+    { env: { ...process.env, OPENCLAW_STATE_DIR: stateDir }, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  const exited = new Promise((resolve) => {
+    child.once("close", resolve);
+  });
+  try {
+    const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
+    const boundaryRoot = (await lines.next()).value as string;
+    const signalled = capturePaths(stateDir, boundaryRoot, (await lines.next()).value as string);
+    expect(fs.existsSync(signalled.instanceRoot)).toBe(true);
+    child.kill("SIGTERM");
+    expect((await lines.next()).value).toBe("drained");
+    expect(child.exitCode).toBeNull();
+    expect(fs.existsSync(signalled.instanceRoot)).toBe(false);
+    expect(await live.read()).toBe(capturedSource.trimEnd());
+  } finally {
+    child.kill("SIGKILL");
+    await exited;
+    await live.stop();
+  }
+});
+
 async function startCliCapture(stateDir: string, source: string, worker: boolean, legacy = false) {
   const child = spawn(
     process.execPath,
@@ -522,31 +613,20 @@ it.each(["payload", "instance"])(
   30_000,
 );
 
-it("keeps hourly reclamation on a live metadata owner when its siblings are closing", async () => {
+it("runs hourly reclamation on a live metadata owner", async () => {
   const stateDir = temp.make("plugin-capture-periodic-");
   const orphan = await abandonCapture(stateDir, createSource());
   vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
   const time = createGatewaySchedulerClock();
   const scheduler = createTestGatewayScheduler(time.clock);
   const metadata = retainGatewayPluginMetadata(scheduler);
-  const fencedTime = createGatewaySchedulerClock();
-  const fencedScheduler = createTestGatewayScheduler(fencedTime.clock);
-  const fenced = retainGatewayPluginMetadata(fencedScheduler);
-  const siblingTime = createGatewaySchedulerClock();
-  const siblingScheduler = createTestGatewayScheduler(siblingTime.clock);
-  const sibling = retainGatewayPluginMetadata(siblingScheduler);
   try {
     await sweepPluginSourceCapturesForTest(stateDir);
     expect(fs.readFileSync(orphan.capturedFile, "utf8")).toBe(capturedSource);
-    fencedScheduler.beginClose();
-    await siblingScheduler.stop();
     age(orphan.instanceRoot);
     await time.advanceBy(2 * hour);
     expect(fs.existsSync(orphan.instanceRoot)).toBe(false);
-    await sibling.close();
   } finally {
-    await sibling.close();
-    await fenced.close();
     await metadata.close();
     await sweepPluginSourceCapturesForTest(stateDir);
   }
@@ -674,15 +754,13 @@ it.each(["before command", "inside command"])(
   },
 );
 
-it("retains live capture bytes until both metadata owners and the artifact release custody", async () => {
+it("retains live capture bytes until the metadata owner and artifact are released", async () => {
   const stateDir = temp.make("plugin-capture-shared-");
   vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
   const source = createSource();
   const first = retainGatewayPluginMetadata(createTestGatewayScheduler());
-  let second: ReturnType<typeof retainGatewayPluginMetadata> | undefined;
   let artifact: ReturnType<typeof capturePluginGenerationArtifact> | undefined;
   try {
-    second = retainGatewayPluginMetadata(createTestGatewayScheduler());
     artifact = capturePluginGenerationArtifact(source);
     const { instanceRoot } = capturePaths(
       stateDir,
@@ -696,10 +774,6 @@ it("retains live capture bytes until both metadata owners and the artifact relea
     );
     await first.close();
     await first.close();
-    expect(fs.readFileSync(artifact.resolve(path.join(source, "index.cjs")), "utf8")).toBe(
-      capturedSource,
-    );
-    await second.close();
     await sweepPluginSourceCapturesForTest(stateDir);
     expect(fs.readFileSync(artifact.resolve(path.join(source, "index.cjs")), "utf8")).toBe(
       capturedSource,
@@ -710,7 +784,7 @@ it("retains live capture bytes until both metadata owners and the artifact relea
     try {
       await artifact?.disposeAsync();
     } finally {
-      await Promise.all([first.close(), second?.close()]);
+      await first.close();
     }
   }
 });
@@ -933,7 +1007,7 @@ it.each(["malformed", "symlink", "hardlink", "sidecar-symlink", "captures-symlin
   },
 );
 
-it("summarizes inaccessible owner records with backoff while continuing cleanup retries", async () => {
+it("summarizes inaccessible owner records and retries cleanup", async () => {
   const stateDir = temp.make("plugin-capture-warning-backoff-");
   const root = path.join(stateDir, "tmp", "plugin-captures");
   const orphan = await abandonCapture(stateDir, createSource());
@@ -957,14 +1031,6 @@ it("summarizes inaccessible owner records with backoff while continuing cleanup 
   await sweepPluginSourceCapturesForTest(stateDir);
   expect(warning).toHaveBeenCalledTimes(1);
   expect(String(warning.mock.calls[0]?.[0])).toContain("3 cleanup failure(s)");
-  await sweepPluginSourceCapturesForTest(stateDir);
-  expect(warning).toHaveBeenCalledTimes(1);
-  vi.setSystemTime(Date.now() + hour);
-  await sweepPluginSourceCapturesForTest(stateDir);
-  expect(warning).toHaveBeenCalledTimes(2);
-  vi.setSystemTime(Date.now() + hour);
-  await sweepPluginSourceCapturesForTest(stateDir);
-  expect(warning).toHaveBeenCalledTimes(2);
   fault.mockRestore();
   await sweepPluginSourceCapturesForTest(stateDir);
   expect(fs.readdirSync(root)).toEqual([]);

@@ -947,9 +947,7 @@ function assertAgentError() {
     "/tmp/openclaw-codex-agent-after-uninstall.err",
     "post-uninstall agent stderr",
   );
-  const failure = stdout ? JSON.parse(stdout) : null;
-  const errorMessage = typeof failure?.error?.message === "string" ? failure.error.message : stdout;
-  const combined = `${errorMessage}\n${stderr}`;
+  const combined = `${stdout}\n${stderr}`;
   const expectedErrors = [
     'Agent harness runtime "codex" is unavailable. (reason=owner-plugin-not-activatable, ownerPluginId=codex)',
     'Requested agent harness "codex" is not registered',

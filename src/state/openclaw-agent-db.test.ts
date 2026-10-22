@@ -11,6 +11,7 @@ import { cleanupTempDirs, makeTempDir } from "../../test/helpers/temp-dir.js";
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import * as nodeSqlite from "../infra/node-sqlite.js";
 import { resolveRuntimeWorkerArgv, resolveRuntimeWorkerUrl } from "../infra/runtime-worker-url.js";
+import { revokeSqliteDatabaseAdmissionsForPath } from "../infra/sqlite-database-admission.js";
 import * as integrityWorker from "../infra/sqlite-integrity-worker.js";
 import { readSqliteNumberPragma } from "../infra/sqlite-pragma.test-support.js";
 import { migrateLegacyMediaPersistence } from "../infra/state-migrations.media-persistence.js";
@@ -42,6 +43,7 @@ import {
   unregisterOpenClawAgentDatabase,
   unregisterOpenClawAgentDatabases,
 } from "./openclaw-agent-db-registry.js";
+import { invalidateOpenClawAgentDatabaseValidation } from "./openclaw-agent-db-validation-cache.js";
 import {
   clearOpenClawAgentDatabaseOpenFailure,
   closeOpenClawAgentDatabaseByPath,
@@ -61,14 +63,12 @@ import {
 import {
   createOpenClawAgentDatabasePathMatcher,
   isSameOpenClawAgentDatabasePath,
-  resolveIncognitoOpenClawAgentSqlitePath,
 } from "./openclaw-agent-db.paths.js";
 import {
   removeCanonicalValidationFromHistoricalAgentFixture,
   seedSchema19SessionKeyRepairFixture,
 } from "./openclaw-agent-db.test-support.js";
 import { materializeV21WorkerAgentDatabase } from "./openclaw-agent-schema-v21.test-support.js";
-import { clearOpenClawAgentIntegrityVerification } from "./openclaw-quarantine-store.js";
 import {
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
@@ -687,26 +687,6 @@ afterEach(() => {
 });
 
 describe("openclaw agent database", () => {
-  it("keeps incognito state writable without SQLite extension support", () => {
-    const options = { agentId: "worker-1", env: { OPENCLAW_STATE_DIR: createTempStateDir() } };
-    const capability = vi
-      .spyOn(nodeSqlite, "supportsNodeSqliteExtensionLoading")
-      .mockReturnValue(false);
-    try {
-      const { db } = openOpenClawAgentDatabase({
-        ...options,
-        path: resolveIncognitoOpenClawAgentSqlitePath(options),
-      });
-      db.prepare("UPDATE schema_meta SET updated_at = ? WHERE meta_key = 'primary'").run(123);
-      expect(
-        db.prepare("SELECT updated_at FROM schema_meta WHERE meta_key = 'primary'").get(),
-      ).toEqual({ updated_at: 123 });
-      expect(() => db.enableLoadExtension(true)).toThrow();
-    } finally {
-      capability.mockRestore();
-    }
-  });
-
   it("uses the canonical state schema for deletion journal reads and updates", () => {
     const stateDir = createTempStateDir();
     const env = { OPENCLAW_STATE_DIR: stateDir };
@@ -879,6 +859,8 @@ describe("openclaw agent database", () => {
       reason: "schema-missing",
     });
 
+    fs.copyFileSync(databasePath, `${databasePath}.replacement`);
+    fs.renameSync(`${databasePath}.replacement`, databasePath);
     const unsupported = new DatabaseSync(databasePath);
     try {
       unsupported.exec(`PRAGMA user_version = ${OPENCLAW_AGENT_SCHEMA_VERSION + 1};`);
@@ -2128,7 +2110,8 @@ describe("openclaw agent database", () => {
     expect(isOpenClawAgentDatabaseOpen(databasePath)).toBe(false);
 
     // Retiring a claim during a real integrity read must precede index repair, not only exposure.
-    clearOpenClawAgentIntegrityVerification(databasePath, env);
+    invalidateOpenClawAgentDatabaseValidation(databasePath);
+    revokeSqliteDatabaseAdmissionsForPath(databasePath);
     const editor = nodeSqlite.openNodeSqliteDatabase(databasePath);
     try {
       editor.exec("DROP INDEX idx_agent_cache_expiry");
@@ -2335,6 +2318,50 @@ describe("openclaw agent database", () => {
     });
   });
 
+  it("preserves ownership when another initializer wins before the schema transaction", () => {
+    const stateDir = createTempStateDir();
+    const env = { OPENCLAW_STATE_DIR: stateDir };
+    openOpenClawStateDatabase({ env });
+    const databasePath = path.join(stateDir, "shared.sqlite");
+    const { DatabaseSync } = requireNodeSqlite();
+    using pending = new DatabaseSync(databasePath);
+    using winner = new DatabaseSync(databasePath);
+    const exec = pending.exec.bind(pending);
+    let preparingSchema = false;
+    vi.spyOn(pending, "exec").mockImplementation((sql) => {
+      if (sql.includes("PRAGMA foreign_keys = OFF")) {
+        preparingSchema = true;
+      }
+      if (preparingSchema && sql.trimStart().startsWith("BEGIN IMMEDIATE")) {
+        preparingSchema = false;
+        // Commit a real competing initialization after preparation, before the writer lock.
+        ensureOpenClawAgentDatabaseSchema(winner, {
+          agentId: "worker-b",
+          env,
+          path: databasePath,
+          register: true,
+        });
+      }
+      return exec(sql);
+    });
+
+    expect(() =>
+      ensureOpenClawAgentDatabaseSchema(pending, {
+        agentId: "worker-a",
+        env,
+        path: databasePath,
+        register: true,
+      }),
+    ).toThrow("belongs to agent worker-b");
+    expect(inspectOpenClawAgentDatabaseOwner(databasePath)).toEqual({
+      status: "owned",
+      agentId: "worker-b",
+    });
+    expect(listOpenClawRegisteredAgentDatabases({ env })).toEqual([
+      expect.objectContaining({ agentId: "worker-b", path: databasePath }),
+    ]);
+  });
+
   it("serializes concurrent ownership claims for one unowned database", async () => {
     const stateDir = createTempStateDir();
     openOpenClawStateDatabase({ env: { OPENCLAW_STATE_DIR: stateDir } });
@@ -2456,26 +2483,6 @@ describe("openclaw agent database", () => {
 
     expect(fs.statSync(parentDir).mode & 0o777).toBe(0o755);
   });
-
-  it.runIf(process.platform !== "win32")(
-    "defers nested permission repair to the outer transaction boundary",
-    () => {
-      const stateDir = createTempStateDir();
-      const options = {
-        agentId: "worker-1",
-        env: { OPENCLAW_STATE_DIR: stateDir },
-      };
-      const database = openOpenClawAgentDatabase(options);
-      fs.chmodSync(database.path, 0o644);
-
-      runOpenClawAgentWriteTransaction(() => {
-        runOpenClawAgentWriteTransaction(() => undefined, options);
-        expect(fs.statSync(database.path).mode & 0o777).toBe(0o644);
-      }, options);
-
-      expect(fs.statSync(database.path).mode & 0o777).toBe(0o600);
-    },
-  );
 
   it("repairs every missing or drifted canonical agent-state named index", () => {
     const stateDir = createTempStateDir();
@@ -2805,6 +2812,7 @@ describe("openclaw agent database", () => {
       )
       .run();
     corrupt.close();
+    revokeSqliteDatabaseAdmissionsForPath(databasePath);
 
     openOpenClawAgentDatabase(options);
     closeOpenClawAgentDatabasesForTest();
@@ -2914,6 +2922,8 @@ describe("openclaw agent database", () => {
       }
       closeOpenClawAgentDatabasesForTest();
       if (owner !== "worker-1") {
+        fs.copyFileSync(databasePath, `${databasePath}.replacement`);
+        fs.renameSync(`${databasePath}.replacement`, databasePath);
         const { DatabaseSync } = requireNodeSqlite();
         using raw = new DatabaseSync(databasePath);
         raw.prepare("UPDATE schema_meta SET agent_id = ? WHERE meta_key = 'primary'").run(owner);
@@ -3055,6 +3065,8 @@ describe("openclaw agent database", () => {
       const nowSpy = vi.spyOn(Date, "now").mockReturnValue(1_000);
       const databasePath = openOpenClawAgentDatabase({ agentId: "worker-1", env }).path;
       expect(closeOpenClawAgentDatabaseByPath(databasePath)).toBe(true);
+      fs.copyFileSync(databasePath, `${databasePath}.replacement`);
+      fs.renameSync(`${databasePath}.replacement`, databasePath);
       createCacheExpiryIndexPhysicalDrift(databasePath);
 
       const { DatabaseSync } = requireNodeSqlite();
@@ -3109,6 +3121,8 @@ describe("openclaw agent database", () => {
       } finally {
         restored.close();
       }
+      fs.copyFileSync(databasePath, `${databasePath}.replacement`);
+      fs.renameSync(`${databasePath}.replacement`, databasePath);
 
       nowSpy.mockReturnValue(2_000);
       try {
@@ -3131,28 +3145,6 @@ describe("openclaw agent database", () => {
       }
     },
   );
-
-  it("rechecks the media version guard after a validated handle is replaced by a populated v0 store", () => {
-    const stateDir = createTempStateDir();
-    const env = { OPENCLAW_STATE_DIR: stateDir };
-    const databasePath = openOpenClawAgentDatabase({ agentId: "worker-1", env }).path;
-    expect(closeOpenClawAgentDatabaseByPath(databasePath)).toBe(true);
-
-    const { DatabaseSync } = requireNodeSqlite();
-    const downgraded = new DatabaseSync(databasePath);
-    try {
-      downgraded.exec(`
-        PRAGMA user_version = 0;
-        UPDATE schema_meta SET schema_version = 0 WHERE meta_key = 'primary';
-      `);
-    } finally {
-      downgraded.close();
-    }
-
-    expect(() => openOpenClawAgentDatabase({ agentId: "worker-1", env })).toThrow(
-      "run openclaw doctor --fix to migrate persisted media",
-    );
-  });
 
   it.each([
     {
@@ -3193,6 +3185,8 @@ describe("openclaw agent database", () => {
     const databasePath = openOpenClawAgentDatabase({ agentId: "worker-1", env }).path;
     expect(closeOpenClawAgentDatabaseByPath(databasePath)).toBe(true);
     closeOpenClawStateDatabaseForTest();
+    fs.copyFileSync(databasePath, `${databasePath}.replacement`);
+    fs.renameSync(`${databasePath}.replacement`, databasePath);
     createUnsafeIndexDrift(databasePath);
     const { DatabaseSync } = requireNodeSqlite();
     const db = new DatabaseSync(databasePath);

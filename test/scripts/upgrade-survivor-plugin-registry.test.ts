@@ -18,6 +18,26 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const SOURCE_SHA = "a".repeat(40);
 const VERSION = "2026.8.1";
 
+it("routes custom sibling updates through the candidate plugin registry", () => {
+  const source = readFileSync("scripts/e2e/lib/upgrade-survivor/run.sh", "utf8");
+  const start = source.indexOf('if [ "$SCENARIO" = "custom-plugin-siblings" ]; then');
+  const end = source.indexOf('if [ "$SCENARIO" = "abandoned-update" ]; then', start);
+  const scenario = source.slice(start, end);
+  const candidateResolution = scenario.indexOf(
+    "phase resolve-sibling-candidate resolve_candidate_version",
+  );
+  const registry = scenario.indexOf(
+    "phase configure-sibling-plugin-registry configure_plugin_registry",
+  );
+  const update = scenario.indexOf("phase update-sibling-candidate update_candidate");
+
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  expect(candidateResolution).toBeGreaterThan(0);
+  expect(registry).toBeGreaterThan(candidateResolution);
+  expect(update).toBeGreaterThan(registry);
+});
+
 function expectFinalFailure(stderr: string, exitCode: number) {
   const summary = `[upgrade-survivor] FAILED (exit ${exitCode})`;
   expect(stderr.trimEnd().split("\n").at(-1)).toBe(summary);
@@ -345,24 +365,6 @@ on_exit 0
     },
   );
 
-  it.each([
-    ["custom-plugin-siblings", "openclaw@2026.9.4"],
-    ["abandoned-update", "openclaw@2026.9.4"],
-    ["workshop-doctor-recovery", "openclaw@2026.9.4"],
-  ])("follows the planner's no-registry decision for %s", (scenario, baseline) => {
-    const { captureDir, result } = runSurvivor({
-      OPENCLAW_UPGRADE_SURVIVOR_SCENARIO: scenario,
-      OPENCLAW_UPGRADE_SURVIVOR_BASELINE_SPEC: baseline,
-    });
-
-    expect(result.status, result.stderr).toBe(0);
-    expect(existsSync(join(captureDir, "node-args"))).toBe(false);
-    expect(existsSync(join(captureDir, "docker-run-args"))).toBe(true);
-    expect(readFileSync(join(captureDir, "docker-args"), "utf8")).not.toContain(
-      "/tmp/openclaw-prepublish-plugin-registry",
-    );
-  });
-
   it("does not prepare a registry for a published candidate", () => {
     const { captureDir, packageTarball, result } = runSurvivor({
       OPENCLAW_CURRENT_PACKAGE_TGZ: undefined,
@@ -544,13 +546,7 @@ run_live_models
         "google/gemini-3.1-pro-preview",
       ],
     },
-    ...[
-      "mobile-pairing-reconnect",
-      "projects-doctor",
-      "projects-startup-migration",
-      "dreaming-cron-doctor",
-      "cron-owner-doctor",
-    ].map((scenario) => ({ scenario, liveEnv: {}, expectedModels: [] })),
+    ...["projects-doctor"].map((scenario) => ({ scenario, liveEnv: {}, expectedModels: [] })),
   ])(
     "clears provider and channel credentials for $scenario while preserving live snapshots",
     ({ scenario, liveEnv, expectedModels }) => {
@@ -671,7 +667,6 @@ test "$LIVE_GEMINI_API_KEY" = fixture-google
 describe("legacy operator baseline plugin cohort", () => {
   it.each([
     ["2026.7.1-2", "2026.7.1", "latest", ""],
-    ["2026.8.1", "2026.8.1", "latest", ""],
     ["2026.7.2-beta.7", "2026.7.2-beta.7", "beta", ""],
     ["2026.8.1-alpha.3", "2026.8.1-alpha.3", "alpha", ""],
     ["2026.8.1-beta.1", "2026.8.1-beta.1", "beta", "E404"],

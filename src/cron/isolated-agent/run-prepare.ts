@@ -9,6 +9,7 @@ import {
   loadPublishedGatewayReplyDispatchRuntime,
   type PreparedModelRuntimeLease,
 } from "../../agents/prepared-model-runtime.js";
+import { resolveSessionStableReplyMode } from "../../auto-reply/reply/session-stable-reply-mode.js";
 import { resolveAgentModelPrimaryValue } from "../../config/model-input.js";
 import { resolveSessionStorePathCore } from "../../config/sessions/paths.js";
 import { resolveCreatorSandbox } from "../../gateway/operator-role-policy.js";
@@ -54,7 +55,7 @@ import {
   createCronRunContinuationSession,
   createPersistCronSessionEntry,
   setCronSessionRuntimeModel,
-  persistCronSkillsSnapshotIfChanged,
+  setCronSessionAgentHarnessId,
   type CronSessionRowWriter,
 } from "./run-session-state.js";
 import { resolveCronRunTimeoutOverrideMs } from "./run-timeout.js";
@@ -165,6 +166,7 @@ export async function prepareCronRunContext(params: {
   const prepareSession = () =>
     withCronSessionPreparation(
       {
+        agentId,
         storePath: resolveSessionStorePathCore(runtimeCfg.session?.store, { agentId }),
         sessionKey: agentSessionKey,
         signal: input.abortSignal ?? input.signal,
@@ -191,8 +193,7 @@ export async function prepareCronRunContext(params: {
       hookExternalContentSource,
     });
     const sourceEntry = sourceSessionKey ? cronSession.store[sourceSessionKey] : undefined;
-    const completionSource =
-      input.job.sessionTarget === "isolated" ? input.job.sourceConversation : sourceEntry;
+    const completionSource = input.job.sourceConversation ?? sourceEntry;
     const sourceSessionGeneration = completionSource
       ? {
           sessionId: completionSource.sessionId,
@@ -216,6 +217,7 @@ export async function prepareCronRunContext(params: {
       ? `${agentSessionKey}:run:${runSessionId}`
       : agentSessionKey;
     const sessionWorkAdmission = await beginCronSessionWorkAdmission({
+      agentId,
       cronSession,
       agentSessionKey,
       runSessionKey,
@@ -474,6 +476,23 @@ export async function prepareCronRunContext(params: {
         job: input.job,
         agentId,
       });
+      // Persistent wakes share chat's binding policy; announce targeting is turn-local.
+      const cliSessionBindingFacts = {
+        extraSystemPromptStatic: deliverySystemPrompt,
+        sourceReplyDeliveryMode: usesExactRunSession
+          ? sourceDelivery.sourceReplyDeliveryMode
+          : await resolveSessionStableReplyMode({
+              cfg: admittedConfig,
+              metadataSnapshot: preparedModelRuntimeLease.snapshot.metadataSnapshot,
+              ctx: { CommandAuthorized: false },
+              sessionEntry: cronSession.sessionEntry,
+              sessionAgentId: agentId,
+              sessionKey: runSessionKey,
+            }),
+        requireExplicitMessageTarget: usesExactRunSession
+          ? sourceDelivery.messageTool.requireExplicitTarget
+          : undefined,
+      };
 
       const { formattedTime, timeLine } = resolveCronStyleNow(runtimeCfg, now);
       // Current jobs stay detached; a bounded tail preserves context without transcript continuation.
@@ -538,18 +557,24 @@ export async function prepareCronRunContext(params: {
         librarySelections: cronSession.sessionEntry.skillLibrarySelections,
         isFastTestEnv: params.isFastTestEnv,
       });
-      await persistCronSkillsSnapshotIfChanged({
-        isFastTestEnv: params.isFastTestEnv,
-        cronSession,
-        skillsSnapshot,
-        nowMs: Date.now(),
-        persistSessionEntry,
-      });
+      if (!params.isFastTestEnv && skillsSnapshot !== cronSession.sessionEntry.skillsSnapshot) {
+        cronSession.sessionEntry = {
+          ...cronSession.sessionEntry,
+          updatedAt: Date.now(),
+          skillsSnapshot,
+        };
+      }
 
       setCronSessionRuntimeModel({ entry: cronSession.sessionEntry, provider, model });
+      setCronSessionAgentHarnessId({
+        entry: cronSession.sessionEntry,
+        agentHarnessId: effectiveAgentRuntime,
+      });
       cronSession.sessionEntry.systemSent = true;
+      let preRunSessionPersisted = false;
       try {
         await persistSessionEntry();
+        preRunSessionPersisted = true;
       } catch (err) {
         if (err instanceof CronSessionLifecycleClaimError) {
           throw err;
@@ -563,21 +588,28 @@ export async function prepareCronRunContext(params: {
         job: input.job,
         cronSession,
       });
-      const authSelection = await resolveCronAuthSelection({
-        agentId,
-        cfg: admittedConfig,
-        provider,
-        modelId: model,
-        ...(provider === resolvedModelSelection.provider &&
-        resolvedModelSelection.configuredProfileId
-          ? { configuredProfileId: resolvedModelSelection.configuredProfileId }
-          : {}),
-        harnessRuntime: effectiveAgentRuntime,
-        agentDir,
-        cronSession,
-        sessionKey: agentSessionKey,
-        isNewSession: cronSession.isNewSession && input.job.sessionTarget !== "isolated",
-      });
+      const authSelection = input.job.runtimeAuthority
+        ? undefined
+        : input.job.inferenceBinding
+          ? {
+              profileId: input.job.inferenceBinding.profileId,
+              source: input.job.inferenceBinding.source,
+            }
+          : await resolveCronAuthSelection({
+              agentId,
+              cfg: admittedConfig,
+              provider,
+              modelId: model,
+              ...(provider === resolvedModelSelection.provider &&
+              resolvedModelSelection.configuredProfileId
+                ? { configuredProfileId: resolvedModelSelection.configuredProfileId }
+                : {}),
+              harnessRuntime: effectiveAgentRuntime,
+              agentDir,
+              cronSession,
+              sessionKey: agentSessionKey,
+              isNewSession: cronSession.isNewSession && input.job.sessionTarget !== "isolated",
+            });
       const authProfileId = authSelection?.profileId;
       const liveSelection: LiveSessionModelSelection = {
         provider,
@@ -607,11 +639,7 @@ export async function prepareCronRunContext(params: {
             scheduledToolCallerOrigin: input.job.toolsAllowProvenance?.callerOrigin,
             toolsAllowExecTarget: input.job.toolsAllowExecTarget,
             toolsAllowExecTargetRequirement: input.job.toolsAllowExecTargetRequirement,
-            cliSessionBindingFacts: {
-              extraSystemPromptStatic: deliverySystemPrompt,
-              sourceReplyDeliveryMode: sourceDelivery.sourceReplyDeliveryMode,
-              requireExplicitMessageTarget: sourceDelivery.messageTool.requireExplicitTarget,
-            },
+            cliSessionBindingFacts,
             persistSessionEntry: persistCronSessionRow,
           })
         : undefined;
@@ -628,10 +656,7 @@ export async function prepareCronRunContext(params: {
           agentCfg,
           agentDir,
           agentSessionKey,
-          sourceSessionKey:
-            input.job.sessionTarget === "isolated"
-              ? input.job.sourceConversation?.sessionKey
-              : sourceSessionKey,
+          sourceSessionKey: input.job.sourceConversation?.sessionKey ?? sourceSessionKey,
           sourceSessionGeneration,
           runSessionId,
           currentRunSessionId,
@@ -655,6 +680,7 @@ export async function prepareCronRunContext(params: {
           cronSession,
           sessionWorkAdmission,
           persistSessionEntry,
+          preRunSessionPersisted,
           runContinuationSession,
           withRunSession,
           agentPayload,
@@ -666,6 +692,7 @@ export async function prepareCronRunContext(params: {
           // Applied only after the final tool surface exposes the message tool.
           messageToolFormatPrompt,
           sourceDelivery,
+          cliSessionBindingFacts,
           suppressExecNotifyOnExit: deliveryPlan.mode === "none",
           skillsSnapshot,
           liveSelection,

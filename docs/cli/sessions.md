@@ -256,7 +256,7 @@ remains supported. The real archive or delete request is authoritative.
 
 Agent-qualified aliases keep their selected owner through lookup and mutation.
 For example, `sessions delete agent:work:main --yes` still targets `work` when
-the Gateway describes that session using the canonical key `global`.
+the Gateway describes that session using the resolved key `global`.
 
 Example mixed-result JSON:
 
@@ -309,9 +309,10 @@ guidance for listing valid keys, and an empty or whitespace-only `--session-key`
 is rejected. Without a key, an empty selection prints
 `No sessions found.` and exits successfully, including with `--follow`.
 
-The progress view is intentionally conservative: prompt text, tool arguments,
-and tool result bodies are not printed. Tool calls show the tool name with
-`{...redacted...}`; tool results show status such as `ok`, `error`, or `done`;
+The progress view omits prompt text and tool result bodies. Tool calls show the
+tool name and serialized arguments, without secret masking; this output can
+contain credentials, so review it before copying or sharing. Tool results show
+status such as `ok`, `error`, or `done`;
 model completion lines show provider/model and terminal status. Provider failures
 and turns without delivery show `error`; cancellation shows `aborted`, timeouts
 show `timeout`, and successful completions (including delivered partial replies)
@@ -406,7 +407,9 @@ Flags:
 
 When a Gateway is reachable, non-dry-run cleanup for configured agent stores is
 sent through the Gateway so it shares the same session-store writer as runtime
-traffic. Use `--store <path>` for explicit offline repair of a SQLite database or
+traffic. Once connected, the CLI waits for cleanup to finish without a fixed
+request deadline; connection startup still has a timeout. Use `--store <path>`
+for explicit offline repair of a SQLite database or
 legacy store selector.
 
 Automatic offline fallback applies only when the configured local Gateway cannot
@@ -430,7 +433,7 @@ JSON result. Dry runs do not load harness plugins.
 Applied artifact cleanup counts only successful file removals. If a file cannot
 be deleted, it contributes no freed bytes and remains part of disk usage.
 Unreferenced artifact cleanup and legacy disk-budget enforcement continue with
-other eligible files. Canonical SQLite archive pruning stops after a deletion
+other eligible files. SQLite archive pruning stops after a deletion
 error to retain its database recovery copy. If usage stays above the target,
 check filesystem permissions and retry after resolving the deletion failure.
 
@@ -511,7 +514,7 @@ owner; an explicit Doctor store selector otherwise defaults to `main`.
 
 `archive-age`, `archive-dashboard`, and `archive-cap` change session metadata
 while retaining transcript rows. Disk-budget cleanup can replace eligible
-history with compressed archives, whose canonical payload remains in SQLite.
+history with compressed archives, whose stored payload remains in SQLite.
 Doctor's `compact` step then reclaims free database pages with `VACUUM` and
 reports before/after database and WAL sizes. It does not choose more history
 to delete. Compare physical sizes and retained history, not only session counts;

@@ -4,29 +4,21 @@ import { assertSupportedJobSpec } from "../../cron/service/jobs-validation.js";
 import { isCronInvalidRequestError } from "./cron-error-classification.js";
 
 describe("isCronInvalidRequestError", () => {
-  const schedule = { kind: "every", everyMs: 60_000 } as const;
   it.each([
-    { schedule, sessionTarget: "main", payload: { kind: "agentTurn", message: "check" } },
-    { schedule, sessionTarget: "isolated", payload: { kind: "systemEvent", text: "check" } },
-    { schedule, sessionTarget: "current", payload: { kind: "systemEvent", text: "check" } },
-    {
-      schedule,
-      sessionTarget: "session:agent:main:conversation",
-      payload: { kind: "script", script: "json({})" },
-    },
-  ] satisfies Parameters<typeof assertSupportedJobSpec>[0][])(
-    "classifies target/payload guidance as invalid input: $sessionTarget",
-    (job) => {
-      let error: unknown;
-      try {
-        assertSupportedJobSpec(job);
-      } catch (cause) {
-        error = cause;
-      }
-      expect(error).toBeInstanceOf(Error);
-      expect(isCronInvalidRequestError(error)).toBe(true);
-    },
-  );
+    { sessionTarget: "main", payload: { kind: "agentTurn" } },
+    { sessionTarget: "isolated", payload: { kind: "systemEvent" } },
+    { sessionTarget: "current", payload: { kind: "systemEvent" } },
+    { sessionTarget: "session:agent:main:conversation", payload: { kind: "script" } },
+  ] as const)("classifies target/payload guidance as invalid input: $sessionTarget", (job) => {
+    let error: unknown;
+    try {
+      assertSupportedJobSpec(job);
+    } catch (cause) {
+      error = cause;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect(isCronInvalidRequestError(error)).toBe(true);
+  });
 
   it("classifies unresolved agent ownership as an actionable invalid request", () => {
     expect(isCronInvalidRequestError(new Error(CRON_AGENT_SELECTION_REQUIRED_MESSAGE))).toBe(true);

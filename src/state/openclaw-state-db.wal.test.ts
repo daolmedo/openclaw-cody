@@ -22,6 +22,7 @@ import {
 import { runWithSqliteWorkerStateContext } from "../infra/sqlite-worker-state-context.js";
 import { storageProcessTestEntrypoints } from "../infra/storage-process-runtime.test-support.js";
 import { createPluginStateKeyedStore } from "../plugin-state/plugin-state-store.js";
+import { requireNativeSqliteDatabase } from "../test-utils/native-sqlite.js";
 import {
   createOpenClawDatabaseMaintenanceScope,
   runOutsideOpenClawDatabaseMaintenanceScope,
@@ -237,7 +238,7 @@ it("keeps periodic WAL work off the host before and after a competing SQLite wri
   );
 });
 
-it("analyzes once per periodic pass, preserves retained snapshots, and admits run-index plans", async () => {
+it("maintains planner statistics per periodic pass without disturbing snapshots or run-index plans", async () => {
   const { database, periodic } = openWithPeriodicMaintenance(
     path.join(tempDirs.make("state-wal-planner-"), "openclaw.sqlite"),
   );
@@ -261,9 +262,13 @@ it("analyzes once per periodic pass, preserves retained snapshots, and admits ru
     createSqliteWorkerBackend(undefined, { databasePath: database.path }),
   );
   let refuseCommit = false;
+  let refreshedStatisticsAtCommit: unknown;
   const admission = createSqliteWorkerOperationAdmission((request, grant) => {
     context.admission.assertCurrent();
-    if (refuseCommit && request.stage === "commit" && analyses() === 3) {
+    if (refuseCommit && request.stage === "commit" && plannerPasses() === 3) {
+      refreshedStatisticsAtCommit = database.db
+        .prepare("SELECT stat FROM sqlite_stat1 WHERE idx='idx_audit_events_run_sequence'")
+        .get();
       throw new Error("fixture revoked commit");
     }
     grant();
@@ -283,20 +288,20 @@ it("analyzes once per periodic pass, preserves retained snapshots, and admits ru
       ),
     );
   // Preserve real scheduler continuation and native command execution while exposing SQL counts.
-  walAdmission.registerSqliteWalWorkerMaintenance(database.db, async (request) =>
-    z.object({ reclaimedPages: z.number() }).parse(execute(request)),
+  walAdmission.registerSqliteWalWorkerMaintenance(
+    requireNativeSqliteDatabase(database.db),
+    async (request) => z.object({ reclaimedPages: z.number() }).parse(execute(request)),
   );
   const statements = vi.spyOn(database.db, "exec");
-  const analyses = () =>
-    statements.mock.calls.filter(([sql]) => sql.includes("ANALYZE main")).length;
+  const plannerPasses = () =>
+    statements.mock.calls.filter(([sql]) => sql.includes("PRAGMA optimize")).length;
   try {
     execute({ maxPages: 0, checkpointMode: "PASSIVE" });
-    expect(analyses()).toBe(0);
+    expect(plannerPasses()).toBe(0);
     reader.exec("BEGIN");
     expect(read.all("run-100", 0)).toEqual(before);
     await periodic();
-    expect(analyses()).toBe(1);
-    expect(statements).toHaveBeenCalledWith("PRAGMA analysis_limit=1000; ANALYZE main;");
+    expect(plannerPasses()).toBe(1);
     expect(
       reader.prepare("SELECT name FROM sqlite_schema WHERE name='sqlite_stat1'").get(),
     ).toBeUndefined();
@@ -309,7 +314,7 @@ it("analyzes once per periodic pass, preserves retained snapshots, and admits ru
         fresh
           .prepare("SELECT stat FROM sqlite_stat1 WHERE idx='idx_audit_events_run_sequence'")
           .get(),
-      ).toBeDefined();
+      ).toEqual({ stat: expect.stringMatching(/^[1-9]\d* /) });
       expect(fresh.prepare(`EXPLAIN QUERY PLAN ${query}`).all("run-100", 0)).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
@@ -322,7 +327,7 @@ it("analyzes once per periodic pass, preserves retained snapshots, and admits ru
       fresh.close();
     }
     execute({ maxPages: 512, checkpointMode: "PASSIVE", continuation: true });
-    expect(analyses()).toBe(1);
+    expect(plannerPasses()).toBe(1);
     database.db.exec(`
       WITH RECURSIVE rows(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM rows WHERE n<64)
       INSERT INTO config_machine_state(state_key,value_json,updated_at_ms)
@@ -333,15 +338,21 @@ it("analyzes once per periodic pass, preserves retained snapshots, and admits ru
       Number(database.db.prepare("PRAGMA freelist_count").get()?.freelist_count),
     ).toBeGreaterThan(8);
     await periodic();
-    expect(analyses()).toBe(2);
+    expect(plannerPasses()).toBe(2);
+    // Missing statistics force real maintenance work before the refused commit.
+    database.db.exec(`
+      DELETE FROM sqlite_stat1 WHERE idx='idx_audit_events_run_sequence';
+      ANALYZE sqlite_schema;
+    `);
     const statistics = database.db.prepare("SELECT * FROM sqlite_stat1 ORDER BY tbl,idx").all();
-    database.db.exec("DELETE FROM audit_events WHERE sequence>4000");
     refuseCommit = true;
     await periodic();
-    expect(analyses()).toBe(3);
+    expect(plannerPasses()).toBe(3);
+    expect(refreshedStatisticsAtCommit).toEqual({ stat: expect.stringMatching(/^[1-9]\d* /) });
     expect(database.db.prepare("SELECT * FROM sqlite_stat1 ORDER BY tbl,idx").all()).toEqual(
       statistics,
     );
+    expect(read.all("run-100", 0)).toEqual(before);
     expect(database.db.isTransaction).toBe(false);
   } finally {
     statements.mockRestore();
@@ -542,7 +553,9 @@ it("refuses checkpoints without borrowing the timer caller's maintenance authori
     periodicWork = Promise.resolve(maintenance.run(() => periodic()));
     await wait(signal);
     expect(observations).toEqual(["error"]);
-    expect(database.walMaintenance.health?.error).toContain("offline maintenance");
+    expect(database.walMaintenance.health?.error).toContain(
+      "without an active schema lease or maintenance scope",
+    );
     expect(prepare).not.toHaveBeenCalled();
     expect(database.walMaintenance.checkpoint()).toBe(false);
     expect(observations).toEqual(["error", "error"]);
@@ -641,6 +654,8 @@ it("cancels queued periodic maintenance during synchronous close without replayi
     )
     .run("maintenance-close", "preserved", "{}", 1);
   const { observations, stop } = observeCheckpoints(database.path);
+  const prepare = vi.spyOn(database.db, "prepare");
+  const exec = vi.spyOn(database.db, "exec");
   const periodicWork: Promise<unknown>[] = [];
   try {
     periodicWork.push(Promise.resolve(periodic()));
@@ -649,10 +664,12 @@ it("cancels queued periodic maintenance during synchronous close without replayi
     const closed = closeOpenClawStateDatabaseByPath(database.path);
     expect(closed).toBe(true);
     expect(database.db.isOpen).toBe(false);
-    expect(observations).toEqual(["complete"]);
+    expect(observations).toEqual([]);
     periodicWork.push(Promise.resolve(periodic()));
     await Promise.all(periodicWork);
-    expect(observations).toEqual(["complete"]);
+    expect(observations).toEqual([]);
+    expect(prepare).not.toHaveBeenCalled();
+    expect(exec).not.toHaveBeenCalled();
     const reopened = openOpenClawStateDatabase({ path: database.path });
     expect(
       reopened.db
@@ -660,12 +677,55 @@ it("cancels queued periodic maintenance during synchronous close without replayi
         .all("maintenance-close"),
     ).toEqual([{ event_key: "preserved" }]);
   } finally {
+    prepare.mockRestore();
+    exec.mockRestore();
     stop();
     try {
       await closeOpenClawStateDatabaseByPathAsync(database.path);
     } finally {
       await Promise.all(periodicWork);
     }
+  }
+});
+
+it("checkpoints committed worker writes before retiring the host without host SQL", async () => {
+  const root = tempDirs.make("state-wal-worker-shutdown-");
+  const env = { ...process.env, OPENCLAW_STATE_DIR: path.join(root, "state") };
+  const store = createPluginStateKeyedStore<string>("fixture-plugin", {
+    namespace: "worker-shutdown",
+    maxEntries: 1,
+    env,
+  });
+  await store.register("retained", "initial");
+  const database = openOpenClawStateDatabase({ env });
+  await store.register("retained", "final");
+  const prepare = vi.spyOn(database.db, "prepare");
+  const exec = vi.spyOn(database.db, "exec");
+  const nativeClose = database.db.close.bind(database.db);
+  let walBytesAtHostClose: number | undefined;
+  const close = vi.spyOn(database.db, "close").mockImplementation(() => {
+    walBytesAtHostClose = fs.statSync(`${database.path}-wal`).size;
+    nativeClose();
+  });
+  try {
+    await closeOpenClawStateDatabaseByPathAsync(database.path);
+    expect(prepare).not.toHaveBeenCalled();
+    expect(exec).not.toHaveBeenCalled();
+    expect(walBytesAtHostClose).toBe(0);
+  } finally {
+    prepare.mockRestore();
+    exec.mockRestore();
+    close.mockRestore();
+  }
+  const reopened = new DatabaseSync(database.path, { readOnly: true });
+  try {
+    expect(
+      reopened
+        .prepare("SELECT value_json FROM plugin_state_entries WHERE entry_key = 'retained'")
+        .get(),
+    ).toEqual({ value_json: '"final"' });
+  } finally {
+    reopened.close();
   }
 });
 

@@ -238,6 +238,8 @@ describe.skipIf(process.platform === "win32")("LaunchAgent file restoration", ()
           });
         }
         await rename(from, to);
+        const stat = await fs.stat(to);
+        await fs.utimes(to, stat.atime, new Date(stat.mtimeMs + 10));
       });
       if (failure === "publication ownership") {
         native.ownership.mockImplementation(async () => {

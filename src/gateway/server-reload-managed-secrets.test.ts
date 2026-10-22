@@ -28,6 +28,7 @@ import {
   getActiveSecretsRuntimeSnapshotRevision,
   prepareSecretsRuntimeSnapshot,
 } from "../secrets/runtime.js";
+import * as skillsDiscovery from "../skills/runtime/refresh.js";
 import { diffConfigPaths } from "./config-diff.js";
 import { buildGatewayReloadPlan } from "./config-reload-plan.js";
 import type { GatewayConfigReloadTransactionOwnership } from "./config-reload.js";
@@ -37,12 +38,8 @@ import {
   createConfigReloadTestClock,
   makeWrite,
   makeSnapshot,
-  makeZeroDebounceHookWrite,
 } from "./config-reload.test-support.js";
-import {
-  GatewayConfigReloadSupersededError,
-  GatewayHotReloadStaleSecretsError,
-} from "./server-reload-contracts.js";
+import { GatewayHotReloadStaleSecretsError } from "./server-reload-contracts.js";
 import { createManagedReloadSecretHandlers } from "./server-reload-managed-secrets.js";
 import { SharedGatewaySessionGenerationState } from "./server-shared-auth-generation.js";
 import { createRuntimeSecretsActivator } from "./server-startup-config.js";
@@ -180,6 +177,7 @@ async function createReload(
       expectedRevision: getActiveSecretsRuntimeSnapshotRevision(),
     }),
     applyHotReload,
+    hasPendingModelRuntimeReload: () => false,
   });
   const ownership: GatewayConfigReloadTransactionOwnership = {
     isCurrent: () => true,
@@ -258,7 +256,9 @@ describe("managed reload authored source", () => {
         );
         return "applied";
       },
+      hasPendingModelRuntimeReload: () => false,
     });
+    const refresh = vi.spyOn(skillsDiscovery, "refreshSkillsDiscovery").mockResolvedValue();
     const { clock, scheduler } = createConfigReloadTestClock();
     const snapshot = makeSnapshot({ config: source, hash: "saved-secret-source" });
     const readSnapshot = vi.fn(async () => makeSnapshot({ config: initial, hash: "initial" }));
@@ -276,6 +276,7 @@ describe("managed reload authored source", () => {
     expect(getRuntimeConfigSnapshot()?.models?.providers?.fixture?.apiKey).toBe(
       "resolved-fixture-key",
     );
+    expect(refresh).toHaveBeenCalledOnce();
 
     const application = createRuntimeConfigWriteApplication();
     const settled: string[] = [];
@@ -294,84 +295,64 @@ describe("managed reload authored source", () => {
     );
     expect(getRuntimeConfigSourceSnapshot()).toEqual(source);
     expect(harness.onHotReload).toHaveBeenCalledOnce();
+    expect(refresh).toHaveBeenCalledOnce();
     await harness.reloader.stop();
   });
 
-  it.each(["same-source", "newer-write"] as const)(
-    "rechecks config ownership after durable secrets publication preparation (%s)",
-    async (observation) => {
-      const initialConfig: OpenClawConfig = { gateway: { port: 18789 } };
-      const config: OpenClawConfig = { gateway: { port: 18790 } };
-      activateSecretsRuntimeSnapshot(await prepare(initialConfig));
-      const prepared = await prepare(config);
-      const revision = getActiveSecretsRuntimeSnapshotRevision();
-      const snapshot = makeSnapshot({ config, hash: "candidate" });
-      const published = vi.fn();
-      const policies: Array<OpenClawConfig | null> = [];
-      const activate = createRuntimeSecretsActivator({
-        ...activatorOptions(),
-        beforeSnapshotPublication: async (policy) => {
-          policies.push(policy);
-          if (policy !== prepared.config) {
-            return;
-          }
-          if (observation === "newer-write") {
-            harness.emitWrite({
-              ...makeZeroDebounceHookWrite("successor"),
-              snapshot: makeSnapshot({ config, hash: "successor" }),
-              sourceConfig: config,
-              runtimeConfig: config,
-            });
-          } else {
-            harness.watcher.emit("change");
-          }
-        },
-      });
-      const runtime = { operationId: "secret-publication", generation: 2, pluginIds: ["notes"] };
-      const harness = createReloaderHarness(async () => snapshot, {
-        initialConfig: config,
-        onHotReload: async (plan, nextConfig, ownership) => {
-          const activated = await activate.activatePreparedSnapshotIfCurrent(
-            prepared,
-            revision,
-            { reason: "reload", activate: true },
-            published,
-            ownership.isCurrent,
-            ownership.checkpoint,
-          );
-          if (!activated) {
-            throw new Error("Prepared secrets lost publication ownership");
-          }
-          ownership.markRuntimeCommitted(nextConfig, plan);
-          return { status: "applied", runtime };
-        },
-      });
-      await harness.reloader.ready;
-      try {
-        const operation = harness.reloader.applyPluginLifecycleChange({
+  it("publishes prepared secrets through a same-source watcher echo", async () => {
+    const initialConfig: OpenClawConfig = { gateway: { port: 18789 } };
+    const config: OpenClawConfig = { gateway: { port: 18790 } };
+    activateSecretsRuntimeSnapshot(await prepare(initialConfig));
+    const prepared = await prepare(config);
+    const revision = getActiveSecretsRuntimeSnapshotRevision();
+    const snapshot = makeSnapshot({ config, hash: "candidate" });
+    const published = vi.fn();
+    const policies: Array<OpenClawConfig | null> = [];
+    const activate = createRuntimeSecretsActivator({
+      ...activatorOptions(),
+      beforeSnapshotPublication: async (policy) => {
+        policies.push(policy);
+        if (policy === prepared.config) {
+          harness.watcher.emit("change");
+        }
+      },
+    });
+    const runtime = { operationId: "secret-publication", generation: 2, pluginIds: ["notes"] };
+    const harness = createReloaderHarness(async () => snapshot, {
+      initialConfig: config,
+      onHotReload: async (plan, nextConfig, ownership) => {
+        const activated = await activate.activatePreparedSnapshotIfCurrent(
+          prepared,
+          revision,
+          { reason: "reload", activate: true },
+          published,
+          ownership.isCurrent,
+          ownership.checkpoint,
+        );
+        if (!activated) {
+          throw new Error("Prepared secrets lost publication ownership");
+        }
+        ownership.markRuntimeCommitted(nextConfig, plan);
+        return { status: "applied", runtime };
+      },
+    });
+    await harness.reloader.ready;
+    try {
+      await expect(
+        harness.reloader.applyPluginLifecycleChange({
           config,
           pluginIds: ["notes"],
           reason: "reload",
-        });
-        if (observation === "same-source") {
-          await expect(operation).resolves.toBe(runtime);
-          expect(published).toHaveBeenCalledOnce();
-          expect(getActiveSecretsRuntimeSnapshotState()?.config).toEqual(prepared.config);
-          expect(policies).toEqual([prepared.config]);
-        } else {
-          await expect(operation).rejects.toMatchObject({
-            cause: expect.any(GatewayConfigReloadSupersededError),
-          });
-          expect(published).not.toHaveBeenCalled();
-          expect(getActiveSecretsRuntimeSnapshotState()?.config).toEqual(initialConfig);
-          expect(policies).toEqual([prepared.config, initialConfig]);
-        }
-      } finally {
-        await harness.reloader.stop();
-        clearSecretsRuntimeSnapshot();
-      }
-    },
-  );
+        }),
+      ).resolves.toBe(runtime);
+      expect(published).toHaveBeenCalledOnce();
+      expect(getActiveSecretsRuntimeSnapshotState()?.config).toEqual(prepared.config);
+      expect(policies).toEqual([prepared.config]);
+    } finally {
+      await harness.reloader.stop();
+      clearSecretsRuntimeSnapshot();
+    }
+  });
 
   it.each(["success", "hook fails", "publisher fails", "publisher replaces then fails"] as const)(
     "commits the exact target and reconciles publication outcome: %s",

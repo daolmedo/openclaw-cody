@@ -213,6 +213,12 @@ async function buildCatalogFallbackBaseline(
     for (const [index, entry] of CONTROL_UI_LOCALE_ENTRIES.entries()) {
       const memoryPath = path.join(I18N_ASSETS_DIR, `${entry.locale}.tm.jsonl`);
       if (!existsSync(memoryPath)) {
+        // A newly registered source-only locale has no memory until its own refresh
+        // worker creates it; sibling workers must not block that bootstrap. The
+        // aggregate sync and check still require every locale's memory.
+        if (options.allowCatalogDrift) {
+          continue;
+        }
         throw new Error(`${toRepoPath(memoryPath)} does not contain ${entry.locale} translations`);
       }
       const memory = loadControlUiTranslationMemory(memoryPath);
@@ -293,9 +299,16 @@ async function verifyControlUiSourceCatalogShape() {
 
 export async function verifyControlUiPluginCatalogs(repoRoot = ROOT) {
   const summaries = [];
+  const sharedSource = flattenControlUiCatalog(loadControlUiSourceCatalog(), "en");
   const supportedLocales = new Set<string>(CONTROL_UI_LOCALE_ENTRIES.map(({ locale }) => locale));
   for (const plugin of await loadControlUiPluginCatalogs(repoRoot)) {
     const sourceFlat = flattenControlUiCatalog(plugin.source, `${plugin.id}:en`);
+    for (const [key, text] of sourceFlat) {
+      const shared = sharedSource.get(key);
+      if (shared !== undefined && shared !== text) {
+        throw new Error(`${plugin.id}:${key} disagrees with the shared English catalog`);
+      }
+    }
     const localeFlats = new Map<string, Map<string, string>>();
     let unusedTranslations = 0;
     for (const [locale, translations] of Object.entries(plugin.translations)) {

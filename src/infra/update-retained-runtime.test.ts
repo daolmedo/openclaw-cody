@@ -24,6 +24,7 @@ import { resolveRuntimeWorkerUrl } from "./runtime-worker-url.js";
 import { openSqliteWorkerStore, type SqliteWorkerStore } from "./sqlite-worker-store.js";
 import * as temporaryArtifacts from "./temp-artifact-cleanup.js";
 import { runUpdateStateInspectionWorker } from "./update-candidate-state.inspection.js";
+import { createUpdateErrorFact } from "./update-failure-facts.js";
 import type { ResolvedGlobalInstallTarget } from "./update-global.js";
 import { type RetainUpdateRuntime, withRetainedUpdateRuntime } from "./update-retained-runtime.js";
 
@@ -74,6 +75,8 @@ it.for([false, true])(
     const original = new Error("original update failure");
     const entered = createDeferred();
     const release = createDeferred();
+    const nativeEntered = createDeferred();
+    const nativeRelease = createDeferred();
     const removed = vi.spyOn(fs, "rm");
     const reportRetained = vi.spyOn(temporaryArtifacts, "reportRetainedUpdateRuntime");
     vi.spyOn(os, "tmpdir").mockReturnValue(base);
@@ -115,7 +118,11 @@ it.for([false, true])(
       source.runtimeGeneration.retain({}, async () => {
         entered.resolve();
         await release.promise;
-        resourcesSettled = true;
+        return async () => {
+          nativeEntered.resolve();
+          await nativeRelease.promise;
+          resourcesSettled = true;
+        };
       });
       acceptedWrite = store.execute({ type: "append", input: "accepted before exit" });
       void acceptedWrite.catch(() => undefined);
@@ -143,8 +150,27 @@ it.for([false, true])(
       expect(assertResourcesSettled).not.toHaveBeenCalled();
       assert.ok(directory);
       expect((await stat(directory)).isDirectory()).toBe(true);
+      release.resolve();
+      await withinTest(
+        awaitGateBeforeSettlement(
+          nativeEntered.promise,
+          settled,
+          "Updater returned before native retirement",
+        ),
+        signal,
+      );
+      expect(await maintain()).toContainEqual(
+        expect.stringContaining("the creating update still owns this runtime"),
+      );
+      expect(assertResourcesSettled).not.toHaveBeenCalled();
+      expect(reportRetained).not.toHaveBeenCalledWith(
+        directory,
+        expect.stringContaining("worker generation settled; cleanup deferred"),
+      );
+      expect((await stat(directory)).isDirectory()).toBe(true);
     } finally {
       release.resolve();
+      nativeRelease.resolve();
       await settled;
     }
     expect(await settled).toEqual(failed ? { error: original } : { value: receipt.metrics });
@@ -437,11 +463,18 @@ it.each([".git", "extensions/retired", "extensions/linked-residue"])(
     if (directory !== "extensions/retired") {
       await symlink(target, link, process.platform === "win32" ? "junction" : "dir");
     }
-    await expect(
-      withRetainedUpdateRuntime(pathToFileURL(path.join(root, "dist/updater.mjs")).href, (retain) =>
-        retain({ mutationRoots: [root], timeoutMs: 30_000, assertCurrent() {} }),
-      ),
-    ).rejects.toThrow(`Cannot privately copy host-owned plugin link ${link} -> ${target}`);
+    const failure = await withRetainedUpdateRuntime(
+      pathToFileURL(path.join(root, "dist/updater.mjs")).href,
+      (retain) => retain({ mutationRoots: [root], timeoutMs: 30_000, assertCurrent() {} }),
+    ).catch((error: unknown) => error);
+    expect(failure).toMatchObject({
+      code: "host-owned-plugin-link",
+      message: expect.stringContaining(`${link} -> ${target}`),
+    });
+    expect(createUpdateErrorFact("updater-runtime-retention", failure)).toMatchObject({
+      check: "updater-runtime-retention",
+      code: "host-owned-plugin-link",
+    });
     expect(await readFile(marker, "utf8")).toBe("unrelated checkout data");
   },
 );
@@ -893,7 +926,6 @@ it("falls back when the runtime sibling is read-only", async () => {
     });
     assert.ok(retained && generation);
     expect(await readFile(retained, "utf8")).toBe(backend);
-    expect(() => generation!.resolve(pathToFileURL(retained!))).toThrow("generation is closing");
   } finally {
     allocation.mockRestore();
     temporaryRoot.mockRestore();

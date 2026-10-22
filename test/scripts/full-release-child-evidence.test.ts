@@ -50,8 +50,6 @@ function fixture(role = "normalCi") {
     },
     jobs,
     attempts: [jobs],
-    // Page sizes above this limit return GitHub's persistent large-listing 502.
-    maxPageSize: 100,
     role,
   };
 }
@@ -66,7 +64,6 @@ function seal(data = fixture(), runAttempt = 1) {
   const event = join(root, "event.json");
   const output = join(root, "output");
   const receipt = join(root, "receipt.json");
-  const calls = join(root, "calls");
   writeFileSync(fixturePath, JSON.stringify(data));
   writeFileSync(
     event,
@@ -85,22 +82,13 @@ function seal(data = fixture(), runAttempt = 1) {
 const fs = require("node:fs");
 const fixture = JSON.parse(fs.readFileSync(process.env.FRV_FIXTURE, "utf8"));
 const endpoint = process.argv.find((arg) => arg.startsWith("repos/"));
-fs.appendFileSync(process.env.FRV_CALLS, endpoint + "\\n");
 if (endpoint === "repos/openclaw/openclaw/actions/runs/101") {
   process.stdout.write(JSON.stringify(fixture.run));
 } else if (endpoint.startsWith("repos/openclaw/openclaw/actions/runs/101/attempts/")) {
   const attempt = Number(endpoint.split("/").at(-2));
-  const perPage = Number(new URL("https://x/" + endpoint).searchParams.get("per_page"));
-  if (perPage > fixture.maxPageSize) {
-    process.stderr.write("gh: Server Error (HTTP 502)\\n");
-    process.exit(1);
-  }
   const jobs = fixture.attempts[attempt - 1];
-  const pages = [];
-  for (let start = 0; start === 0 || start < jobs.length; start += perPage) {
-    pages.push({ total_count: jobs.length, jobs: jobs.slice(start, start + perPage) });
-  }
-  process.stdout.write(JSON.stringify(pages));
+  const page = Number(new URL("https://example.invalid/" + endpoint).searchParams.get("page") ?? 1);
+  process.stdout.write(JSON.stringify({total_count: jobs.length, jobs: jobs.slice((page - 1) * 100, page * 100)}));
 } else {
   throw new Error("Unexpected evidence read: " + endpoint);
 }
@@ -115,7 +103,6 @@ if (endpoint === "repos/openclaw/openclaw/actions/runs/101") {
       PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
       OPENCLAW_GH_BIN: gh,
       GH_TOKEN: "synthetic-test-token",
-      FRV_CALLS: calls,
       FRV_FIXTURE: fixturePath,
       FRV_CHILD_ROLE: role,
       FRV_CHILD_TARGET_SHA: TARGET,
@@ -129,8 +116,7 @@ if (endpoint === "repos/openclaw/openclaw/actions/runs/101") {
       GITHUB_REF_NAME: "main",
     },
   });
-  const endpoints = readFileSync(calls, "utf8").trim().split("\n");
-  return { result, receipt, output, endpoints };
+  return { result, receipt, output };
 }
 
 describe("full release child evidence producer", () => {
@@ -245,6 +231,19 @@ describe("full release child evidence producer", () => {
     },
   );
 
+  it("seals a complete paginated attempt without a monolithic metadata response", () => {
+    const data = fixture();
+    for (let index = 0; index < 100; index++) {
+      data.jobs.push({ ...data.jobs[1]!, id: index + 10, name: `workload ${index}` });
+    }
+    const { result, receipt } = seal(data);
+    expect(result.status, result.stderr).toBe(0);
+    const evidence = JSON.parse(readFileSync(receipt, "utf8"));
+    expect(evidence.workloadConclusion).toBe("success");
+    expect(evidence.jobs).toHaveLength(102);
+    expect(evidence.observedRunAttempts).toEqual([1]);
+  });
+
   it.each(["pluginPrereleaseIndependent", "releaseChecksCandidate"])(
     "seals %s evidence at the exact target SHA",
     (role) => {
@@ -305,62 +304,6 @@ describe("full release child evidence producer", () => {
         ["node tests", accepted],
         ["resolve target", 1],
       ]);
-    },
-  );
-
-  it("rereads attempt job listings at smaller pages after a GitHub 5xx", () => {
-    const data = fixture();
-    data.maxPageSize = 50;
-    data.run.run_attempt = 2;
-    data.jobs[2]!.status = "completed";
-    data.jobs[2]!.conclusion = "failure";
-    data.attempts.push([
-      { ...data.jobs[2]!, id: 4, run_attempt: 2, status: "in_progress", conclusion: null },
-    ]);
-    const { result, receipt, endpoints } = seal(data, 2);
-    expect(result.status, result.stderr).toBe(0);
-    expect(JSON.parse(readFileSync(receipt, "utf8"))).toMatchObject({
-      observedRunAttempts: [1, 2],
-      publisher: { jobId: "4" },
-    });
-    expect(endpoints.filter((endpoint) => endpoint.includes("/jobs?"))).toEqual([
-      "repos/openclaw/openclaw/actions/runs/101/attempts/1/jobs?per_page=100",
-      "repos/openclaw/openclaw/actions/runs/101/attempts/1/jobs?per_page=50",
-      "repos/openclaw/openclaw/actions/runs/101/attempts/2/jobs?per_page=100",
-      "repos/openclaw/openclaw/actions/runs/101/attempts/2/jobs?per_page=50",
-    ]);
-  });
-
-  it.each([
-    { jobs: 2000, accepted: true },
-    { jobs: 2001, accepted: false },
-  ])(
-    "keeps the 2,000-job attempt ceiling after falling back to 30-job pages: $jobs jobs",
-    ({ jobs, accepted }) => {
-      const data = fixture();
-      data.maxPageSize = 30;
-      const [first, , publisher] = data.jobs;
-      data.jobs.splice(
-        0,
-        data.jobs.length,
-        ...Array.from({ length: jobs - 1 }, (_, index) => ({
-          ...first!,
-          id: index + 10,
-          name: `job ${index}`,
-        })),
-        publisher!,
-      );
-      const { result, endpoints } = seal(data);
-      expect(result.status, result.stderr).toBe(accepted ? 0 : 1);
-      if (!accepted) {
-        expect(result.stderr).toContain("Child evidence job inventory is incomplete");
-      }
-      expect(endpoints.filter((endpoint) => endpoint.includes("/jobs?"))).toEqual(
-        [100, 50, 30].map(
-          (perPage) =>
-            `repos/openclaw/openclaw/actions/runs/101/attempts/1/jobs?per_page=${perPage}`,
-        ),
-      );
     },
   );
 

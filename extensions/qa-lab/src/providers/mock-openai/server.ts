@@ -21,6 +21,7 @@ import {
   normalizeAnthropicMessagesRequest,
 } from "./mock-anthropic-messages.js";
 import { adaptAnthropicToolCallIds } from "./mock-anthropic-wire.js";
+import { resolveAfterToolHttpFailure } from "./mock-openai-after-tool-failures.js";
 import {
   buildAssistantText,
   buildImageInspectionReply,
@@ -57,7 +58,6 @@ import {
   QA_BLOCK_STREAMING_PROMPT_RE,
   QA_TOOL_PROGRESS_PROMPT_RE,
   QA_TOOL_LOOP_GLOBAL_BREAKER_PROMPT_RE,
-  QA_PROVIDER_HTTP_503_AFTER_TOOL_PROMPT_RE,
   QA_MSTEAMS_THREAD_DEDUPE_PROMPT_RE,
   QA_THREAD_REPLY_RECEIPT_PROMPT_RE,
   QA_A2A_MESSAGE_TOOL_MIRROR_PROMPT_RE,
@@ -742,9 +742,9 @@ async function buildResponsesPayload(
       completedToolName === "tool_search" &&
       !toolOutput.includes("FAKE_PLUGIN_OK") &&
       toolSearchOutputHasCandidate(parseToolOutputJson(toolOutput), targetTool) &&
-      hasDeclaredTool(body, "tool_call")
+      hasDeclaredTool(body, "dispatch_action")
     ) {
-      return buildToolCallEventsWithArgs("tool_call", { id: targetTool, args: plannedArgs });
+      return buildToolCallEventsWithArgs("dispatch_action", { id: targetTool, args: plannedArgs });
     }
     if (
       !hasCompletedToolOutput &&
@@ -2033,6 +2033,7 @@ export async function startQaMockOpenAiServer(params?: QaMockOpenAiServerOptions
       repeatedRequestRecoveryAttempts: 0,
       stalledTurnRecoveryAttempts: 0,
       toolLoopReadAttempts: 0,
+      rateLimitAfterToolInjected: false,
     };
     scenarioStates.set(sessionId ?? "", scenarioState);
     const compactionSummaryFaultMode = resolveCompactionSummaryFaultMode({
@@ -2156,21 +2157,16 @@ export async function startQaMockOpenAiServer(params?: QaMockOpenAiServerOptions
         : undefined;
     const failure =
       injectedFailure ??
-      (QA_PROVIDER_HTTP_503_AFTER_TOOL_PROMPT_RE.test(allInputText) && hasToolOutput(input)
-        ? {
-            status: 503,
-            type: "server_error",
-            message: "Service Unavailable",
-            retryAfterSeconds: 120,
-          }
-        : undefined);
+      resolveAfterToolHttpFailure(allInputText, hasToolOutput(input), scenarioState);
     const recorded = requestLog.record({
       ...requestSnapshotBase,
       outcome:
         failure || events.some((event) => event.type === "response.failed") ? "error" : "success",
       ...(events.some((event) => event.type === "response.failed")
         ? { errorCode: "response_failed_no_details" }
-        : {}),
+        : failure?.code
+          ? { errorCode: failure.code }
+          : {}),
       plannedToolCallId: plannedTool.callId,
       ...(request.route === "responses" && plannedTool.itemId
         ? { plannedToolItemId: plannedTool.itemId }

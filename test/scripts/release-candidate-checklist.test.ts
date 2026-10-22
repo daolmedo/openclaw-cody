@@ -68,6 +68,7 @@ import {
 } from "../../scripts/release-candidate-checklist.mts";
 import type { runReleasePublishPreflight } from "../../scripts/release-publish-preflight.mts";
 import { loadReleaseNotesForTag } from "../../scripts/render-github-release-notes.mts";
+import { isShaPinnedReleaseValidationBranch } from "../../scripts/validate-full-release-validation-evidence.mjs";
 import { stripNodeTypeScriptTypes } from "../helpers/node-toolchain.js";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
@@ -188,7 +189,7 @@ describe("release candidate checklist", () => {
     ]);
     expect(prepared.publicationRoute).toBe("prepared");
     const identity = { targetSha: "a".repeat(40), toolingSha: "b".repeat(40) };
-    const saved = buildReleaseCandidateState(normal, identity);
+    const saved = { ...buildReleaseCandidateState(normal, identity), fullReleaseRunId: "111" };
     expect(() =>
       reconcileReleaseCandidateState(saved, buildReleaseCandidateState(prepared, identity)),
     ).toThrow("publicationRoute");
@@ -250,16 +251,19 @@ describe("release candidate checklist", () => {
     registryAdmission?: boolean;
     preflightFailure?: boolean;
     workflowSha?: string;
-    savedToolingSha?: string;
     savedToolingTag?: string;
+    savedToolingSha?: string;
+    telegramRunId?: string;
     retainedHelperRequest?: boolean;
     sdkAcknowledgement?: string;
+    sdkReport?: boolean;
     generatedFailure?: boolean;
   };
 
   it.each<QualificationCase>([
     ...["", "deadbeef", "f4b495f3"].map<QualificationCase>((sdkAcknowledgement) => ({
       sdkAcknowledgement,
+      sdkReport: sdkAcknowledgement === "",
     })),
     { launch: "npm-only", generatedFailure: true },
     { workflowSha: "b".repeat(40), savedToolingTag: "release-publish/bbbbbbbbbbbb-100" },
@@ -300,6 +304,7 @@ describe("release candidate checklist", () => {
       expected: "passed",
       publicationRoute,
       workflowSha: "b".repeat(40),
+      telegramRunId: "555",
     })),
     { tag: "v2026.9.1", pin: "2026.9.1", workflowSha: "c".repeat(40) },
     { tag: "v2026.9.1", pin: "2026.7.4", expected: "warning", failedRegistry: "" },
@@ -367,10 +372,12 @@ describe("release candidate checklist", () => {
       registryAdmission = false,
       preflightFailure = false,
       workflowSha,
-      savedToolingSha,
       savedToolingTag,
+      savedToolingSha,
+      telegramRunId,
       retainedHelperRequest,
       sdkAcknowledgement,
+      sdkReport,
       generatedFailure,
     }) => {
       const { root: targetRoot, git } = candidateGitFixture({
@@ -429,6 +436,8 @@ describe("release candidate checklist", () => {
         source.match(/^function publicationSelectionForChecklist\([\s\S]*?^\}/mu)?.[0] ?? "";
       const savedTagReader =
         source.match(/^function savedPublishWorkflowRef\([\s\S]*?^\}/mu)?.[0] ?? "";
+      const statePlanning =
+        source.match(/^function canUpdateReleaseCandidateState\([\s\S]*?^\}/mu)?.[0] ?? "";
       const shellQuote = source.match(/^function shellQuote\([\s\S]*?^\}/mu)?.[0] ?? "";
       const log = vi.fn();
       const stages: string[] = [];
@@ -547,6 +556,7 @@ describe("release candidate checklist", () => {
           publicationRoute,
           workflowRef: options.publishWorkflowRef || options.workflowRef,
         });
+        expect(input.npmTelegramRunId).toBeUndefined();
         return {
           rows: preflightRows,
           command: buildReleasePublishDispatchCommand(input, "1", input.workflowRef, "777"),
@@ -557,7 +567,7 @@ describe("release candidate checklist", () => {
       const dispatches: string[][] = [];
       const completion = runInNewContext(
         stripNodeTypeScriptTypes(
-          `${android}\n${selectPublication}\n${savedTagReader}\n${helperDispatch}\n${shellQuote}\n${main}\nmain();`,
+          `${android}\n${selectPublication}\n${statePlanning}\n${savedTagReader}\n${helperDispatch}\n${shellQuote}\n${main}\nmain();`,
         ),
         {
           process: {
@@ -566,6 +576,7 @@ describe("release candidate checklist", () => {
             env: {},
             execPath: process.execPath,
           },
+          TextDecoder,
           DEFAULT_REPO: "openclaw/openclaw",
           resolvePath: (...paths: string[]) => join(...paths),
           console: { log, warn: log },
@@ -573,6 +584,7 @@ describe("release candidate checklist", () => {
           PUBLISH_TOOLING_TAG_PATTERN: /^release-publish\/[a-f0-9]{12}-[1-9][0-9]*$/u,
           TRUSTED_TOOLING_SHA_ENV: "OPENCLAW_RELEASE_CANDIDATE_TRUSTED_TOOLING_SHA",
           RELEASE_CANDIDATE_STATE_FILE: "release-candidate-state.json",
+          RELEASE_CANDIDATE_STATE_VERSION: 2,
           parseArgs: () => options,
           gitTopLevel: (root: string) => root,
           gitRevParse: (_ref: string, root: string) =>
@@ -620,7 +632,10 @@ describe("release candidate checklist", () => {
           validateCandidateChangelogProvenance: () => ({ status: "passed", shippedBaselines: [] }),
           runLocalGeneratedCheckIfNeeded: generatedChecks,
           releaseBranchForTag,
-          readFileSync: () => readFileSync(".github/workflows/full-release-validation.yml", "utf8"),
+          readFileSync: (file: string) =>
+            file.endsWith("plugin-sdk-api-release-diff.md")
+              ? readFileSync(file)
+              : readFileSync(".github/workflows/full-release-validation.yml", "utf8"),
           waitForSuccessfulRun: async (_repo: string, runId: string) => {
             if (dispatches.length === 0) {
               expect(generatedChecks).not.toHaveBeenCalled();
@@ -632,7 +647,26 @@ describe("release candidate checklist", () => {
               source: { workflowRef: options.workflowRef },
             };
           },
-          downloadArtifact: () => {},
+          downloadArtifact: (_repo: string, _runId: string, name: string, outputDir: string) => {
+            if (sdkReport && name.startsWith("plugin-sdk-api-release-diff-")) {
+              mkdirSync(outputDir, { recursive: true });
+              writeFileSync(
+                join(outputDir, "plugin-sdk-api-release-diff.md"),
+                [
+                  "# Plugin SDK API diff",
+                  "",
+                  "latest: v2026.8.1 → fixture",
+                  "",
+                  "Acknowledgement digest: `f4b495f3`",
+                  "",
+                  "## Exports added (1)",
+                  "",
+                  "- `openclaw/plugin-sdk` — `send`",
+                  "",
+                ].join("\n"),
+              );
+            }
+          },
           readJson: (file: string) =>
             file === statePath || file.endsWith("frv-request.json")
               ? JSON.parse(readFileSync(file, "utf8"))
@@ -660,7 +694,8 @@ describe("release candidate checklist", () => {
           preflightCorePackageTarballs,
           preflightDependencyTarballs,
           runParallelsIfNeeded: async () => ({ status: "skipped" }),
-          runTelegramIfNeeded: async () => ({ status: "skipped" }),
+          runTelegramIfNeeded: async () =>
+            telegramRunId ? { status: "passed", runId: telegramRunId } : { status: "skipped" },
           collectPluginPlanWithRetry: async (script: string) => {
             expect(generatedChecks).toHaveBeenCalledOnce();
             stages.push(script);
@@ -698,7 +733,14 @@ describe("release candidate checklist", () => {
         expect(error.message).toContain(
           "Plugin SDK API changes require acknowledgement digest f4b495f3",
         );
-        expect(error.message).toContain("Review the Plugin SDK API diff before rerunning.");
+        if (sdkReport) {
+          expect(error.message).toContain("## Exports added (1)");
+          expect(error.message).toContain("- `openclaw/plugin-sdk` — `send`");
+        } else {
+          expect(error.message).toContain(
+            "Review the Plugin SDK API diff artifact before rerunning.",
+          );
+        }
         const command = error.message.split("\n").at(-1);
         const decoded = execFileSync(
           "bash",
@@ -795,6 +837,12 @@ describe("release candidate checklist", () => {
           publishWorkflowRef,
           ...(launch === "npm-only" ? {} : { fullReleaseRunId: savedState?.fullReleaseRunId }),
         });
+      }
+      if (telegramRunId) {
+        expect(evidence.npmTelegram).toMatchObject({ status: "passed", runId: telegramRunId });
+        expect(evidence.prepareCommand ?? evidence.publishCommand).not.toContain(
+          "npm_telegram_run_id",
+        );
       }
       if (launch === "npm-only") {
         expect(dispatches).toHaveLength(1);
@@ -961,8 +1009,10 @@ describe("release candidate checklist", () => {
     "missing node_modules",
     "install failure",
     "child failure",
+    "worktree removal failure",
     "pinned ancestor",
     "untrusted SHA",
+    "candidate SHA",
   ])("prepares and cleans trusted tooling dependencies: %s", (scenario) => {
     const manifest = { version: "2026.9.1", dependencies: { yaml: "2.8.1" } };
     const { root: targetRoot, git } = candidateGitFixture({
@@ -1004,7 +1054,10 @@ describe("release candidate checklist", () => {
         ? trustedToolingSha
         : scenario === "untrusted SHA"
           ? git("commit-tree", "HEAD^{tree}", "-m", "test: unrelated tooling")
-          : "";
+          : scenario === "candidate SHA"
+            ? (git("commit", "--allow-empty", "-m", "test: release candidate"),
+              git("rev-parse", "HEAD"))
+            : "";
     const installedModules = realpathSync("node_modules");
     if (scenario !== "missing node_modules") {
       symlinkSync(installedModules, join(targetRoot, "node_modules"), "junction");
@@ -1087,6 +1140,13 @@ describe("release candidate checklist", () => {
             args: string[],
             options: Parameters<typeof spawnSync>[2],
           ) => {
+            if (
+              scenario === "worktree removal failure" &&
+              command === "git" &&
+              args[0] === "worktree"
+            ) {
+              return { status: 1, stderr: "fixture worktree removal failed" };
+            }
             if (command === process.execPath) {
               const entrypoint = args[2];
               if (!entrypoint) {
@@ -1106,8 +1166,22 @@ describe("release candidate checklist", () => {
           },
         },
       );
-    if (scenario === "untrusted SHA") {
-      expect(execute).toThrow(`--workflow-sha ${workflowSha} is not reachable from trusted main`);
+    if (scenario === "untrusted SHA" || scenario === "candidate SHA") {
+      expect(execute).toThrow(`--workflow-sha ${workflowSha} is not reachable from trusted main.`);
+      // The vm context has its own Error realm, so read the rendered message.
+      const message = (() => {
+        try {
+          execute();
+        } catch (error) {
+          return String(error);
+        }
+        return "";
+      })();
+      expect(message).toContain("so it must be a commit on trusted main");
+      // Only the candidate itself gets the candidate-specific hint.
+      expect(message.includes("It is the checked-out release candidate.")).toBe(
+        scenario === "candidate SHA",
+      );
       expect(installs).not.toHaveBeenCalled();
       expect(git("worktree", "list", "--porcelain").match(/^worktree /gmu)).toHaveLength(1);
       return;
@@ -1124,9 +1198,28 @@ describe("release candidate checklist", () => {
       expect(JSON.parse(childOutput)).toEqual({ parsed: { ready: true }, cwd: targetRoot });
     }
     expect(installs).toHaveBeenCalledTimes(1);
-    if (toolingRoot) {
+    if (scenario === "worktree removal failure") {
+      try {
+        expect(cleanupWarning).toHaveBeenCalledWith(
+          expect.stringContaining("fixture worktree removal failed"),
+        );
+        expect(existsSync(join(toolingRoot, ".git"))).toBe(true);
+        expect(existsSync(toolingAdminDir)).toBe(true);
+        expect(git("worktree", "list", "--porcelain").match(/^worktree /gmu)).toHaveLength(2);
+      } finally {
+        if (existsSync(join(toolingRoot, ".git"))) {
+          git("worktree", "remove", "--force", toolingRoot);
+        } else {
+          git("worktree", "prune");
+        }
+        rmSync(dirname(toolingRoot), { force: true, recursive: true });
+      }
+    } else if (toolingRoot) {
       expect(existsSync(dirname(toolingRoot))).toBe(false);
       expect(existsSync(toolingAdminDir)).toBe(false);
+    }
+    if (scenario !== "child failure" && scenario !== "worktree removal failure") {
+      expect(cleanupWarning).not.toHaveBeenCalled();
     }
     expect(git("worktree", "list", "--porcelain").match(/^worktree /gmu)).toHaveLength(1);
     expect(existsSync(join(installedModules, "yaml"))).toBe(true);
@@ -1275,7 +1368,7 @@ describe("release candidate checklist", () => {
       publishWorkflowRef: "release-publish/cccccccccccc-200",
     };
 
-    expect(reconcileReleaseCandidateState(saved, repaired)).toMatchObject({
+    expect(reconcileReleaseCandidateState(saved, repaired, true)).toMatchObject({
       toolingSha: "c".repeat(40),
       publishWorkflowRef: "release-publish/cccccccccccc-200",
       fullReleaseRunId: "111",
@@ -1286,6 +1379,39 @@ describe("release candidate checklist", () => {
       reconcileReleaseCandidateState(saved, { ...repaired, skipParallels: !saved.skipParallels }),
     ).toThrow("state mismatch for skipParallels");
   });
+
+  it.each(["unbound", "retained request", "full run", "npm run", "later phase"])(
+    "updates candidate planning flags only before qualification is bound: %s",
+    (scenario) => {
+      const options = parseArgs(["--tag", "v2026.9.1"]);
+      const saved = buildReleaseCandidateState(options, {
+        targetSha: "a".repeat(40),
+        toolingSha: "b".repeat(40),
+      });
+      const expected = {
+        ...saved,
+        skipParallels: true,
+        windowsNodeTag: "v0.6.3",
+        toolingSha: scenario === "unbound" ? "c".repeat(40) : saved.toolingSha,
+      };
+      if (scenario === "full run") {
+        saved.fullReleaseRunId = "111";
+      }
+      if (scenario === "npm run") {
+        saved.npmPreflightRunId = "222";
+      }
+      if (scenario === "later phase") {
+        saved.phase = "waiting";
+      }
+      const reconcile = () =>
+        reconcileReleaseCandidateState(saved, expected, scenario === "retained request");
+      if (scenario === "unbound") {
+        expect(reconcile()).toEqual(expected);
+      } else {
+        expect(reconcile).toThrow("release candidate state mismatch");
+      }
+    },
+  );
 
   it("captures changelogs larger than the Node spawnSync default buffer", () => {
     const output = run(
@@ -1636,7 +1762,7 @@ describe("release candidate checklist", () => {
     ).toThrow("--run-parallels and --skip-parallels cannot be combined");
   });
 
-  it("runs Parallels against the exact prepared candidate tarball", () => {
+  it("runs Parallels against the exact prepared candidate tarball with the candidate harness", async () => {
     expect(candidateParallelsArgs(".artifacts/preflight/openclaw.tgz", [], "/trusted")).toEqual([
       "exec",
       "tsx",
@@ -1648,10 +1774,15 @@ describe("release candidate checklist", () => {
     const command = candidateParallelsShellCommand(
       ".artifacts/preflight/openclaw candidate.tgz",
       "/opt/homebrew/bin/gtimeout",
+      [],
+      [],
+      "",
+      "/candidate",
     );
     expect(command).toContain(
       `set -a; source "$HOME/.profile" >/dev/null 2>&1 || true; set +a; export PATH='${dirname(process.execPath)}':"$PATH"; exec '/opt/homebrew/bin/gtimeout' --foreground 150m pnpm`,
     );
+    expect(command).toContain("'/candidate/scripts/e2e/parallels/npm-update-smoke.ts'");
     expect(
       candidateParallelsShellCommand(
         ".artifacts/preflight/openclaw candidate.tgz",
@@ -1681,6 +1812,33 @@ describe("release candidate checklist", () => {
       "macOS 26.5 Node 24",
       "--json",
     ]);
+    const source = readFileSync("scripts/release-candidate-checklist.mts", "utf8");
+    const owner = source.match(/^async function runParallelsIfNeeded\([\s\S]*?^\}/mu)?.[0];
+    const caller = source.match(/const parallels = await runParallelsIfNeeded\([\s\S]*?\);/u)?.[0];
+    const runLocal = vi.fn(() => "/opt/homebrew/bin/gtimeout");
+    await runInNewContext(
+      stripNodeTypeScriptTypes(`async function fixture() {\n${owner}\n${caller}\n}\nfixture();`),
+      {
+        options: parseArgs(["--tag", "v2026.9.1"]),
+        tarballPath: ".artifacts/preflight/openclaw candidate.tgz",
+        dependencyTarballPaths: [],
+        revalidatedRegistryArtifacts: [],
+        targetRoot: "/candidate",
+        TOOLING_ROOT: "/trusted/tooling",
+        candidateParallelsShellCommand,
+        run: runLocal,
+        process,
+        join,
+      },
+    );
+    expect(runLocal).toHaveBeenCalledWith(
+      "bash",
+      ["-lc", expect.stringContaining("'/candidate/scripts/e2e/parallels/npm-update-smoke.ts'")],
+      {
+        cwd: "/candidate",
+        env: { OPENCLAW_PARALLELS_ARTIFACT_ROOT: "/candidate/.artifacts/parallels" },
+      },
+    );
   });
 
   it("accepts repeatable candidate registry package artifacts", () => {
@@ -2127,7 +2285,80 @@ describe("release candidate checklist", () => {
     ).not.toThrow();
   });
 
-  it("dispatches Telegram proof using the artifact producer rather than its authorization run", async () => {
+  it.each<{
+    name: string;
+    coveragePolicy?: string;
+    profile?: string;
+    source?: string;
+    separatePackage?: boolean;
+    providerMode?: string;
+    waived?: boolean;
+    qualificationSha?: string;
+    qualificationRef?: string;
+    transport?: "missing" | "moved";
+    returnedSha?: string;
+    status?: string;
+    error?: string;
+  }>([
+    {
+      name: "stable FRV package proof with --workflow-sha and default workflow ref",
+      coveragePolicy: "npm-stable-v1",
+      status: "covered-by-full-release-validation",
+    },
+    {
+      name: "beta coverage defers Telegram",
+      coveragePolicy: "npm-beta-v1",
+      profile: "beta",
+      status: "deferred-postpublish",
+    },
+    {
+      name: "admitted full coverage includes package Telegram without a named npm policy",
+      profile: "full",
+      source: "candidate-owned-admission-v1",
+      status: "covered-by-full-release-validation",
+    },
+    {
+      name: "historical full evidence needs supplemental qualification",
+      profile: "full",
+      status: "passed",
+    },
+    {
+      name: "a separately packed tarball needs its own exact-byte qualification",
+      coveragePolicy: "npm-stable-v1",
+      separatePackage: true,
+      status: "passed",
+    },
+    {
+      name: "mock FRV proof cannot cover an explicit live-provider check",
+      coveragePolicy: "npm-stable-v1",
+      providerMode: "live-frontier",
+      status: "passed",
+    },
+    {
+      name: "waived Telegram does not count as package Telegram proof",
+      coveragePolicy: "npm-stable-v1",
+      waived: true,
+      status: "passed",
+    },
+    { name: "missing Q transport", transport: "missing", error: "qualification ref" },
+    { name: "moved Q transport", transport: "moved", error: "qualification ref" },
+    {
+      name: "legacy Q differs from C",
+      qualificationSha: "a".repeat(40),
+      qualificationRef: "release-ci/aaaaaaaaaaaa-123",
+      error: "candidate-owned Full Release Validation",
+    },
+    {
+      name: "main is not a frozen Q transport",
+      qualificationRef: "main",
+      error: "candidate-owned Full Release Validation",
+    },
+    {
+      name: "dispatch race changed Q",
+      returnedSha: "a".repeat(40),
+      error: "Telegram qualification SHA mismatch",
+    },
+  ])("qualifies Telegram with frozen candidate evidence: $name", async (scenario) => {
     const source = readFileSync("scripts/release-candidate-checklist.mts", "utf8");
     const telegramOwner = source.match(/^async function runTelegramIfNeeded\([\s\S]*?^\}/mu)?.[0];
     const telegramCall = source.match(
@@ -2136,22 +2367,52 @@ describe("release candidate checklist", () => {
     expect(telegramOwner).toBeDefined();
     expect(telegramCall).toBeDefined();
     const options = {
-      ...parseArgs(["--tag", "v2026.7.1", "--windows-node-tag", "v0.6.3"]),
+      ...parseArgs([
+        "--tag",
+        scenario.profile === "beta" ? "v2026.7.1-beta.1" : "v2026.7.1",
+        "--release-profile",
+        scenario.profile ?? "stable",
+        "--workflow-sha",
+        "b".repeat(40),
+        "--telegram-provider-mode",
+        scenario.providerMode ?? "mock-openai",
+      ]),
       npmPreflightRunId: "222",
       publishWorkflowRef,
     };
+    expect(options.workflowRef).toBe("main");
+    const targetSha = "c".repeat(40);
+    const qualificationRef = scenario.qualificationRef ?? "release-ci/cccccccccccc-123";
     const dispatchWorkflow = vi.fn(() => "333");
+    const lookupQualificationRef = vi.fn(async () => {
+      if (scenario.transport === "missing") {
+        throw new Error("404 missing qualification ref");
+      }
+      return {
+        ref: `refs/heads/${qualificationRef}`,
+        object: {
+          type: "commit",
+          sha: scenario.transport === "moved" ? "d".repeat(40) : targetSha,
+        },
+      };
+    });
     const waitForSuccessfulRun = vi.fn(async () => ({
-      run: { url: "https://github.com/openclaw/openclaw/actions/runs/333" },
+      run: {
+        headSha: scenario.returnedSha ?? targetSha,
+        url: "https://github.com/openclaw/openclaw/actions/runs/333",
+      },
     }));
     // Execute the private owner and its real caller without exporting a test-only API.
-    const result = (await runInNewContext(
+    const completion = runInNewContext(
       stripNodeTypeScriptTypes(
         `async function fixture() {\n${telegramOwner}\n${telegramCall}\nreturn npmTelegram;\n}\nfixture();`,
       ),
       {
         buildTelegramArtifactInputs,
         dispatchWorkflow,
+        githubApi: lookupQualificationRef,
+        isRecord,
+        isShaPinnedReleaseValidationBranch,
         waitForSuccessfulRun,
         options,
         npmArtifact: {
@@ -2166,17 +2427,47 @@ describe("release candidate checklist", () => {
           packageVersion: options.tag.slice(1),
         },
         npmRun: { runAttempt: 1 },
-        targetSha: "c".repeat(40),
-        fullValidationEvidence: { coveragePolicy: "npm-stable-v1" },
+        targetSha,
+        npmUsesFullRun: !scenario.separatePackage,
+        fullValidationEvidence: {
+          coveragePolicy: scenario.coveragePolicy,
+          source: scenario.source ?? "sha-pinned-main",
+          run: { headSha: scenario.qualificationSha ?? targetSha, headBranch: qualificationRef },
+          evidence: {
+            current: {
+              manifest: {
+                releaseProfile: options.releaseProfile,
+                validationInputs: { telegramWaiver: scenario.waived ? "reviewed waiver" : "" },
+              },
+            },
+          },
+        },
       },
-    )) as { status: string; runId?: string };
+    ) as Promise<{ status: string; runId?: string }>;
+    if (scenario.error) {
+      await expect(completion).rejects.toThrow(scenario.error);
+      expect(dispatchWorkflow).toHaveBeenCalledTimes(scenario.returnedSha ? 1 : 0);
+      return;
+    }
+    const result = await completion;
+    expect(result.status).toBe(scenario.status);
+    if (scenario.status !== "passed") {
+      expect(dispatchWorkflow).not.toHaveBeenCalled();
+      expect(lookupQualificationRef).not.toHaveBeenCalled();
+      expect(waitForSuccessfulRun).not.toHaveBeenCalled();
+      return;
+    }
     expect(result).toMatchObject({ status: "passed", runId: "333" });
+    expect(lookupQualificationRef).toHaveBeenCalledWith(
+      `repos/${options.repo}/git/ref/heads/${qualificationRef}`,
+    );
     expect(dispatchWorkflow).toHaveBeenCalledOnce();
     expect(dispatchWorkflow).toHaveBeenCalledWith(
       options.repo,
       "npm-telegram-beta-e2e.yml",
-      options.workflowRef,
+      qualificationRef,
       expect.objectContaining({
+        harness_ref: targetSha,
         package_artifact_id: 9,
         package_artifact_run_id: "444",
         package_source_sha: "c".repeat(40),
@@ -2184,7 +2475,7 @@ describe("release candidate checklist", () => {
     );
     expect(waitForSuccessfulRun).toHaveBeenCalledWith(options.repo, "333", {
       workflowName: "NPM Telegram Beta E2E",
-      workflowRef: options.workflowRef,
+      workflowRef: qualificationRef,
     });
   });
 
@@ -2533,6 +2824,103 @@ describe("GitHub API public fallback", () => {
       expect(fetchImpl).toHaveBeenCalledTimes(2);
       expect(fetchImpl.mock.calls[0]?.[1]?.headers).toMatchObject({ Authorization: "Bearer x" });
       expect(fetchImpl.mock.calls[1]?.[1]?.headers).not.toHaveProperty("Authorization");
+    },
+  );
+});
+
+describe("release run environment approval diagnostics", () => {
+  it.each([
+    { capability: true, unavailable: false, empty: false },
+    { capability: false, unavailable: false, empty: false },
+    { capability: undefined, unavailable: false, empty: false },
+    { capability: undefined, unavailable: true, empty: false },
+    { capability: undefined, unavailable: false, empty: true },
+  ])(
+    "reports approval capability $capability (unavailable=$unavailable, empty=$empty)",
+    async ({ capability, unavailable, empty }) => {
+      const source = readFileSync("scripts/release-candidate-checklist.mts", "utf8");
+      const owners = [
+        "runInfo",
+        "pendingDeployments",
+        "summarizePendingDeployments",
+        "summarizeFailedRun",
+        "waitForSuccessfulRun",
+      ]
+        .map(
+          (name) =>
+            source.match(new RegExp(`^(?:async )?function ${name}\\([\\s\\S]*?^\\}`, "mu"))?.[0],
+        )
+        .join("\n");
+      const log = vi.fn();
+      let reads = 0;
+      const fetchImpl = vi.fn(async (path: string, init?: RequestInit) => {
+        if (path.endsWith("/pending_deployments")) {
+          if (unavailable && new Headers(init?.headers).has("Authorization")) {
+            return jsonResponse(
+              { message: "API rate limit exceeded; credential-private fixture error" },
+              { status: 403 },
+            );
+          }
+          return jsonResponse(
+            empty || reads > 1
+              ? []
+              : [
+                  {
+                    environment: { id: 7, name: "npm-release" },
+                    current_user_can_approve: unavailable ? false : capability,
+                  },
+                ],
+          );
+        }
+        if (path.includes("/jobs?")) {
+          return jsonResponse({ jobs: [] });
+        }
+        reads++;
+        return jsonResponse({
+          id: 123,
+          name: "Release",
+          head_branch: "main",
+          status: reads === 1 ? "waiting" : "completed",
+          conclusion: reads === 1 ? null : "success",
+          html_url: "https://github.com/fixture/repo/actions/runs/123",
+        });
+      });
+      await runInNewContext(
+        stripNodeTypeScriptTypes(
+          `${owners}\nwaitForSuccessfulRun("fixture/repo", "123", { workflowName: "Release", workflowRef: "main" });`,
+        ),
+        {
+          githubApi: (path: string, options: Parameters<typeof githubApi>[1]) =>
+            githubApi(path, { ...options, token: "test-token", fetchImpl }),
+          isRecord,
+          formatJsonValue: JSON.stringify,
+          console: { log },
+          wait: async () => {},
+        },
+      );
+      const output = log.mock.calls.map(([line]) => line).join("\n");
+      if (unavailable) {
+        expect(output).toContain("environment approval status unavailable");
+        expect(output).toContain("not proof that no approval is pending");
+        expect(output).not.toContain("credential-private");
+      } else if (empty) {
+        expect(output).not.toContain("pending approval");
+        expect(output).not.toContain("approval status unavailable");
+      } else {
+        expect(output).toContain('pending approval: env="npm-release"');
+        expect(output).toContain(
+          "Environment approval is separate from repository write, organization membership, branch-policy read, CI bypass, and production deployment authority",
+        );
+        expect(output.includes("approve: gh api -X POST")).toBe(capability === true);
+        if (capability !== true) {
+          expect(output).toContain("ask an eligible environment reviewer");
+          expect(output).toContain(
+            capability === false
+              ? "authenticated caller cannot approve"
+              : "Caller approval capability is unknown",
+          );
+        }
+      }
     },
   );
 });

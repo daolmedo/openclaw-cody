@@ -45,7 +45,7 @@ it("preserves the released updater's bookkeeping comparison during candidate Doc
         OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
       },
       async () => {
-        const ctx = await prepareDoctorContext(configPath);
+        await using ctx = await prepareDoctorContext(configPath);
         // Exercise the write stage without loading optional plugin repairs.
         ctx.configResult.shouldWriteConfig = true;
         await runInitialConfigWriteHealth(ctx);

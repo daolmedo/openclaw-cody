@@ -261,11 +261,9 @@ export function resolveModelContextTokenProjectionFromCache(
         configuredModel,
         normalizePositiveContextTokens,
       );
-    if (effectiveConfiguredTokens !== undefined) {
-      return { contextTokens: effectiveConfiguredTokens, authoredContextTokens };
-    }
-    if (fixedContextWindow !== undefined) {
-      return { contextTokens: fixedContextWindow, authoredContextTokens };
+    const configuredTokens = effectiveConfiguredTokens ?? fixedContextWindow;
+    if (configuredTokens !== undefined) {
+      return { contextTokens: configuredTokens, authoredContextTokens };
     }
     const providerKey = providerContextTokenCacheKey(normalizeProviderId(ref.provider), ref.model);
     const providerResult =

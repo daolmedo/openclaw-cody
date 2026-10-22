@@ -167,10 +167,6 @@ vi.mock("./session-updates.js", () => ({
   incrementCompactionCount: async () => undefined,
 }));
 
-vi.mock("./session-usage.js", () => ({
-  persistSessionUsageUpdate: async () => undefined,
-}));
-
 vi.mock("./agent-runner-memory.js", () => ({
   runMemoryFlushIfNeeded: async ({ sessionEntry }: { sessionEntry?: unknown }) => ({
     sessionEntry,
@@ -180,9 +176,11 @@ vi.mock("./agent-runner-memory.js", () => ({
     sessionEntry,
 }));
 
-vi.mock("./queue.js", () => ({
+// mock-isolation: Keep the process-wide followup queue and drain registry outside media cases.
+vi.mock("./queue.js", async () => ({
   admitFollowupRunLifecycle: vi.fn(async () => {}),
   enqueueFollowupRun: enqueueFollowupRunMock,
+  isFollowupRunAborted: (await import("./queue/types.js")).isFollowupRunAborted,
   parkSteerCandidate: parkSteerCandidateMock,
   refreshQueuedFollowupSession: refreshQueuedFollowupSessionMock,
   resolveFollowupAbortSignal: vi.fn(() => undefined),
@@ -220,13 +218,13 @@ function createMediaFollowupRun(overrides: Parameters<typeof createMockFollowupR
   return followupRun;
 }
 
-function makeRunReplyAgentParams(
+async function makeRunReplyAgentParams(
   overrides: Partial<Parameters<typeof runReplyAgent>[0]> & {
     provider?: string;
     prompt?: string;
     workspaceDir?: string;
   } = {},
-): Parameters<typeof runReplyAgent>[0] {
+): Promise<Parameters<typeof runReplyAgent>[0]> {
   const provider = overrides.provider ?? "whatsapp";
   const prompt = overrides.prompt ?? "generate chart";
   const runWorkspaceDir = overrides.workspaceDir ?? testWorkspaceDir;
@@ -257,7 +255,7 @@ function makeRunReplyAgentParams(
     }
   }
   if (overrides.isActive === true && !overrides.replyOperation) {
-    replyOperation.bindToolAuthoritySnapshot(prepareReplyToolAuthority(followupRun));
+    await replyOperation.bindToolAuthoritySnapshotAsync(prepareReplyToolAuthority(followupRun));
   }
   if (overrides.isActive === true) {
     replyOperation.attachBackend({

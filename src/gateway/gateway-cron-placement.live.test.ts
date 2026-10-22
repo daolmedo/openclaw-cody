@@ -299,11 +299,7 @@ describeLive("cron placement identity through production Gateway routing", () =>
 
           // The same real Gateway now pauses a registered reply hook before its final HTTP effect.
           let hookTarget = second;
-          // HOOK_ROTATED rotates the root by forcing a cron run while this hook holds the
-          // session writer; since #165310 that run waits for the writer, so the step deadlocks.
-          // Skipped on the release line until the step is reworked on main (#174956).
-          const hookMarkers: Array<"HOOK_ALLOWED" | "HOOK_ROTATED"> = ["HOOK_ALLOWED"];
-          for (const marker of hookMarkers) {
+          for (const marker of ["HOOK_ALLOWED", "HOOK_ROTATED"]) {
             const accepted = await connected.request<{ runId: string; status: string }>("agent", {
               agentId: "probe",
               sessionKey: rootKey,

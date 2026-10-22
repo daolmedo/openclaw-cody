@@ -84,6 +84,7 @@ function boundLiveEvent(event: WorkerLiveEvent): WorkerLiveEvent {
     bounded = {
       kind: "thinking",
       payload: {
+        ...event.payload,
         text: truncateLiveText(event.payload.text),
         delta: truncateLiveText(event.payload.delta),
       },
@@ -252,7 +253,11 @@ export function createWorkerLiveRuntime(client: WorkerLiveClient) {
         streamedThinking = readAssistantThinking(event.message);
         enqueueLive({
           kind: "thinking",
-          payload: { text: streamedThinking, delta: event.assistantMessageEvent.delta },
+          payload: {
+            text: streamedThinking,
+            delta: event.assistantMessageEvent.delta,
+            itemId: assistantSource?.itemId,
+          },
         });
       }
       return;
@@ -263,7 +268,11 @@ export function createWorkerLiveRuntime(client: WorkerLiveClient) {
       if (finalThinking !== streamedThinking) {
         enqueueLive({
           kind: "thinking",
-          payload: { text: finalThinking, delta: finalThinking },
+          payload: {
+            text: finalThinking,
+            delta: finalThinking,
+            itemId: assistantSource?.itemId,
+          },
         });
       }
       return;

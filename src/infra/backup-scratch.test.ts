@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -10,6 +11,7 @@ import {
   finishBackupScratch,
   maintainBackupScratch,
 } from "./backup-scratch.js";
+import * as fsSafe from "./fs-safe.js";
 import * as nodeSqlite from "./node-sqlite.js";
 import * as privateDirectory from "./sqlite-private-directory.js";
 import * as stagingToken from "./sqlite-staging-token.js";
@@ -55,6 +57,62 @@ it.each([false, true])(
       resume.resolve();
       await expect(finishBackupScratch(await creating, () => {})).resolves.toBeUndefined();
     }
+    await expect(fs.readdir(root)).resolves.toEqual([]);
+  },
+);
+
+it("reclaims scratch when the platform cannot rename onto an existing directory", async () => {
+  const root = await fs.realpath(dirs.make("backup-scratch-windows-"));
+  const scratch = await createBackupScratchDirectory(root);
+  await fs.writeFile(path.join(scratch.directory, "config-0"), "synthetic config");
+  const nativePlatform = process.platform;
+  const platform = vi.spyOn(process, "platform", "get").mockReturnValue(nativePlatform);
+  const createRoot = fsSafe.root;
+  // Keep filesystem admission native; emulate Windows only at the retirement move.
+  vi.spyOn(fsSafe, "root").mockImplementation(async (...args) => {
+    const boundary = await createRoot(...args);
+    if (args[0] === root) {
+      platform.mockReturnValue("win32");
+      vi.spyOn(boundary, "move").mockImplementation(async (from, to, options) => {
+        platform.mockReturnValue(nativePlatform);
+        options?.assertBeforeMutation?.();
+        const destination = path.join(root, to);
+        if (fsSync.existsSync(destination)) {
+          throw Object.assign(new Error("Windows cannot replace a directory"), { code: "EPERM" });
+        }
+        await fs.rename(path.join(root, from), destination);
+      });
+    }
+    return boundary;
+  });
+  // A precreated target must reach EPERM even on hosts without Windows ACL helpers.
+  vi.spyOn(privateDirectory, "createPrivateSqliteTempDirectory").mockImplementation(
+    (parent, prefix) => fs.mkdtemp(path.join(parent, prefix)),
+  );
+  const log = vi.fn();
+  await expect(finishBackupScratch(scratch, log)).resolves.toBeUndefined();
+  expect(log).not.toHaveBeenCalled();
+  await expect(fs.readdir(root)).resolves.toEqual([]);
+});
+
+it.runIf(process.platform === "win32")(
+  "preserves an existing retirement destination without moving the owned scratch",
+  async () => {
+    const root = dirs.make("backup-scratch-collision-");
+    const scratch = await createBackupScratchDirectory(root);
+    const id = crypto.randomUUID();
+    const destination = path.join(root, `openclaw-backup-retired-${id}`);
+    await fs.mkdir(destination);
+    const before = await fs.lstat(destination, { bigint: true });
+    vi.spyOn(crypto, "randomUUID").mockReturnValue(id);
+
+    await expect(finishBackupScratch(scratch, () => {})).resolves.toContain(scratch.directory);
+    await expect(fs.stat(path.join(scratch.directory, "owner.sqlite"))).resolves.toBeDefined();
+    await expect(fs.lstat(destination, { bigint: true })).resolves.toMatchObject({
+      dev: before.dev,
+      ino: before.ino,
+    });
+    await expect(fs.readdir(destination)).resolves.toEqual([]);
   },
 );
 
@@ -125,26 +183,32 @@ it.each([false, true])(
   async (reclaimed) => {
     const root = dirs.make("backup-scratch-create-open-");
     const open = nodeSqlite.openNodeSqliteDatabase;
+    const createDirectory = privateDirectory.createPrivateSqliteTempDirectory;
     let failedDirectory: string | undefined;
     let nativeFailure: unknown;
-    vi.spyOn(nodeSqlite, "openNodeSqliteDatabase").mockImplementation((location, options) => {
-      if (failedDirectory) {
-        return open(location, options);
-      }
-      failedDirectory = path.dirname(location);
-      if (reclaimed) {
-        fsSync.rmSync(failedDirectory, { recursive: true });
-      }
-      try {
-        return open(
-          reclaimed ? location : path.join(failedDirectory, "missing", "owner.sqlite"),
-          options,
+    vi.spyOn(privateDirectory, "createPrivateSqliteTempDirectory").mockImplementationOnce(
+      async (...args) => {
+        const directory = await createDirectory(...args);
+        vi.spyOn(nodeSqlite, "openNodeSqliteDatabase").mockImplementationOnce(
+          (location, options) => {
+            failedDirectory = directory;
+            if (reclaimed) {
+              fsSync.rmSync(directory, { recursive: true });
+            }
+            try {
+              return open(
+                reclaimed ? location : path.join(directory, "missing", "owner.sqlite"),
+                options,
+              );
+            } catch (error) {
+              nativeFailure = error;
+              throw error;
+            }
+          },
         );
-      } catch (error) {
-        nativeFailure = error;
-        throw error;
-      }
-    });
+        return directory;
+      },
+    );
     let scratch: Awaited<ReturnType<typeof createBackupScratchDirectory>> | undefined;
     try {
       const outcome = await createBackupScratchDirectory(root).then(

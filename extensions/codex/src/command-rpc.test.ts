@@ -3,7 +3,6 @@ import os from "node:os";
 import path from "node:path";
 import {
   clearRuntimeAuthProfileStoreSnapshots,
-  replaceRuntimeAuthProfileStoreSnapshots,
   type AuthProfileStore,
 } from "openclaw/plugin-sdk/agent-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
@@ -13,6 +12,11 @@ import {
   resetPluginRuntimeStateForTest,
   setActivePluginRegistry,
 } from "openclaw/plugin-sdk/plugin-test-runtime";
+import { updateAuthProfileStoreWithLock } from "openclaw/plugin-sdk/provider-auth";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "openclaw/plugin-sdk/runtime-config-snapshot";
 import {
   clearSessionStoreCacheForTest,
   upsertSessionEntry,
@@ -86,7 +90,8 @@ describe("Codex command RPC helpers", () => {
     vi.stubEnv("OPENAI_API_KEY", undefined);
     vi.stubEnv("CODEX_API_KEY", undefined);
     config = { agents: { defaults: { model: { primary: "openai/gpt-5.5" } } } };
-    setAuthStore({ version: 1, profiles: {} });
+    setRuntimeConfigSnapshot(config);
+    await setAuthStore({ version: 1, profiles: {} });
     harness = createClientHarness();
     requestCodexAppServerJsonMock.mockReset();
     requestCodexAppServerJsonMock.mockResolvedValue(resumeResponse);
@@ -118,13 +123,23 @@ describe("Codex command RPC helpers", () => {
     await closeOpenClawAgentDatabasesAsync();
     await closeOpenClawStateDatabaseAsync();
     clearRuntimeAuthProfileStoreSnapshots();
+    clearRuntimeConfigSnapshot();
     clearSessionStoreCacheForTest();
+    clearRuntimeConfigSnapshot();
     vi.unstubAllEnvs();
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
-  function setAuthStore(store: AuthProfileStore) {
-    replaceRuntimeAuthProfileStoreSnapshots([{ agentDir, store }]);
+  async function setAuthStore(store: AuthProfileStore) {
+    const saved = await updateAuthProfileStoreWithLock({
+      agentDir,
+      stateDir: tempDir,
+      updater: (current) => {
+        Object.assign(current, store);
+        return true;
+      },
+    });
+    expect(saved).not.toBeNull();
   }
 
   function resume(options: Partial<CodexControlRequestOptions> = {}) {
@@ -206,7 +221,9 @@ describe("Codex command RPC helpers", () => {
     const options = { config, authProfileId: "openai:selected" };
     const startOptions = { transport: "stdio" as const, command: "codex", args: [], headers: {} };
     await expect(prepareCodexControlSessionAuth(options, startOptions)).resolves.toEqual({
+      release: expect.any(Function),
       authProfileId: "openai:selected",
+      source: undefined,
       clientOptions: { authProfileId: "openai:selected" },
     });
     await expect(
@@ -256,6 +273,8 @@ describe("Codex command RPC helpers", () => {
       {
         authProfileId: undefined,
         assertCurrent: expect.any(Function),
+        assertCurrentAsync: expect.any(Function),
+        source: expect.any(Function),
       },
     );
   });
@@ -280,7 +299,7 @@ describe("Codex command RPC helpers", () => {
               accountId: "control-account",
             }
           : { type, provider: "openai", token };
-      setAuthStore({
+      await setAuthStore({
         version: 1,
         profiles: { "openai:old": credential, "openai:ready": credential },
         order: { openai: ["openai:old", "openai:ready"] },
@@ -313,6 +332,8 @@ describe("Codex command RPC helpers", () => {
       expect(onResponse).toHaveBeenCalledWith(expect.anything(), harness.client, {
         authProfileId: "openai:ready",
         assertCurrent: expect.any(Function),
+        assertCurrentAsync: expect.any(Function),
+        source: expect.any(Function),
       });
     },
   );
@@ -322,7 +343,7 @@ describe("Codex command RPC helpers", () => {
     const explicitStorePath = path.join(tempDir, "explicit", "sessions.json");
     const configuredStorePath = path.join(tempDir, "configured", "sessions.json");
     config.session = { store: configuredStorePath };
-    setAuthStore({
+    await setAuthStore({
       version: 1,
       profiles: {
         "openai:first": { type: "api_key", provider: "openai", key: "automatic-key" },

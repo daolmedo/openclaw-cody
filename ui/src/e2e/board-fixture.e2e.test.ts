@@ -6,8 +6,8 @@ import { asNullableRecord } from "@openclaw/normalization-core/record-coerce";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runQaGatewayFixture } from "../../../test/helpers/qa-gateway-cleanup.ts";
-import type { ApplicationRuntime } from "../app/bootstrap.ts";
 import { createControlUiE2eArtifactDir } from "../test-helpers/control-ui-e2e-artifacts.ts";
+import { evaluateControlUiContext } from "../test-helpers/control-ui-e2e-context.ts";
 import {
   canRunPlaywrightChromium,
   controlUiSessionUrl,
@@ -19,6 +19,7 @@ import {
   stopFixtureServer,
   type FixtureServer,
 } from "./board-fixture-server.test-support.ts";
+import { selectAllSidebarSessions } from "./sidebar-navigation.test-support.ts";
 
 const chromiumExecutablePath = resolvePlaywrightChromiumExecutablePath(chromium.executablePath());
 const chromiumAvailable = canRunPlaywrightChromium(chromiumExecutablePath);
@@ -58,14 +59,13 @@ async function openWidgetMenu(page: Page): Promise<void> {
   const widget = page.locator('[data-test-id="board-widget"]').first();
   await widget.focus();
   await widget.locator(".board-widget__menu-trigger").click();
-  await page.locator(".board-widget__menu[open]").waitFor();
+  await widget.locator(".board-widget__menu-panel:popover-open").waitFor();
 }
 
 async function readMenuColors(page: Page): Promise<{ background: string; foreground: string }> {
   return page.evaluate(() => {
-    const dropdown = document.querySelector(".board-widget__menu");
-    const item = dropdown?.querySelector("wa-dropdown-item:not(.board-widget__menu-danger)");
-    const menu = dropdown?.shadowRoot?.querySelector('[part~="menu"]');
+    const menu = document.querySelector(".board-widget__menu-panel:popover-open");
+    const item = menu?.querySelector('[role="menuitem"]:not(.board-widget__menu-danger)');
     if (!(item instanceof HTMLElement) || !(menu instanceof HTMLElement)) {
       throw new Error("board fixture menu did not expose its surface and first item");
     }
@@ -83,16 +83,17 @@ async function requestPreviewGateway(
   page: Page,
   requests: Array<{ method: string; params?: unknown }>,
 ): Promise<unknown[]> {
-  return page.evaluate((batch) => {
-    const app = document.querySelector<HTMLElement & { runtime?: ApplicationRuntime }>(
-      "openclaw-app",
-    );
-    const client = app?.runtime?.context.gateway.snapshot.client;
-    if (!client) {
-      throw new Error("Preview Gateway client is unavailable");
-    }
-    return Promise.all(batch.map(({ method, params }) => client.request(method, params)));
-  }, requests);
+  return evaluateControlUiContext(
+    page,
+    (context, batch) => {
+      const client = context.gateway.snapshot.client;
+      if (!client) {
+        throw new Error("Preview Gateway client is unavailable");
+      }
+      return Promise.all(batch.map(({ method, params }) => client.request(method, params)));
+    },
+    requests,
+  );
 }
 
 describeStandaloneMockServer("standalone Control UI mock server", () => {
@@ -334,6 +335,8 @@ describeStandaloneMockServer("standalone Control UI mock server", () => {
         });
         const page = await context.newPage();
         await page.goto(`${origin}/chat`, { waitUntil: "networkidle" });
+        // The fixture viewer is Riley; this shared checkout belongs to Peter.
+        await selectAllSidebarSessions(page);
         await page.getByText("OpenClaw work checkout", { exact: true }).click();
         await page.getByRole("button", { name: "Write a message to send." }).waitFor();
         await page.screenshot({ path: path.join(artifacts, "chat.png") });
@@ -762,12 +765,12 @@ describeStandaloneMockServer("standalone Control UI mock server", () => {
       await page.goto(fixtureServer.url, { waitUntil: "networkidle" });
       await openWidgetMenu(page);
       const presentation = await page
-        .locator(".board-widget__menu[open] .board-widget__menu-danger")
+        .locator(".board-widget__menu-panel:popover-open .board-widget__menu-danger")
         .evaluate((action) => {
           const menu = action.parentElement;
-          const move = menu?.querySelector('wa-dropdown-item[value^="move:"]');
+          const move = menu?.querySelector('[role="menuitem"][data-value^="move:"]');
           const preset = menu?.querySelector(".board-widget__preset");
-          const icon = action.querySelector('[slot="icon"]');
+          const icon = action.querySelector(".board-widget__menu-icon");
           if (!(move instanceof HTMLElement) || !(preset instanceof HTMLElement)) {
             throw new Error("board fixture menu did not expose move and resize options");
           }
@@ -815,6 +818,8 @@ describeStandaloneMockServer("standalone Control UI mock server", () => {
     const page = await browser.newPage();
     try {
       await page.goto(new URL("/chat", fixtureServer.url).toString(), { waitUntil: "networkidle" });
+      // External catalog sessions have no human owner.
+      await selectAllSidebarSessions(page);
       await page.getByText("Release checklist sweep", { exact: true }).click();
 
       const transcript = [
@@ -849,6 +854,7 @@ describeStandaloneMockServer("standalone Control UI mock server", () => {
       expect(
         await page.evaluate(() => localStorage.getItem("openclaw:control-ui:community-invite:v2")),
       ).not.toBeNull();
+      await selectAllSidebarSessions(page);
       await page.getByText("OpenClaw work checkout", { exact: true }).click();
 
       await page.getByRole("button", { name: "Write a message to send." }).waitFor();
@@ -857,21 +863,21 @@ describeStandaloneMockServer("standalone Control UI mock server", () => {
         .locator("openclaw-chat-pane.chat-pane-cache__pane--active")
         .evaluate(async (pane) => {
           const chatPane = pane as HTMLElement & {
-            hasUpdated?: boolean;
-            updateComplete?: Promise<boolean>;
+            transcriptReady: boolean;
+            updateComplete: Promise<unknown>;
           };
           await chatPane.updateComplete;
           const constructor = customElements.get("openclaw-chat-pane");
           return {
             connected: chatPane.isConnected,
-            hasUpdated: chatPane.hasUpdated,
+            transcriptReady: chatPane.transcriptReady,
             registered: constructor !== undefined,
             upgraded: constructor !== undefined && chatPane instanceof constructor,
           };
         });
       expect(paneState).toEqual({
         connected: true,
-        hasUpdated: true,
+        transcriptReady: true,
         registered: true,
         upgraded: true,
       });
@@ -885,6 +891,7 @@ describeStandaloneMockServer("standalone Control UI mock server", () => {
     const page = await browser.newPage();
     try {
       await page.goto(new URL("/chat", fixtureServer.url).toString(), { waitUntil: "networkidle" });
+      await selectAllSidebarSessions(page);
       await page.getByText("OpenClaw work checkout", { exact: true }).click();
       await page.getByRole("button", { name: "Write a message to send." }).waitFor();
 

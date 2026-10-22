@@ -58,7 +58,12 @@ const mocks = vi.hoisted(() => ({
   readService: vi.fn<typeof import("../../daemon/service.js").readGatewayServiceState>(),
   execSchtasks: vi.fn<typeof import("../../daemon/schtasks-exec.js").execSchtasks>(),
 }));
-vi.mock("../../daemon/schtasks-exec.js", () => ({ execSchtasks: mocks.execSchtasks }));
+// mock-isolation: Recovery tests mutate only their synthetic Windows task, never host services.
+vi.mock("../../daemon/schtasks-exec.js", () => ({
+  execSchtasks: mocks.execSchtasks,
+  execScheduledTaskEnabledChange: (taskName: string, enabled: boolean) =>
+    mocks.execSchtasks(["/Change", "/TN", taskName, enabled ? "/ENABLE" : "/DISABLE"]),
+}));
 vi.mock("../../infra/update-repair-agent.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../infra/update-repair-agent.js")>()),
   runUpdateRepairLoop: mocks.repair,
@@ -432,13 +437,6 @@ describe("post-activation failure settlement without inference", () => {
           root: activeRoot,
           after: { version: rollback === "restored" ? "2026.9.1" : "2026.9.3" },
         },
-        automaticTriage: restoredHealthy
-          ? undefined
-          : expect.objectContaining({
-              kind: "update",
-              phase: reason,
-              installationRoot: activeRoot,
-            }),
       });
       // Plugin writes remain in the original stopped interval and never rerun after restoration.
       expect(mocks.converge).toHaveBeenCalledOnce();

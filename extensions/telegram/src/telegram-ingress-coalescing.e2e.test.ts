@@ -305,20 +305,20 @@ describe("Telegram durable ingress coalescing", () => {
     }
   });
 
-  it("keeps a later album alive and ordered behind a slowly adopting album", async () => {
+  it("keeps a later album alive and ordered behind a slowly adopting album", async ({ signal }) => {
     const { monitor } = await createMonitor({ adoptionStallTimeoutMs: 1_000 });
-    const { headDispatched, releaseHead, headFinished } = holdFirstDownstreamTurn();
+    const { headDispatched, releaseHead } = holdFirstDownstreamTurn();
     useIngressTimers();
     monitor.start();
     try {
-      await admitAlbum(monitor, "A", 1_001);
+      await withinTest(admitAlbum(monitor, "A", 1_001), signal);
       // Freeze the claim clock while dispatch finishes its real worker I/O.
-      await headDispatched.promise;
-      await admitAlbum(monitor, "B", 1_003);
-      await vi.advanceTimersByTimeAsync(3_000);
+      await withinTest(headDispatched.promise, signal);
+      await withinTest(admitAlbum(monitor, "B", 1_003), signal);
+      await withinTest(vi.advanceTimersByTimeAsync(3_000), signal);
       expect(downstreamTurns, "Album B must wait for album A's adoption").toHaveBeenCalledOnce();
       releaseHead.resolve();
-      await monitor.waitForDeferredClaims();
+      await withinTest(monitor.waitForDeferredClaims(), signal);
       expect(downstreamTurns).toHaveBeenCalledTimes(2);
       expect(downstreamTurns.mock.calls.map(([turn]) => turn.RawBody)).toEqual([
         "Album A",
@@ -328,36 +328,51 @@ describe("Telegram durable ingress coalescing", () => {
       expect(runtimeErrors).toEqual([]);
     } finally {
       releaseHead.resolve();
-      await headFinished.promise;
       await monitor.stop();
     }
   });
 
-  it("keeps a later same-sender forward batch alive behind a deferred batch", async () => {
+  it("keeps a later same-sender forward batch alive behind a deferred batch", async ({
+    signal,
+  }) => {
     const { monitor } = await createMonitor({ adoptionStallTimeoutMs: 3_000 });
-    const { releaseHead, turnsDeferred, turnsFinished } = holdDownstreamLane();
+    const { releaseHead, turnsDeferred } = holdDownstreamLane();
     useIngressTimers();
     monitor.start();
     try {
-      await monitor.admit(forwardedTextUpdate({ updateId: 1_401, messageId: 1, text: "Batch A" }));
-      await monitor.waitForIdle();
-      await vi.advanceTimersByTimeAsync(1_000);
+      await withinTest(
+        monitor.admit(forwardedTextUpdate({ updateId: 1_401, messageId: 1, text: "Batch A" })),
+        signal,
+      );
+      await withinTest(monitor.waitForIdle(), signal);
+      await withinTest(vi.advanceTimersByTimeAsync(1_000), signal);
       // Freeze the claim clock while each flushed turn finishes its real worker I/O.
-      await turnsDeferred[0]?.promise;
-      await monitor.admit(forwardedTextUpdate({ updateId: 1_402, messageId: 2, text: "Batch B" }));
-      await monitor.waitForIdle();
-      await vi.advanceTimersByTimeAsync(1_000);
+      await withinTest(turnsDeferred[0].promise, signal);
+      await withinTest(
+        monitor.admit(forwardedTextUpdate({ updateId: 1_402, messageId: 2, text: "Batch B" })),
+        signal,
+      );
+      await withinTest(monitor.waitForIdle(), signal);
+      await withinTest(vi.advanceTimersByTimeAsync(1_000), signal);
       // A deferred head releases the sender key; B queues behind it in the session lane.
-      await turnsDeferred[1]?.promise;
-      await vi.advanceTimersByTimeAsync(9_000);
+      await withinTest(turnsDeferred[1].promise, signal);
+      await withinTest(vi.advanceTimersByTimeAsync(9_000), signal);
       const queue = openTelegramIngressQueue({ stateDir });
-      expect(await queue.listPending({ limit: "all" }), "Batch B stalled behind A").toEqual([]);
-      expect((await queue.listClaims()).map(({ id, attempts }) => ({ id, attempts }))).toEqual([
+      expect(
+        await withinTest(queue.listPending({ limit: "all" }), signal),
+        "Batch B stalled behind A",
+      ).toEqual([]);
+      expect(
+        (await withinTest(queue.listClaims(), signal)).map(({ id, attempts }) => ({
+          id,
+          attempts,
+        })),
+      ).toEqual([
         { id: telegramQueueEventId(1_401), attempts: 0 },
         { id: telegramQueueEventId(1_402), attempts: 0 },
       ]);
       releaseHead.resolve();
-      await monitor.waitForDeferredClaims();
+      await withinTest(monitor.waitForDeferredClaims(), signal);
       expect(downstreamTurns.mock.calls.map(([turn]) => turn.RawBody)).toEqual([
         "Batch A",
         "Batch B",
@@ -366,7 +381,6 @@ describe("Telegram durable ingress coalescing", () => {
       expect(runtimeErrors).toEqual([]);
     } finally {
       releaseHead.resolve();
-      await Promise.all(turnsFinished);
       await monitor.stop();
     }
   });

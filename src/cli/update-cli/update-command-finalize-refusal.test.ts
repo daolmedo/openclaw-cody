@@ -20,7 +20,7 @@ import {
   listUpdateRuns,
 } from "../../infra/update-run-ledger.js";
 import { renderUpdateRunReport } from "../../infra/update-run-report.js";
-import { defaultRuntime } from "../../runtime.js";
+import { defaultRuntime, ExitError } from "../../runtime.js";
 import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
 import * as utils from "../../utils.js";
 import * as restartHealth from "../daemon-cli/restart-health.js";
@@ -233,10 +233,12 @@ it.each([true, false])(
   async (json) => {
     vi.stubEnv("OPENCLAW_PROFILE", "repair-test");
     const nextAction =
-      "Stop the Gateway through its service owner, stop other OpenClaw processes using this state, then rerun `openclaw --profile repair-test update repair`.";
+      "Stop the Gateway through its service owner (`openclaw --profile repair-test gateway stop --force` for the managed service), stop other OpenClaw processes using this state, then rerun `openclaw --profile repair-test update repair`.";
     const old = createUpdateRun({ trigger: "cli" });
     const history = finishUpdateRun(old.runId, { status: "failed", reason: "abandoned" });
-    await updateRepairCommand({ json, yes: true, deferCompletionCache: true });
+    await expect(
+      updateRepairCommand({ json, yes: true, deferCompletionCache: true }),
+    ).rejects.toEqual(new ExitError(2));
     expect(native.events).toEqual([
       "running-holder",
       "stop-verified",

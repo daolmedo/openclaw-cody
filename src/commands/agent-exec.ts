@@ -449,12 +449,7 @@ export async function agentExecCommand(
       `Agent exec cleanup failed: ${formatErrorMessage(cleanupError)}`,
     );
     if (commandResult.envelope.ok) {
-      commandResult = resultForEnvelope({
-        ...commandResult.envelope,
-        ok: false,
-        status: "error",
-        error: { message: cleanupFailure.message, kind: "cleanup" },
-      });
+      commandResult = resultForEnvelope(errorEnvelope(cleanupFailure, sessionId));
     } else {
       runtime.error(cleanupFailure.message);
     }

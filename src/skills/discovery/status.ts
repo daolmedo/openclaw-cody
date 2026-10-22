@@ -1,8 +1,9 @@
 import path from "node:path";
+import { getAgentWorkspaceAccess } from "../../agents/workspace-access.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { prepareBinaryAvailability } from "../../shared/config-eval.js";
 import { evaluateEntryRequirementsForCurrentPlatform } from "../../shared/entry-status.js";
-import { isOsRequirementSatisfied } from "../../shared/requirements.js";
 import { CONFIG_DIR } from "../../utils.js";
 import { prepareSkillLibrarySelection } from "../library/selection.js";
 import { resolveBundledSkillsDir } from "../loading/bundled-dir.js";
@@ -13,6 +14,7 @@ import {
   isSkillConfigPathTruthy,
   resolveBundledAllowlist,
   resolveSkillConfig,
+  resolveSkillRequiredBins,
   resolveSkillsInstallPreferences,
 } from "../loading/config.js";
 import { resolveSkillKey } from "../loading/frontmatter.js";
@@ -22,8 +24,8 @@ import {
   prepareWorkspaceSkillEntries,
 } from "../loading/workspace-skill-loader.js";
 import type { WorkspaceSkillSources } from "../loading/workspace-skill-sources.js";
+import { prepareSkillStatusFacts } from "../runtime/refresh.js";
 import { mergeRemoteNodeSkillEntries } from "../runtime/remote-skills.js";
-import { resolveSkillFileHost } from "../skill-file-host.js";
 import type {
   SkillEntry,
   SkillEligibilityContext,
@@ -118,13 +120,16 @@ function normalizeInstallOptions(
   platform: string,
 ): SkillInstallOption[] {
   // Recipes execute where the workspace dependencies live.
-  if (!isOsRequirementSatisfied(entry.metadata?.os ?? [], [platform])) {
+  const requiredOs = entry.metadata?.os ?? [];
+  if (requiredOs.length > 0 && !requiredOs.includes(platform)) {
     return [];
   }
 
   const install = entry.metadata?.install ?? [];
-  const supportsPlatform = (spec: SkillInstallSpec) =>
-    isOsRequirementSatisfied(spec.os ?? [], [platform]);
+  const supportsPlatform = (spec: SkillInstallSpec) => {
+    const osList = spec.os ?? [];
+    return osList.length === 0 || osList.includes(platform);
+  };
   const filtered = install.filter(supportsPlatform);
 
   const toOption = (spec: SkillInstallSpec, index: number): SkillInstallOption => {
@@ -277,8 +282,8 @@ function prepareWorkspaceSkillRequirements(
   opts?: WorkspaceSkillStatusOptions & { runtime?: WorkspaceSkillSources["runtime"] },
 ) {
   const managedSkillsDir = opts?.managedSkillsDir ?? path.join(CONFIG_DIR, "skills");
-  const bundledSkillsDir = resolveBundledSkillsDir();
-  if (!bundledSkillsDir && !hasWarnedMissingBundledDir) {
+  const bundledSkillsDir = opts?.entries === undefined ? resolveBundledSkillsDir() : undefined;
+  if (opts?.entries === undefined && !bundledSkillsDir && !hasWarnedMissingBundledDir) {
     hasWarnedMissingBundledDir = true;
     skillsLogger.warn(
       "Bundled skills directory could not be resolved; built-in skills may be missing.",
@@ -348,36 +353,38 @@ export async function prepareWorkspaceSkillStatus(
   if (sources.runtime && !sources.status) {
     throw new Error("Remote workspace skill status is unavailable");
   }
-  const localEntries = sources.status
-    ? [
-        ...(await prepareSkillLibrarySelection(opts?.librarySelections ?? [], {}, () => {})),
-        ...sources.entries.filter((entry) => resolveSkillFileHost(entry.skill) === "gateway"),
-      ]
-    : sources.entries;
-  const localFacts =
-    localEntries.length || !sources.status
-      ? readWorkspaceSkillStatusFacts({
-          entries: localEntries,
+  const libraryEntries = opts?.librarySelections?.length
+    ? await prepareSkillLibrarySelection(opts.librarySelections, {}, () => {})
+    : [];
+  const entriesWithoutFacts = sources.status ? libraryEntries : sources.entries;
+  const additionalFacts =
+    entriesWithoutFacts.length > 0
+      ? await prepareSkillStatusFacts({
+          entries: entriesWithoutFacts,
           workspaceDir,
           managedSkillsDir: opts?.managedSkillsDir ?? path.join(CONFIG_DIR, "skills"),
           skillCardKey: opts?.skillCardKey,
         })
       : undefined;
-  const hostPaths = new Set(
-    sources.entries
-      .filter((entry) => resolveSkillFileHost(entry.skill) === "workspace")
-      .map((entry) => entry.skill.filePath),
+  const selectedPaths = new Set(sources.entries.map((entry) => entry.skill.filePath));
+  const files = [...(sources.status?.files ?? []), ...(additionalFacts?.files ?? [])].filter(
+    (file) => selectedPaths.has(file.filePath),
   );
-  const files = [
-    ...(sources.status?.files.filter((file) => hostPaths.has(file.filePath)) ?? []),
-    ...(localFacts?.files ?? []),
-  ];
+  let runtime = sources.runtime;
+  if (!getAgentWorkspaceAccess(workspaceDir, "loadSkills")?.loadSkills) {
+    const bins = [...new Set(["brew", ...sources.entries.flatMap(resolveSkillRequiredBins)])];
+    let facts = await prepareBinaryAvailability(bins);
+    while (!facts.isCurrent()) {
+      facts = await prepareBinaryAvailability(bins);
+    }
+    runtime = { platform: process.platform, bins: bins.filter(facts.hasBinary) };
+  }
   return {
     report: buildWorkspaceSkillStatus(workspaceDir, {
       ...opts,
       entries: sources.entries,
       files,
-      runtime: sources.runtime,
+      runtime,
     }),
     files,
   };

@@ -450,6 +450,15 @@ describe("scripts/lib/openclaw-e2e-instance.sh", () => {
 
   it.for([
     [
+      "accepts the current listener marker",
+      "http server listening",
+      true,
+      "strict",
+      200,
+      '{"ready":true}',
+      0,
+    ],
+    [
       "accepts the March listening marker",
       "listening on",
       true,

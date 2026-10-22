@@ -10,6 +10,7 @@ import type {
   BrowserTabSelection,
   BrowserTabTarget,
 } from "../../components/browser/browser-target.ts";
+import type { HostDesktopRuntimeConfig } from "../../components/desktop/host-desktop-setup.ts";
 import { icons } from "../../components/icons.ts";
 import { EMPTY_LINK_READERS } from "../../components/link-reader-target.ts";
 import { renderPanelLoadingSkeleton } from "../../components/panel-loading-skeleton.ts";
@@ -41,7 +42,7 @@ import {
 import { resolveSessionDiffSidebarContent } from "./components/chat-session-workspace.ts";
 import type { SidebarContent } from "./components/chat-sidebar-content-types.ts";
 import type { SidebarPanelDefinition } from "./components/chat-sidebar-region-types.ts";
-import type { SessionDiscussionPanelConfig } from "./components/session-discussion-panel.ts";
+import type { SessionDiscussionPanelConfig } from "./components/session-discussion-panel.tsx";
 import type { SidebarSlotId } from "./sidebar-layout-types.ts";
 import { sidebarMainPanel } from "./sidebar-layout.ts";
 
@@ -55,10 +56,8 @@ type SidebarPanelDefinitionParams = {
   subagentsInputRegion: "page" | "dock";
   subagentsPresented: PresentationValue;
   processesPresented?: PresentationValue;
-  onRefreshProcesses?: () => void;
   subagentsAvailable: boolean;
   subagentsShowRequest?: () => string | null | undefined;
-  onRefreshSubagents: () => void;
   onSubagentSessionSelect: (
     sessionKey: string,
     options?: PaneSessionChangeOptions,
@@ -80,6 +79,7 @@ type SidebarPanelDefinitionParams = {
   desktopRefreshOnPresentation: boolean;
   desktopAvailable: boolean;
   desktopSource: string | null;
+  desktopRuntimeConfig: HostDesktopRuntimeConfig | null;
   desktopFocusHref: string;
   portalPresented?: PresentationValue;
   onDesktopFocusTargetChange: (
@@ -178,19 +178,6 @@ export function sidebarPanelDefinitions(
       shortcut: SIDEBAR_PANEL_SHORTCUTS[slot]?.combo,
     };
   };
-  const refreshAction = (panel: "subagents" | "processes", onRefresh?: () => void) =>
-    params
-      ? html`<button
-          type="button"
-          class="rail-header__action"
-          aria-label=${t(`chat.${panel}Panel.refresh`)}
-          title=${t(`chat.${panel}Panel.refresh`)}
-          ?disabled=${!params.connected}
-          @click=${onRefresh}
-        >
-          ${icons.refresh}
-        </button>`
-      : undefined;
   const terminal = state?.terminalAvailable
     ? html`<openclaw-terminal-panel
         embedded
@@ -253,6 +240,7 @@ export function sidebarPanelDefinitions(
           .presented=${livePresentation(params?.desktopPresented ?? false)}
           .refreshOnPresentation=${params?.desktopRefreshOnPresentation ?? true}
           .requestedSource=${params?.desktopSource ?? null}
+          .runtimeConfig=${params?.desktopRuntimeConfig ?? null}
           .sessionKey=${state.sessionKey}
           .onFocusTargetChange=${params?.onDesktopFocusTargetChange}
         ></openclaw-desktop-panel>`
@@ -322,7 +310,6 @@ export function sidebarPanelDefinitions(
             .onSessionSelect=${params.onSubagentSessionSelect}
           ></openclaw-chat-subagents-panel>`
         : null,
-      refreshAction("subagents", params?.onRefreshSubagents),
     ),
     definePanel(
       "processes",
@@ -334,7 +321,6 @@ export function sidebarPanelDefinitions(
             .presented=${livePresentation(params.processesPresented ?? false)}
           ></openclaw-chat-processes-panel>`
         : null,
-      refreshAction("processes", params?.onRefreshProcesses),
     ),
     definePanel(
       "detail",

@@ -16,6 +16,7 @@ import { collectTextContentBlocks } from "../../content-blocks.js";
 import { formatUserFacingAssistantErrorText } from "../../embedded-agent-helpers.js";
 import { renderAgentHarnessPreflightUserMessage } from "../../embedded-agent-helpers/user-facing-text.js";
 import type { MessagingToolSend } from "../../embedded-agent-messaging.types.js";
+import { isToolAuthoredSourceReplyForAssistant } from "../../embedded-agent-tool-authored-source-reply.js";
 import { renderAssistantRequestFailureCopy } from "../../failover/assistant-request-failure-copy.js";
 import { resolveReplyFailoverFacts } from "../../failover/request-error-facts.js";
 import { renderAuthProfileFailoverCopy } from "../../failover/user-copy.js";
@@ -76,8 +77,16 @@ export function resolveIncompleteTurnPayloadText(params: {
   attempt: IncompleteTurnAttempt;
 }): string | null {
   const assistantState = classifyAssistantTurn(params);
+  const textToolCallAttempt = params.attempt.textToolCallAttempt === true;
   const assistant = assistantState.assistant;
-  const hasTerminalOutput = hasAttemptTerminalState(params.attempt);
+  const completionAttempt = {
+    ...params.attempt,
+    messagingToolSourceReplyPayloads: params.attempt.messagingToolSourceReplyPayloads?.filter(
+      (payload) =>
+        !payload.toolAuthored || isToolAuthoredSourceReplyForAssistant(payload, assistant),
+    ),
+  };
+  const hasTerminalOutput = hasAttemptTerminalState(completionAttempt);
   // Tool-use expects a post-tool continuation, so partial visible text completes
   // nothing. A length stop that did produce visible text is a partial answer and
   // is delivered with a truncation notice instead. (#76477)
@@ -98,7 +107,10 @@ export function resolveIncompleteTurnPayloadText(params: {
     Boolean(assistant && hasOnlyAssistantReasoningContent(assistant));
 
   if (
-    (params.payloadCount !== 0 && !incompleteTerminalAssistant && !thinkingOnlyTerminal) ||
+    (params.payloadCount !== 0 &&
+      !incompleteTerminalAssistant &&
+      !thinkingOnlyTerminal &&
+      !textToolCallAttempt) ||
     (params.aborted && params.externalAbort) ||
     params.timedOut ||
     params.attempt.clientToolCalls ||
@@ -107,9 +119,9 @@ export function resolveIncompleteTurnPayloadText(params: {
     params.attempt.lastToolError ||
     params.hasIntentionalTerminalCompletion ||
     params.attempt.hasToolMediaBlockReply ||
-    resolveSourceReplyDelivery(params.attempt) !== "missing" ||
-    // A tool-authored final reply awaits host delivery, so its delivery state is still missing.
-    params.attempt.messagingToolSourceReplyPayloads?.some(
+    resolveSourceReplyDelivery(completionAttempt) !== "missing" ||
+    // Authored replies await host delivery, but only this input can complete here.
+    completionAttempt.messagingToolSourceReplyPayloads?.some(
       (payload) => payload.toolAuthored === true,
     ) ||
     hasCompletionMessageSessionSpawn(params.attempt.acceptedSessionSpawns)
@@ -129,8 +141,13 @@ export function resolveIncompleteTurnPayloadText(params: {
     return null;
   }
 
+  const textToolCallFailureText = textToolCallAttempt
+    ? "⚠️ The model wrote a tool call as text instead of calling the tool. No tool ran for that call."
+    : undefined;
+
   const stopReason = assistant?.stopReason;
   if (
+    !textToolCallAttempt &&
     !incompleteTerminalAssistant &&
     !assistantState.reasoningOnly &&
     !thinkingOnlyTerminal &&
@@ -156,10 +173,11 @@ export function resolveIncompleteTurnPayloadText(params: {
   // A non-replayable harness failure may have no assistant message to carry its error.
   // Share classified copy with thrown failures; never display raw prompt diagnostics.
   const promptFailureText =
+    textToolCallFailureText ??
     preflightFailureText ??
     (failureFacts
       ? (failureFacts.providerRequestError?.userMessage ??
-        failureFacts.formatFailureText ??
+        failureFacts.requestFailureText ??
         renderAssistantRequestFailureCopy({
           reason: failureFacts.reason,
           status: failureFacts.status,
@@ -168,6 +186,9 @@ export function resolveIncompleteTurnPayloadText(params: {
       : undefined);
   if (params.hadPotentialSideEffects || params.attempt.replayMetadata.hadPotentialSideEffects) {
     return `${promptFailureText ?? "⚠️ Agent couldn't generate a response."} Note: some tool actions may have already been executed — please verify before retrying.`;
+  }
+  if (textToolCallFailureText) {
+    return `${textToolCallFailureText} Please try again or use a model with native tool calling.`;
   }
   if (preflightFailureText !== undefined) {
     return preflightFailureText;

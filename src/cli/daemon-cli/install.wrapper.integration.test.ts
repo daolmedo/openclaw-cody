@@ -74,12 +74,12 @@ describe("registered gateway install runtime default", () => {
     const bunVersion = Object.getOwnPropertyDescriptor(process.versions, "bun");
     const bunPath = "/opt/app/runtime/bun";
     Object.defineProperty(process, "execPath", { configurable: true, value: bunPath });
-    Object.defineProperty(process.versions, "bun", { configurable: true, value: "1.4.2" });
+    Object.defineProperty(process.versions, "bun", { configurable: true, value: "1.4.3" });
     vi.spyOn(runtimePaths, "resolvePreferredNodePath").mockResolvedValue(undefined);
     vi.spyOn(runtimePaths, "resolveSystemNodeInfo").mockResolvedValue(null);
     const supported = {
       status: "supported" as const,
-      version: "1.4.2",
+      version: "1.4.3",
       sqliteVersion: "3.53.4",
       sqliteProbe: { available: true, version: "3.53.4", text: true, blob: true, json: true },
       nodeSharedSqlite: false,
@@ -286,4 +286,61 @@ afterEach(() => {
   vi.unstubAllEnvs();
   clearConfigCache();
   clearRuntimeConfigSnapshot();
+});
+
+describe("registered gateway install --force wrapper selection", () => {
+  it.each(["blank-wrapper", "missing-replacement-runtime"] as const)(
+    "reports %s only once with an exiting runtime",
+    async (reason) => {
+      if (reason === "missing-replacement-runtime") {
+        service.readCommand.mockResolvedValue({
+          programArguments: ["/opt/prior/node", entrypoint, "gateway"],
+        });
+        vi.spyOn(runtimePaths, "resolveRecordedDaemonRuntime").mockResolvedValue({
+          status: "unsupported",
+          runtime: "node",
+          path: "/opt/prior/node",
+          version: "20.0.0",
+          sqliteVersion: "3.53.4",
+          nodeSharedSqlite: false,
+          sqliteProbe: { available: true, version: "3.53.4", text: true, blob: true, json: true },
+        });
+        vi.spyOn(runtimePaths, "resolvePreferredNodePath").mockResolvedValue(undefined);
+      }
+      defaultRuntime.exit.mockClear();
+      const exit = new ExitError(1);
+      await defaultRuntime.exit.withImplementation(
+        () => {
+          throw exit;
+        },
+        async () => {
+          const program = new Command().name("openclaw");
+          addGatewayServiceCommands(program.command("gateway"));
+          await expect(
+            program.parseAsync(
+              [
+                "gateway",
+                "install",
+                "--force",
+                "--json",
+                ...(reason === "blank-wrapper" ? ["--wrapper", " "] : ["--runtime", "node"]),
+              ],
+              { from: "user" },
+            ),
+          ).rejects.toBe(exit);
+        },
+      );
+      expect(defaultRuntime.exit).toHaveBeenCalledExactlyOnceWith(1);
+      expect(runtimeLogs).toHaveLength(1);
+      expect(JSON.parse(runtimeLogs[0]!)).toMatchObject({
+        ok: false,
+        action: "install",
+        error:
+          reason === "blank-wrapper"
+            ? "Invalid --wrapper"
+            : expect.stringContaining("No supported Node runtime is available."),
+      });
+      expect(service.install).not.toHaveBeenCalled();
+    },
+  );
 });

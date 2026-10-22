@@ -3,18 +3,9 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { root as openCaptureRoot } from "@openclaw/fs-safe/root";
+import { readProcessIdentity } from "@openclaw/proc-safe/identity";
 import { runWithFailedTrailer } from "./lib/failed-trailer.mts";
 import { runManagedCommand, waitForManagedProcessGroupExit } from "./lib/managed-child-process.mts";
-
-// release/2026.10.5 does not ship @openclaw/proc-safe; ESRCH is the absent-process fact main reads.
-function processExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
-  }
-}
 
 function validateSwiftTestingCompletion(eventStreamPath: string, expectedFilter?: string): void {
   const functions = new Set<string>();
@@ -333,12 +324,17 @@ await runWithFailedTrailer("macos-native", async () => {
                 "inherited",
                 "browser-sign-in-before",
                 "browser-sign-in-after",
+                "dashboard-reconnect-before",
+                "dashboard-reconnect-after",
                 "guest-model-permitted",
                 "guest-model-null",
                 "guest-model-open",
                 "guest-model-invalidated",
                 "guest-model-recovered",
                 "history-message-recovery",
+                "worker-schema-before",
+                "worker-schema-after",
+                "worker-schema-no-updater",
               ]
             : ["thread-reasoning", "thread-tool-activity", "model-initial", "thread-restored"];
         const allowed = new RegExp(
@@ -427,7 +423,7 @@ await runWithFailedTrailer("macos-native", async () => {
           const groupGone = await waitForManagedProcessGroupExit({ pid }, 30_000, {
             errorPolicy: "indeterminate",
           });
-          retired &&= groupGone && !processExists(pid);
+          retired &&= groupGone && readProcessIdentity(pid) === null;
         }
         canRemove = retired;
         if (!canRemove) {

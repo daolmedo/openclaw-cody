@@ -11,7 +11,12 @@ import { enqueueSystemEventWithReceipt } from "../infra/system-events.js";
 import { logWarn } from "../logger.js";
 import { parseAgentSessionKey } from "../routing/session-key.js";
 import { isSubagentSessionKey } from "../sessions/session-key-utils.js";
-import { recordNotifyOnExitRemoval, tail, type ProcessSession } from "./bash-process-registry.js";
+import {
+  processSessionInstanceId,
+  recordNotifyOnExitRemoval,
+  tail,
+  type ProcessSession,
+} from "./bash-process-registry.js";
 import {
   appendExecTimeoutRetryGuidance,
   compactNotifyOutput,
@@ -43,6 +48,7 @@ export function prepareExecExitNotification(
       session.notifySessionTarget = target;
     },
     (error: unknown) => {
+      session.notifyOnExit = false;
       logWarn(
         `exec: automatic completion has no destination (${formatErrorMessage(error)}); use process poll.`,
       );
@@ -114,6 +120,7 @@ export function maybeNotifyOnExit(
         ...eventOptions,
         agentId,
         source: "exec",
+        sourceTurnId: `exec:${processSessionInstanceId(session)}`,
         expectedTarget: session.notifySessionTarget,
       });
       recordNotifyOnExitRemoval(session, receipt.cancel);

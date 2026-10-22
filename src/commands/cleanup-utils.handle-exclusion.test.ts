@@ -254,9 +254,11 @@ it("drains the local cache and excludes reopening throughout awaited removal", a
       ]),
     ).toBe("removing");
     expect(database.db.isOpen).toBe(false);
-    expect(() => retainedStatement.get()).toThrow(/finalized/);
+    expect(() => retainedStatement.get()).toThrow(/finalized|database is not open/);
     const before = fs.statSync(database.path, { bigint: true });
-    expect(() => openOpenClawStateDatabase(options)).toThrow("offline maintenance");
+    expect(() => openOpenClawStateDatabase(options)).toThrow(
+      "without an active schema lease or maintenance scope",
+    );
     expect(fs.statSync(database.path, { bigint: true })).toEqual(before);
     resumeRemoval.resolve();
     expect(
@@ -264,7 +266,9 @@ it("drains the local cache and excludes reopening throughout awaited removal", a
     ).toBe("unlinked");
     expect(fs.existsSync(database.path)).toBe(false);
     expect(fs.existsSync(path.dirname(database.path))).toBe(false);
-    expect(() => openOpenClawStateDatabase(options)).toThrow("offline maintenance");
+    expect(() => openOpenClawStateDatabase(options)).toThrow(
+      "without an active schema lease or maintenance scope",
+    );
     expect(fs.existsSync(database.path)).toBe(false);
     expect(fs.existsSync(path.dirname(database.path))).toBe(false);
   } finally {

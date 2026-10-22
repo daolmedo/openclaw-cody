@@ -132,11 +132,15 @@ export { planShellAuthorization } from "../infra/exec-authorization-plan.js";
 export { commitExecAuthorizationLocked } from "../infra/exec-approvals-authorization.js";
 export { updateExecApprovals, readExecApprovalsSnapshot } from "../infra/exec-approvals-store.js";
 export { closeOpenClawStateDatabaseAsync } from "../state/openclaw-state-db.js";
+export { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
+export { readStableSqliteFileGeneration } from "../infra/sqlite-file-generation.js";
+export { recordOpenClawDatabaseQuarantine, readOpenClawDatabaseQuarantineFailure } from "../state/openclaw-quarantine-store.js";
 export { readSecretStoreExecEnvironment } from "../secrets/store/secret-store.js";
 export { rejectUnsafeExecControlShellCommand } from "../infra/exec-control-command-guard.js";
 export { WebSocket } from "../../packages/gateway-client/src/websocket.js";
 export { projectComputerActResult } from "../agents/tools/computer-tool-result.js";
 export { createImageProcessor, convertBmpToPngWithWorker } from "../media/image-processor.js";
+export { createReadTool } from "../agents/sessions/tools/read.js";
 export { createEditTool } from "../agents/sessions/tools/edit.js";
 export { createWriteTool } from "../agents/sessions/tools/write.js";
 export { createRealtimeTranscriptionWebSocketSession } from "../realtime-transcription/websocket-session.js";
@@ -224,6 +228,10 @@ const {
   readExecApprovalsSnapshot,
   readSecretStoreExecEnvironment,
   closeOpenClawStateDatabaseAsync,
+  resolveOpenClawStateSqlitePath,
+  readStableSqliteFileGeneration,
+  recordOpenClawDatabaseQuarantine,
+  readOpenClawDatabaseQuarantineFailure,
 } = await import(pathToFileURL(entry).href);
 const match = { id: "portable-exec", pattern: process.execPath };
 const command = "portable exec authorization";
@@ -240,6 +248,17 @@ try {
   assert.equal(stored.lastUsedCommand, command);
   assert.equal(stored.lastResolvedPath, process.execPath);
   assert.ok(stored.lastUsedAt > 0);
+  await closeOpenClawStateDatabaseAsync();
+  const statePath = resolveOpenClawStateSqlitePath();
+  assert.equal(recordOpenClawDatabaseQuarantine({
+    kind: "state", path: statePath, reason: "portable integrity failure",
+    generation: readStableSqliteFileGeneration(statePath),
+  }), true);
+  assert.equal(readOpenClawDatabaseQuarantineFailure("state", statePath)?.name, "SqliteIntegrityError");
+  await assert.rejects(
+    updateExecApprovals({ update: { kind: "replace", file: { version: 1, defaults: { security: "deny", ask: "off" } } } }),
+    /quarantined after integrity verification failed/,
+  );
 } finally {
   await closeOpenClawStateDatabaseAsync();
 }
@@ -268,55 +287,55 @@ console.log("relocated exec authorization persisted");
       180_000,
     );
 
-    it("keeps activated plugin facades lazy and config-aware in a relocated archive", ({
-      signal,
-    }) =>
-      fixtureLifetime.run(async () => {
-        const root = fixtureLifetime.createTempDir("openclaw-worker-facade-");
-        const packageRoot = path.join(root, "pkg");
-        const relocated = path.join(packageRoot, "dist/worker");
-        const bundledRoot = path.join(packageRoot, "dist/extensions");
-        const pluginRoot = path.join(bundledRoot, "fixture");
-        fs.mkdirSync(relocated, { recursive: true });
-        fs.mkdirSync(pluginRoot, { recursive: true });
-        fs.writeFileSync(
-          path.join(packageRoot, "package.json"),
-          JSON.stringify({ name: "openclaw", version: "0.0.0", type: "module" }),
-        );
-        await tar.extract({ file: preparedArchive, cwd: relocated });
-        fs.writeFileSync(
-          path.join(pluginRoot, "package.json"),
-          JSON.stringify({
-            name: "@openclaw/worker-facade-fixture",
-            version: "0.0.0",
-            type: "module",
-            openclaw: { extensions: ["./index.js"] },
-          }),
-        );
-        fs.writeFileSync(
-          path.join(pluginRoot, "openclaw.plugin.json"),
-          JSON.stringify({
-            id: "worker-facade-owner",
-            enabledByDefault: true,
-            channels: [],
-            configSchema: { type: "object", additionalProperties: false, properties: {} },
-          }),
-        );
-        fs.writeFileSync(
-          path.join(pluginRoot, "index.js"),
-          'export default { id: "worker-facade-owner", register() {} };\n',
-        );
-        fs.writeFileSync(
-          path.join(pluginRoot, "api.js"),
-          `globalThis[Symbol.for("worker-facade-evaluations")] = (globalThis[Symbol.for("worker-facade-evaluations")] ?? 0) + 1;
+    it(
+      "keeps activated plugin facades lazy and config-aware in a relocated archive",
+      ({ signal }) =>
+        fixtureLifetime.run(async () => {
+          const root = fixtureLifetime.createTempDir("openclaw-worker-facade-");
+          const packageRoot = path.join(root, "pkg");
+          const relocated = path.join(packageRoot, "dist/worker");
+          const bundledRoot = path.join(packageRoot, "dist/extensions");
+          const pluginRoot = path.join(bundledRoot, "fixture");
+          fs.mkdirSync(relocated, { recursive: true });
+          fs.mkdirSync(pluginRoot, { recursive: true });
+          fs.writeFileSync(
+            path.join(packageRoot, "package.json"),
+            JSON.stringify({ name: "openclaw", version: "0.0.0", type: "module" }),
+          );
+          await tar.extract({ file: preparedArchive, cwd: relocated });
+          fs.writeFileSync(
+            path.join(pluginRoot, "package.json"),
+            JSON.stringify({
+              name: "@openclaw/worker-facade-fixture",
+              version: "0.0.0",
+              type: "module",
+              openclaw: { extensions: ["./index.js"] },
+            }),
+          );
+          fs.writeFileSync(
+            path.join(pluginRoot, "openclaw.plugin.json"),
+            JSON.stringify({
+              id: "worker-facade-owner",
+              enabledByDefault: true,
+              channels: [],
+              configSchema: { type: "object", additionalProperties: false, properties: {} },
+            }),
+          );
+          fs.writeFileSync(
+            path.join(pluginRoot, "index.js"),
+            'export default { id: "worker-facade-owner", register() {} };\n',
+          );
+          fs.writeFileSync(
+            path.join(pluginRoot, "api.js"),
+            `globalThis[Symbol.for("worker-facade-evaluations")] = (globalThis[Symbol.for("worker-facade-evaluations")] ?? 0) + 1;
 export const marker = "relocated";`,
-        );
-        const result = await fixtureLifetime.track(
-          runNodeScript(
-            [
-              "--input-type=module",
-              "--eval",
-              `
+          );
+          const result = await fixtureLifetime.track(
+            runNodeScript(
+              [
+                "--input-type=module",
+                "--eval",
+                `
 import assert from "node:assert/strict";
 import { pathToFileURL } from "node:url";
 const entry = process.argv[1];
@@ -348,63 +367,65 @@ assert.equal(initializations(), 1);
 assert.equal(evaluations(), 1);
 console.log("relocated worker facade activation follows the shared config snapshot");
 `,
-              path.join(relocated, "worker.mjs"),
-            ],
-            {
-              PATH: process.env.PATH,
-              SystemRoot: process.env.SystemRoot,
-              WINDIR: process.env.WINDIR,
-              HOME: root,
-              USERPROFILE: root,
-              TMPDIR: root,
-              TMP: root,
-              TEMP: root,
-              OPENCLAW_HOME: root,
-              OPENCLAW_STATE_DIR: path.join(root, "state"),
-              OPENCLAW_CONFIG_PATH: path.join(root, "missing-config.json"),
-              OPENCLAW_BUNDLED_PLUGINS_DIR: bundledRoot,
-              XDG_CONFIG_HOME: path.join(root, "config"),
-              XDG_CACHE_HOME: path.join(root, "cache"),
-              XDG_DATA_HOME: path.join(root, "data"),
-              JITI_FS_CACHE: "0",
-              NODE_DISABLE_COMPILE_CACHE: "1",
-            },
-            30_000,
-            {
-              cwd: packageRoot,
-              signal,
-              requireProcessTreeExit: process.platform !== "win32",
-              maxBuffer: 64 * 1024,
-            },
-          ),
-        );
-        expect(result.error, `${root}\n${result.stderr}`).toBeUndefined();
-        expect(result.status, result.stderr).toBe(0);
-        expect(result.stdout.trim()).toBe(
-          "relocated worker facade activation follows the shared config snapshot",
-        );
-
-        const { collectPackageDistImportErrors } =
-          await import("../../scripts/lib/package-dist-imports.mjs");
-        const preparedRoot = path.dirname(preparedDist);
-        const files = fs
-          .readdirSync(preparedDist, { recursive: true, withFileTypes: true })
-          .filter((entry) => entry.isFile())
-          .map((entry) =>
-            path
-              .relative(preparedRoot, path.join(entry.parentPath, entry.name))
-              .replaceAll("\\", "/"),
+                path.join(relocated, "worker.mjs"),
+              ],
+              {
+                PATH: process.env.PATH,
+                SystemRoot: process.env.SystemRoot,
+                WINDIR: process.env.WINDIR,
+                HOME: root,
+                USERPROFILE: root,
+                TMPDIR: root,
+                TMP: root,
+                TEMP: root,
+                OPENCLAW_HOME: root,
+                OPENCLAW_STATE_DIR: path.join(root, "state"),
+                OPENCLAW_CONFIG_PATH: path.join(root, "missing-config.json"),
+                OPENCLAW_BUNDLED_PLUGINS_DIR: bundledRoot,
+                XDG_CONFIG_HOME: path.join(root, "config"),
+                XDG_CACHE_HOME: path.join(root, "cache"),
+                XDG_DATA_HOME: path.join(root, "data"),
+                JITI_FS_CACHE: "0",
+                NODE_DISABLE_COMPILE_CACHE: "1",
+              },
+              30_000,
+              {
+                cwd: packageRoot,
+                signal,
+                requireProcessTreeExit: process.platform !== "win32",
+                maxBuffer: 64 * 1024,
+              },
+            ),
           );
-        expect(
-          collectPackageDistImportErrors({
-            files,
-            readText: (relativePath) =>
-              fs.readFileSync(path.join(preparedRoot, relativePath), "utf8"),
-          }),
-        ).toEqual([]);
-      }));
+          expect(result.error, `${root}\n${result.stderr}`).toBeUndefined();
+          expect(result.status, result.stderr).toBe(0);
+          expect(result.stdout.trim()).toBe(
+            "relocated worker facade activation follows the shared config snapshot",
+          );
 
-    it("delivers image operations and file edits from a relocated archive", async () => {
+          const { collectPackageDistImportErrors } =
+            await import("../../scripts/lib/package-dist-imports.mjs");
+          const preparedRoot = path.dirname(preparedDist);
+          const files = fs
+            .readdirSync(preparedDist, { recursive: true, withFileTypes: true })
+            .filter((entry) => entry.isFile())
+            .map((entry) =>
+              path
+                .relative(preparedRoot, path.join(entry.parentPath, entry.name))
+                .replaceAll("\\", "/"),
+            );
+          expect(
+            collectPackageDistImportErrors({
+              files,
+              readText: (relativePath) =>
+                fs.readFileSync(path.join(preparedRoot, relativePath), "utf8"),
+            }),
+          ).toEqual([]);
+        }),
+      180_000,
+    );
+
+    it("delivers image operations and file reads and edits from a relocated archive", async () => {
       const root = tempDirs.make("openclaw-worker-images-");
       const relocated = path.join(root, "bundle");
       fs.mkdirSync(relocated);
@@ -429,7 +450,7 @@ for (const dependency of ["rastermill", "@silvia-odwyer/photon-node", "diff"]) {
   assert.throws(() => createRequire(pathToFileURL(entry)).resolve(dependency), { code: "MODULE_NOT_FOUND" });
 }
 process.argv = [process.execPath, entry, "--internal-worker-prewarm"];
-const { projectComputerActResult, createImageProcessor, convertBmpToPngWithWorker, createEditTool, createWriteTool } = await import(pathToFileURL(entry).href);
+const { projectComputerActResult, createImageProcessor, convertBmpToPngWithWorker, createReadTool, createEditTool, createWriteTool } = await import(pathToFileURL(entry).href);
 const input = fs.readFileSync(imagePath);
 try {
 const filePath = imagePath + ".txt";
@@ -445,6 +466,12 @@ const edited = await createEditTool(process.cwd()).execute("portable-edit", {
 assert.equal(edited.details.changed, true);
 assert.match(edited.details.diff, /\\+1 const label = "hi"; \\/\\/ keep — unchanged/);
 assert.equal(fs.readFileSync(filePath, "utf8"), 'const label = "hi"; // keep — unchanged\\n');
+for (const extension of [".txt", ".sqlite"]) {
+  const readPath = imagePath + extension;
+  fs.writeFileSync(readPath, "portable file read\\n");
+  const read = await createReadTool(process.cwd()).execute("portable-read", { path: readPath });
+  assert.ok(read.content.some(block => block.type === "text" && block.text.includes("portable file read")));
+}
 for (let index = 0; index < 3; index++) {
   const projected = await projectComputerActResult({
     action: "get_window_state",
@@ -471,7 +498,7 @@ const metadata = await createImageProcessor().probe(png);
 assert.equal(metadata.width, 2);
 assert.equal(metadata.height, 1);
 assert.equal(metadata.format, "png");
-console.log("relocated computer observations, image operations, and file edits passed");
+console.log("relocated computer observations, image operations, and file reads and edits passed");
 } catch (error) {
   console.error(error);
   process.exitCode = 1;
@@ -496,9 +523,9 @@ console.log("relocated computer observations, image operations, and file edits p
         },
       );
       expect(result.stdout).toContain(
-        "relocated computer observations, image operations, and file edits passed",
+        "relocated computer observations, image operations, and file reads and edits passed",
       );
-    });
+    }, 180_000);
 
     it("keeps worker bootstrap, shell analysis, and Windows child spawning portable", async () => {
       const root = tempDirs.make("openclaw-worker-portable-");

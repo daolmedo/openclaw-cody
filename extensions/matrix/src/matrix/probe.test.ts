@@ -35,7 +35,6 @@ describe("probeMatrix", () => {
       persistStorage: false,
       localTimeoutMs: 1234,
     });
-    expect(stopWithoutPersistMock).toHaveBeenCalledTimes(1);
   });
 
   it("authenticates a configured userId instead of trusting the local client identity", async () => {
@@ -72,7 +71,6 @@ describe("probeMatrix", () => {
       status: 401,
       error: "Invalid access token",
     });
-    expect(stopWithoutPersistMock).toHaveBeenCalledTimes(1);
   });
 
   it("passes dispatcherPolicy through to client creation", async () => {

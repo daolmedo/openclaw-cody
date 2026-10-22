@@ -20,6 +20,7 @@ import type { HealthSummary } from "./health/types.js";
 import { NodeRegistry } from "./node-registry.js";
 import type { NodeEvent, NodeEventContext } from "./server-node-events-types.js";
 import { handleNodeEvent } from "./server-node-events.js";
+import { loadGatewaySessionEntryReadOnlyInWorker } from "./session-utils-store-worker.js";
 
 const {
   buildSessionLookup,
@@ -175,13 +176,16 @@ describe("node exec events", () => {
     loadOrCreateProcessDeviceIdentityMock.mockClear();
   });
 
-  it.each([false, true])(
-    "preserves exec authorization and terminal consumption with suppressNotifyOnExit=%s",
-    async (suppressNotifyOnExit) => {
+  it.each([
+    { suppressNotifyOnExit: true, settle: "disconnect" },
+    { suppressNotifyOnExit: false, settle: "result" },
+    { suppressNotifyOnExit: false, settle: "disconnect" },
+  ] as const)(
+    "consumes exec authorization and notifies only undelivered output (suppress=$suppressNotifyOnExit, settle=$settle)",
+    async ({ suppressNotifyOnExit, settle }) => {
       const registry = new NodeRegistry();
-      const connection = { connId: "conn-1" },
-        auth = registry.authorizeSystemRunEvent.bind(registry);
-      const [runId, sessionKey] = [`run-seq-suppress-${suppressNotifyOnExit}`, "agent:main:main"];
+      const connection = { connId: "conn-1" };
+      const [runId, sessionKey] = [`run-seq-${suppressNotifyOnExit}-${settle}`, "agent:main:main"];
       const eventRouting = { sessionKey, contextKey: `exec:${runId}` };
       const startedPayload = { runId, sessionKey, command: "printf ok" };
       const finishedPayload = {
@@ -194,53 +198,72 @@ describe("node exec events", () => {
       const finishedEvent = nodeEvent("exec.finished", finishedPayload);
       const unmatchedEvent = eventResult("exec.finished", "unmatched_exec_event");
       const ctx = buildCtx({
-        authorizeNodeSystemRunEvent: (p) => auth({ ...p, terminal: p.event !== "exec.started" }),
+        authorizeNodeSystemRunEvent: (p) =>
+          registry.authorizeSystemRunEventWithState({
+            ...p,
+            terminal: p.event !== "exec.started",
+          }) ?? false,
       });
-      registry.register(makeNodeClient(connection.connId, "node-1"), {
-        pairingIdentity: "identity-a",
-      });
+      const client = makeNodeClient(connection.connId, "node-1");
+      const sent: string[] = [];
+      Object.assign(client.socket, { send: (frame: string) => sent.push(frame) });
+      registry.register(client, { pairingIdentity: "identity-a" });
       const invoke = registry.invoke({
         nodeId: "node-1",
         command: "system.run",
         params: { runId, sessionKey },
         timeoutMs: 0,
       });
-      try {
-        await expect(
-          handleNodeEvent(ctx, "node-1", finishedEvent, { connId: "wrong-conn" }),
-        ).resolves.toEqual(unmatchedEvent);
-        await expect(
-          handleNodeEvent(ctx, "node-1", nodeEvent("exec.started", startedPayload), connection),
-        ).resolves.toBeUndefined();
+      await expect(
+        handleNodeEvent(ctx, "node-1", finishedEvent, { connId: "wrong-conn" }),
+      ).resolves.toEqual(unmatchedEvent);
+      await expect(
+        handleNodeEvent(ctx, "node-1", nodeEvent("exec.started", startedPayload), connection),
+      ).resolves.toBeUndefined();
 
-        const started = [`Exec started (node=node-1 id=${runId}): printf ok`, eventRouting];
-        const wake = [execEventHeartbeatOptions(sessionKey)];
-        expect(enqueueSystemEventMock.mock.calls).toEqual([started]);
-        expect(requestHeartbeatMock.mock.calls).toEqual([wake]);
+      const started = [`Exec started (node=node-1 id=${runId}): printf ok`, eventRouting];
+      const wake = [execEventHeartbeatOptions(sessionKey)];
+      expect(enqueueSystemEventMock.mock.calls).toEqual([started]);
+      expect(requestHeartbeatMock.mock.calls).toEqual([wake]);
 
-        await expect(
-          handleNodeEvent(ctx, "node-1", finishedEvent, connection),
-        ).resolves.toBeUndefined();
-        // Remove suppression on replay so filtering cannot hide unconsumed authorization.
-        await expect(
-          handleNodeEvent(
-            ctx,
-            "node-1",
-            nodeEvent("exec.finished", { ...finishedPayload, suppressNotifyOnExit: false }),
-            connection,
-          ),
-        ).resolves.toEqual(unmatchedEvent);
-        const finished = [`Exec finished (node=node-1 id=${runId}, code 0)\ndone`, eventRouting];
-        expect(enqueueSystemEventMock.mock.calls).toEqual(
-          suppressNotifyOnExit ? [started] : [started, finished],
-        );
-        expect(requestHeartbeatMock.mock.calls).toEqual(
-          suppressNotifyOnExit ? [wake] : [wake, wake],
-        );
-      } finally {
+      await expect(
+        handleNodeEvent(ctx, "node-1", finishedEvent, connection),
+      ).resolves.toBeUndefined();
+      // Remove suppression on replay so filtering cannot hide unconsumed authorization.
+      await expect(
+        handleNodeEvent(
+          ctx,
+          "node-1",
+          nodeEvent("exec.finished", { ...finishedPayload, suppressNotifyOnExit: false }),
+          connection,
+        ),
+      ).resolves.toEqual(unmatchedEvent);
+      // The waiting caller owns the output until its invoke settles.
+      expect(enqueueSystemEventMock.mock.calls).toEqual([started]);
+
+      if (settle === "result") {
+        const request = sent
+          .map((frame) => JSON.parse(frame) as { event?: string; payload?: { id?: string } })
+          .find((frame) => frame.event === "node.invoke.request");
+        registry.handleInvokeResult({
+          id: request?.payload?.id ?? "",
+          nodeId: "node-1",
+          connId: connection.connId,
+          ok: true,
+          payloadJSON: "{}",
+        });
+        await expect(invoke).resolves.toMatchObject({ ok: true });
+      } else {
         registry.unregister(connection.connId);
-        await invoke;
+        await expect(invoke).resolves.toMatchObject({ ok: false });
       }
+      const finished = [`Exec finished (node=node-1 id=${runId}, code 0)\ndone`, eventRouting];
+      const recovered = !suppressNotifyOnExit && settle === "disconnect";
+      expect(enqueueSystemEventMock.mock.calls).toEqual(
+        recovered ? [started, finished] : [started],
+      );
+      expect(requestHeartbeatMock.mock.calls).toEqual(recovered ? [wake, wake] : [wake]);
+      registry.unregister(connection.connId);
     },
   );
 
@@ -369,7 +392,7 @@ describe("node exec events", () => {
     async (mode) => {
       if (mode === "disabled notifications") {
         const cfg = {
-          session: { mainKey: "agent:main:main" },
+          session: { mainKey: "main" },
           tools: { exec: { notifyOnExit: false } },
         };
         runtimeMocks.getRuntimeConfig.mockReturnValueOnce(cfg);
@@ -581,6 +604,33 @@ describe("voice transcript events", () => {
 });
 
 describe("notifications changed events", () => {
+  it("does not enqueue a notification when pairing changes during session lookup", async () => {
+    const lookupStarted = createDeferred();
+    const lookup = createDeferred<ReturnType<typeof buildSessionLookup>>();
+    let connectionCurrent = true;
+    vi.mocked(loadGatewaySessionEntryReadOnlyInWorker).mockImplementationOnce(async () => {
+      lookupStarted.resolve();
+      return lookup.promise;
+    });
+    const request = handleNodeEvent(
+      buildCtx(),
+      "node-revoked-during-lookup",
+      nodeEvent("notifications.changed", {
+        change: "posted",
+        key: "notif-revoked",
+        sessionKey: "agent:main:notice",
+      }),
+      { isConnectionCurrent: async () => connectionCurrent },
+    );
+    await lookupStarted.promise;
+    connectionCurrent = false;
+    lookup.resolve(buildSessionLookup("agent:main:notice"));
+
+    await expect(request).resolves.toEqual(eventResult("notifications.changed", "pairing_changed"));
+    expect(enqueueSystemEventMock).not.toHaveBeenCalled();
+    expect(requestHeartbeatMock).not.toHaveBeenCalled();
+  });
+
   it("records non-delivery when a targetless notification has no system owner", async () => {
     const warn = vi.fn();
     runtimeMocks.resolveSystemMainSessionTarget.mockImplementationOnce(() => {
@@ -677,7 +727,6 @@ describe("notifications changed events", () => {
       }),
     );
 
-    expect(loadSessionEntryMock).toHaveBeenCalledWith("node-node-n5", { agentId: undefined });
     expect(enqueueSystemEventMock).toHaveBeenCalledWith(
       "Notification posted (node=node-n5 key=notif-5)",
       {
@@ -763,8 +812,6 @@ describe("agent request events", () => {
         }),
       );
 
-      expect(runtimeMocks.resolveSessionAgentId).not.toHaveBeenCalled();
-      expect(runtimeMocks.resolveSessionModelRef).not.toHaveBeenCalled();
       expect(runtimeMocks.resolveGatewayModelSupportsImages).not.toHaveBeenCalled();
       expect(parseMessageWithAttachmentsMock).not.toHaveBeenCalled();
       expect(upsertSessionEntryMock).not.toHaveBeenCalled();
@@ -1239,15 +1286,10 @@ describe("chat subscribe/unsubscribe events", () => {
         ...buildCtx(),
         [event === "chat.subscribe" ? "nodeSubscribe" : "nodeUnsubscribe"]: callback,
       };
-      loadSessionEntryMock.mockReturnValueOnce({
-        ...buildSessionLookup("Main"),
-        canonicalKey: "agent:main:main",
-      });
       await handleNodeEvent(ctx, "node-c1", nodeEvent(event, { sessionKey: "  Main  " }), {
         connId: "node-c1-connection",
       });
       expect(callback).toHaveBeenCalledWith("node-c1", "agent:main:main", "node-c1-connection");
-      expect(loadSessionEntryMock).toHaveBeenCalledWith("Main");
     },
   );
   it("skips the event when the payload is missing a session key", async () => {

@@ -1,6 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import {
-  appendFileSync,
   createReadStream,
   createWriteStream,
   mkdirSync,
@@ -30,10 +29,8 @@ import type {
 import {
   CROSS_OS_COMMAND_CAPTURE_TAIL_BYTES,
   CROSS_OS_COMMAND_HEARTBEAT_SECONDS,
-  CROSS_OS_GATEWAY_STATUS_COMMAND_TIMEOUT_MS,
   CROSS_OS_PROCESS_TREE_KILL_AFTER_MS,
 } from "./config.ts";
-import { readLogTextSince } from "./logs.ts";
 import { formatError, sleep, trimForSummary } from "./shared.ts";
 
 const CROSS_OS_SIGNAL_EXIT_CODES: Partial<Record<NodeJS.Signals, number>> = {
@@ -42,8 +39,6 @@ const CROSS_OS_SIGNAL_EXIT_CODES: Partial<Record<NodeJS.Signals, number>> = {
   SIGTERM: 143,
 };
 const CROSS_OS_ACTIVE_CHILD_TREE_KILLERS = new Set<(signal: NodeJS.Signals) => void>();
-const STARTUP_MIGRATION_RESTART_PREFIX =
-  "OpenClaw plugin migration inputs changed during startup convergence;";
 let forwardedSignalExitCode: number | undefined;
 let forwardedSignalForceKillTimer: NodeJS.Timeout | undefined;
 
@@ -159,75 +154,6 @@ export function captureGatewayProcess(
   child.once("close", close);
   child.once("error", close);
   return { child, closeLog, ...log, waitForClose: () => childClosePromise };
-}
-
-export async function waitForGatewayWithStartupRecovery(params: {
-  gatewayPort: number;
-  gatewayHolder: { current: GatewayHandle | null };
-  restartGateway: (reason: "migration" | "port-busy") => Promise<GatewayHandle>;
-  waitUntilReady: (gateway: GatewayHandle) => Promise<void>;
-}) {
-  let gateway = params.gatewayHolder.current;
-  if (!gateway) {
-    throw new Error("Gateway restart coordination requires an active gateway handle.");
-  }
-
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      await params.waitUntilReady(gateway);
-      return;
-    } catch (error) {
-      if (!hasChildExited(gateway.child)) {
-        throw error;
-      }
-      await gateway.waitForClose();
-      await gateway.closeLog();
-      const startupLog = readLogTextSince(gateway.logPath, gateway.launchLogOffset);
-      const reason = startupLog.includes(STARTUP_MIGRATION_RESTART_PREFIX)
-        ? "migration"
-        : startupLog.includes(
-              `Port ${params.gatewayPort} is busy but no listener PID could be determined.`,
-            ) ||
-            startupLog.includes(
-              `port ${params.gatewayPort} is still busy after --force, but no listener PID could be determined`,
-            )
-          ? "port-busy"
-          : undefined;
-      if (attempt > 0 || !reason) {
-        throw error;
-      }
-      gateway = await params.restartGateway(reason);
-      params.gatewayHolder.current = gateway;
-    }
-  }
-}
-
-// Persist a fresh lane port before relaunching so status, dashboard, and agent
-// checks that read the lane configuration target the same Gateway.
-export async function configureReplacementGatewayPort(params: {
-  lane: LaneState;
-  logPath: string;
-  run: (args: string[], timeoutMs: number) => Promise<CommandResult>;
-}) {
-  const previousPort = params.lane.gatewayPort;
-  const reservation = await reserveGatewayPortForLane(params.lane);
-  try {
-    const configured = await params.run(
-      ["config", "set", "gateway.port", String(reservation.port), "--strict-json"],
-      CROSS_OS_GATEWAY_STATUS_COMMAND_TIMEOUT_MS,
-    );
-    if (configured.exitCode !== 0) {
-      throw new Error(
-        `Failed to configure replacement Gateway port ${reservation.port} (${configured.exitCode}).`,
-      );
-    }
-    appendFileSync(
-      params.logPath,
-      `[release-checks] Gateway refused port ${previousPort}; retrying once on port ${reservation.port}.\n`,
-    );
-  } finally {
-    await reservation.release();
-  }
 }
 
 export async function stopGateway(gateway: GatewayHandle | null) {

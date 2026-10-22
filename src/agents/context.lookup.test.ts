@@ -215,14 +215,28 @@ describe("context cache lifecycle", () => {
     expect(context.resolveContextTokensForModel({ model: "stale-model", cfg: {} })).toBeUndefined();
   });
 
-  it("retires an unpublished prewarm marker when shutdown cancels during import", async () => {
+  it("does not publish prewarm cancelled during cooperative projection", async () => {
     let cancelled = false;
-    const pending = context.prewarmContextWindowCacheAfterReady({
-      config: {},
+    state.catalog.entries = Array.from({ length: 600 }, (_, index) => ({
+      id: `cancelled-${index}`,
+      contextWindow: 64_000,
+    }));
+    state.publishedOwner.mockImplementationOnce(() => {
+      queueMicrotask(() => {
+        cancelled = true;
+      });
+      return { config: state.config, modelCatalog: state.catalog };
+    });
+
+    await context.prewarmContextWindowCacheAfterReady({
+      config: state.config,
       isCancelled: () => cancelled,
     });
-    cancelled = true;
-    await pending;
+
+    expect(cancelled).toBe(true);
+    expect(
+      context.resolveContextTokensForModel({ model: "cancelled-599", cfg: {} }),
+    ).toBeUndefined();
     expect(CONTEXT_WINDOW_RUNTIME_STATE.loadPromise).toBeNull();
     expect(CONTEXT_WINDOW_RUNTIME_STATE.loadGeneration).toBeNull();
   });

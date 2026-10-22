@@ -130,6 +130,52 @@ afterAll(() => {
 });
 
 describe("session event target custody", () => {
+  it("preserves cold event capture across an empty usage refresh", async () => {
+    const { refreshCostUsageCacheForAgent } =
+      await import("../../infra/session-cost-usage-aggregation.js");
+    await withTargetFixture(
+      async ({ env }) => {
+        const databasePath = resolveOpenClawAgentSqlitePath({ agentId: "main", env });
+        await expect(fs.stat(databasePath)).rejects.toMatchObject({ code: "ENOENT" });
+        const originalRead = sessionEntryRead.withSessionEntryReadOnlyInWorker;
+        const reader = vi
+          .spyOn(sessionEntryRead, "withSessionEntryReadOnlyInWorker")
+          .mockImplementation((input, assertCurrent, consume, prepare) =>
+            originalRead(
+              input,
+              assertCurrent,
+              async (read, owner) => {
+                expect(owner.source).toBeUndefined();
+                await expect(refreshCostUsageCacheForAgent({ agentId: "main", env })).resolves.toBe(
+                  "refreshed",
+                );
+                return consume(read, owner);
+              },
+              prepare,
+            ),
+          );
+        try {
+          const target = await captureSessionEventTargetForHost("main", sessionKey, { env });
+          expect(target.sessionId).toBe("");
+          reader.mockRestore();
+          await expect(fs.stat(databasePath)).rejects.toMatchObject({ code: "ENOENT" });
+          const prepared = await prepareSessionEventTargetForHost(target, {
+            createIfMissing: true,
+          });
+          try {
+            prepared.assertCurrent();
+            expect((await fs.stat(databasePath)).isFile()).toBe(true);
+          } finally {
+            prepared.release();
+          }
+        } finally {
+          reader.mockRestore();
+        }
+      },
+      { empty: true, native: true },
+    );
+  });
+
   it("retains fresh event custody from a captured Windows short-path spelling", async () => {
     await withTargetFixture(
       async (state) => {
@@ -576,9 +622,14 @@ describe("session event target custody", () => {
   );
 
   it.each(["awaited", "ignored"] as const)(
-    "reports a queued event's policy failure once with an %s receipt",
+    "reports a re-admitted event's dispatch failure once with an %s receipt",
     async (receiptUse) => {
       await withTargetFixture(async ({ env }) => {
+        const readmissionDispatched = createDeferred();
+        dispatch.mockImplementationOnce(() => {
+          readmissionDispatched.resolve();
+          throw new Error("Re-admitted execution failed");
+        });
         const target = await captureSessionEventTargetForHost("main", sessionKey, { env });
         const receipt = enqueueSessionEventForHost("Process completed", {
           agentId: "main",
@@ -590,13 +641,14 @@ describe("session event target custody", () => {
           ...getRuntimeConfigSnapshot(),
           tools: { deny: ["write", "message"] },
         });
+        await readmissionDispatched.promise;
 
         if (receiptUse === "awaited") {
           await expect(receipt.settled).resolves.toMatchObject({
             status: "failed",
             executionStarted: false,
             delivered: false,
-            error: expect.stringContaining("configuration changed"),
+            error: expect.stringContaining("Re-admitted execution failed"),
           });
         }
         // Join the independent owner without requiring a producer to consume its receipt.
@@ -612,9 +664,9 @@ describe("session event target custody", () => {
           agentId: "main",
           sessionKey,
           eventId: receipt.id,
-          error: expect.stringContaining("configuration changed"),
+          error: expect.stringContaining("Re-admitted execution failed"),
         });
-        expect(dispatch).not.toHaveBeenCalled();
+        expect(dispatch).toHaveBeenCalledTimes(1);
         expect(peekSystemEventEntries(sessionKey)).toEqual([]);
       });
     },

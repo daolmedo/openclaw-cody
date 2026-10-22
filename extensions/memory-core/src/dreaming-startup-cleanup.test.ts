@@ -7,6 +7,10 @@ import {
   createTestPluginApi,
   createTestPluginServiceScheduler,
 } from "openclaw/plugin-sdk/plugin-test-api";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { getSessionEntry, upsertSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
 import { appendSqliteSessionTranscriptEventForTest } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { createOpenClawTestState, type OpenClawTestState } from "openclaw/plugin-sdk/test-state";
@@ -27,6 +31,7 @@ beforeEach(async () => {
     layout: "state-only",
   });
   stateDir = state.stateDir;
+  setRuntimeConfigSnapshot(createConfig());
 });
 
 afterEach(async () => {
@@ -38,17 +43,18 @@ afterEach(async () => {
   vi.restoreAllMocks();
   resetPluginStateStoreForTests();
   await state.cleanup();
+  clearRuntimeConfigSnapshot();
 });
 
-function createGateway(
-  params: {
-    agentIds?: string[];
-    sessionStore?: string;
-    cronEnabled?: boolean;
-  } = {},
-) {
+type GatewayOptions = {
+  agentIds?: string[];
+  sessionStore?: string;
+  cronEnabled?: boolean;
+};
+
+function createConfig(params: GatewayOptions = {}): OpenClawConfig {
   const agentIds = params.agentIds ?? ["main"];
-  const config = {
+  return {
     cron: { enabled: params.cronEnabled ?? true },
     agents: {
       entries: Object.fromEntries(
@@ -62,6 +68,11 @@ function createGateway(
     },
     ...(params.sessionStore ? { session: { store: params.sessionStore } } : {}),
   } as OpenClawConfig;
+}
+
+function createGateway(params: GatewayOptions = {}) {
+  const config = createConfig(params);
+  setRuntimeConfigSnapshot(config);
   const onMock = vi.fn<OpenClawPluginApi["on"]>();
   const services: Parameters<OpenClawPluginApi["registerService"]>[0][] = [];
   const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
@@ -80,6 +91,14 @@ function createGateway(
     on: onMock,
     registerService: (service) => services.push(service),
   });
+  const backgroundTasks: Promise<unknown>[] = [];
+  api.lifecycle.runInBackgroundContext = (run) => {
+    const task = run();
+    if (task instanceof Promise) {
+      backgroundTasks.push(task);
+    }
+    return task;
+  };
   Object.assign(api.runtime, { config: { current: () => config } });
   registerShortTermPromotionDreaming(api);
 
@@ -101,6 +120,8 @@ function createGateway(
       throw new Error("gateway_start hook missing");
     }
     await hook({ port: 0 }, { config, getCron: () => cron });
+    // Storage assertions observe finished maintenance, not just a completed start hook.
+    await Promise.all(backgroundTasks);
   };
   const stop = async () => {
     scheduler.beginClose();

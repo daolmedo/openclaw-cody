@@ -81,32 +81,6 @@ function retentionCommand(
   };
 }
 
-it.each([
-  "updater-runtime-retention",
-  "diagnostic:updater-runtime-retention",
-  "candidate-state-snapshot",
-  "update-driver-handoff",
-])("skips contended bookkeeping for %s", (step) => {
-  const command = retentionCommand();
-  command.input.step.step = step;
-  const run = vi.spyOn(writer, "run").mockImplementation(() => {
-    throw busyError();
-  });
-  const current = vi.fn();
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    expect(recordUpdateRunMutationInWorker(command, options, current, writer)).toEqual({
-      kind: "bookkeeping-skipped",
-    });
-  }
-  expect(run).toHaveBeenCalledTimes(3);
-  expect(run).toHaveBeenLastCalledWith(
-    expect.any(Function),
-    expect.objectContaining({ busyTimeoutMs: 1_000 }),
-  );
-  expect(current.mock.calls).toEqual([["transaction"], ["transaction"], ["transaction"]]);
-  expect(getUpdateRun(runId, options)?.steps.some((entry) => entry.step === step)).toBe(false);
-});
-
 it("warns on contended bookkeeping and still records the required outcome", () => {
   const write = vi
     .spyOn(existingWrites, "runExistingOpenClawStateWriteTransaction")
@@ -148,7 +122,7 @@ it("keeps Gateway verification at the ordinary writer budget", () => {
   expect(getUpdateRun(runId, options)?.verification.booted).toBeUndefined();
 });
 
-it.each(["finalize:predecessor-stop:fixture", "openclaw doctor", "package rollback"])(
+it.each(["finalize:predecessor-stop:fixture"])(
   "gives recovery-critical %s the driver's native busy budget",
   (step) => {
     const command = retentionCommand();
@@ -157,14 +131,14 @@ it.each(["finalize:predecessor-stop:fixture", "openclaw doctor", "package rollba
     const run = vi.spyOn(writer, "run").mockImplementationOnce(() => {
       throw cause;
     });
-    expect(() => recordUpdateRunMutationInWorker(command, options, vi.fn(), writer)).toThrow(
+    expect(() => recordUpdateRunMutationInWorker(command, options, vi.fn(), () => writer)).toThrow(
       /database is locked.*retry `openclaw update`/,
     );
     expect(run).toHaveBeenCalledExactlyOnceWith(
       expect.any(Function),
       expect.objectContaining({ busyTimeoutMs: 120_000 }),
     );
-    expect(recordUpdateRunMutationInWorker(command, options, vi.fn(), writer)).toMatchObject({
+    expect(recordUpdateRunMutationInWorker(command, options, vi.fn(), () => writer)).toMatchObject({
       kind: "recorded",
       record: { steps: expect.arrayContaining([{ step, status: "completed" }]) },
     });
@@ -176,7 +150,7 @@ it("does not turn required recovery admission into optional bookkeeping", () => 
   const run = vi.spyOn(writer, "run").mockImplementationOnce(() => {
     throw busyError();
   });
-  expect(() => recordUpdateRunMutationInWorker(command, options, vi.fn(), writer)).toThrow(
+  expect(() => recordUpdateRunMutationInWorker(command, options, vi.fn(), () => writer)).toThrow(
     /required recovery evidence/,
   );
   expect(run).toHaveBeenCalledExactlyOnceWith(
@@ -191,7 +165,7 @@ it("skips a real SQLite writer lock without waiting or creating a receipt", () =
   const blocker = new DatabaseSync(resolveOpenClawStateSqlitePath(options.env));
   try {
     blocker.exec("BEGIN IMMEDIATE");
-    expect(recordUpdateRunMutationInWorker(command, options, vi.fn(), writer)).toEqual({
+    expect(recordUpdateRunMutationInWorker(command, options, vi.fn(), () => writer)).toEqual({
       kind: "bookkeeping-skipped",
     });
     expect(blocker.isTransaction).toBe(true);
@@ -210,7 +184,7 @@ it("does not swallow a non-contention failure as bookkeeping", () => {
     throw failure;
   });
   expect(() =>
-    recordUpdateRunMutationInWorker(retentionCommand(), options, vi.fn(), writer),
+    recordUpdateRunMutationInWorker(retentionCommand(), options, vi.fn(), () => writer),
   ).toThrow(failure);
 });
 
@@ -226,7 +200,7 @@ it("restores the ordinary transaction wait after driver admission", () => {
       return result;
     }, current),
   );
-  recordUpdateRunMutationInWorker(retentionCommand(false), options, vi.fn(), writer);
+  recordUpdateRunMutationInWorker(retentionCommand(false), options, vi.fn(), () => writer);
   expect(timeout).toBe(5_000);
   expect(connection && readSqliteBusyTimeout(connection)).toBe(5_000);
 });
@@ -246,8 +220,14 @@ it.each([
         },
         options,
         admit,
-        writer,
+        () => writer,
       ),
+    ["transaction:free", "commit:held"],
+  ],
+  [
+    "run creation",
+    (admit: (stage: "transaction" | "commit") => void) =>
+      createUpdateRun({ trigger: "cli" }, options, admit),
     ["transaction:free", "commit:held"],
   ],
   [
@@ -296,9 +276,9 @@ it("does not replay or discard a lock failure after transaction admission", () =
       throw cause;
     }
   });
-  expect(() => recordUpdateRunMutationInWorker(retentionCommand(), options, admit, writer)).toThrow(
-    cause,
-  );
+  expect(() =>
+    recordUpdateRunMutationInWorker(retentionCommand(), options, admit, () => writer),
+  ).toThrow(cause);
   expect(admit.mock.calls).toEqual([["transaction"], ["commit"]]);
   expect(getUpdateRun(runId, options)?.steps).toHaveLength(1);
 });

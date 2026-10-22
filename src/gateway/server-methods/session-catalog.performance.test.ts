@@ -247,7 +247,7 @@ it("measures 100 composed catalog lists against real session and plugin stores",
               Object.entries(io).map(([key, value]) => [key, value / 100]),
             ),
             scope:
-              "Explicit local Codex host through Gateway request admission, registered provider, session accessor and plugin stores. Binding authority is acquired through the plugin-state worker; calling-thread SQL and worker operations are counted separately. File counts cover sync, callback and promise fs read/open APIs, including separately attributed live ownership checks. Descriptor classification adds fstat instrumentation cost.",
+              "Explicit local Codex host through Gateway request admission, registered provider, session accessor and plugin stores. Each sample joins its final host publication and tracked provider refresh. Binding authority is acquired through the plugin-state worker; calling-thread SQL and worker operations are counted separately. File counts cover sync, callback and promise fs read/open APIs, including separately attributed live ownership checks. Descriptor classification adds fstat instrumentation cost.",
           }),
         );
         expect(cpuSamples.totalCpuSamples).toBeGreaterThan(0);
@@ -259,16 +259,16 @@ it("measures 100 composed catalog lists against real session and plugin stores",
         expect(io.pluginStateWorkerReadOperations).toBe(100);
         expect(io.sessionEntryReads).toBe(0);
         expect(io.sessionPayloadReads).toBe(0);
-        // Fresh binding authority belongs to the worker, including its freshness probe.
+        // Binding authority stays in the worker; warm reads reuse process-owned admission.
         for (const work of workPerList) {
           expect(work).toEqual({
             sqliteReadCalls: 0,
             sqliteFreshnessReads: 0,
             bindingAuthorityReads: 0,
-            fileReadCalls: 1,
-            ownershipFileReadCalls: 1,
-            fileOpenCalls: 1,
-            ownershipFileOpenCalls: 1,
+            fileReadCalls: 0,
+            ownershipFileReadCalls: 0,
+            fileOpenCalls: 0,
+            ownershipFileOpenCalls: 0,
             pluginStateWorkerOperations: 1,
           });
         }

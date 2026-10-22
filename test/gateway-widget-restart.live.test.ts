@@ -128,17 +128,13 @@ it.skipIf(!isLiveTestEnabled() || process.platform === "win32")(
         const deviceIdentity = loadOrCreateDeviceIdentity({
           path: instance.state.path("proof-device.sqlite"),
         });
-        // A TEST observer must not replace the original Control UI token's issuer binding.
-        const observerDeviceIdentity = loadOrCreateDeviceIdentity({
-          path: instance.state.path("proof-observer-device.sqlite"),
-        });
         const connect = (controlUi: boolean) =>
           acquireGatewayTestClient(
             {
               url: instance.url,
               origin: controlUi ? `http://127.0.0.1:${instance.port}` : undefined,
               token: instance.gatewayToken,
-              deviceIdentity: controlUi ? deviceIdentity : observerDeviceIdentity,
+              deviceIdentity,
               clientName: controlUi ? GATEWAY_CLIENT_IDS.CONTROL_UI : GATEWAY_CLIENT_IDS.TEST,
               clientBuildId: controlUi ? buildId : undefined,
               mode: controlUi ? "webchat" : "test",

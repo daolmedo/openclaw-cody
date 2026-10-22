@@ -65,6 +65,11 @@ import {
   loadManagedChildSpawner,
 } from "./lib/managed-child-process.mts";
 import {
+  claimManagedCleanup,
+  failManagedCleanup,
+  ManagedCleanupCancelled,
+} from "./lib/managed-cleanup-handoff.mts";
+import {
   prepareTestboxLeaseFreshness,
   recordTestboxLeaseFreshness,
 } from "./testbox-lease-freshness.mts";
@@ -318,7 +323,7 @@ const jsRuntimeEntrypoints = new Set([
 ]);
 const awsMacosCorepackEntrypoints = new Set(["pnpm", "yarn", "corepack"]);
 const awsMacosBunEntrypoints = new Set(["bun", "bunx"]);
-const awsMacosBunVersion = "1.4.2";
+const awsMacosBunVersion = "1.4.3";
 const awsMacosSwiftEntrypoints = new Set(["swift", "xcodebuild"]);
 const awsMacosSwiftScriptTargets = new Set([
   "mac:package",
@@ -1310,9 +1315,6 @@ function restoreTemporaryLeaseClaimPath(claimPath: string) {
       encoding: "utf8",
       mode: 0o600,
     });
-    if (readFileSync(claimPath, "utf8") !== original) {
-      return;
-    }
     renameSync(temporaryPath, claimPath);
   } finally {
     rmSync(temporaryPath, { force: true });
@@ -3917,13 +3919,8 @@ if (canonicalProvider === "blacksmith-testbox") {
     : envProviderLocal
       ? "from CRABBOX_PROVIDER"
       : "from config";
-  const fallback = commandProviderValue
-    ? "rerun without --provider to use .crabbox.yaml"
-    : envProviderLocal
-      ? "unset CRABBOX_PROVIDER to use .crabbox.yaml"
-      : "pass another --provider to override it";
   console.error(
-    `[crabbox] provider=blacksmith-testbox ${source}; if Testbox is queued or down, ${fallback}`,
+    `[crabbox] provider=blacksmith-testbox ${source}; if queued or unavailable, stop this task's allocation and use PR CI or a safe local scope. Keep platform-specific proof pending; do not chain providers.`,
   );
   console.error(
     "[crabbox] delegated Testbox proof uses the wrapper exitCode and timing JSON; the linked Actions run can show cancelled during external lease cleanup",
@@ -4153,6 +4150,7 @@ function cleanupOnce() {
   }
   cleanupSucceeded = false;
   if (!childTreeSettled) {
+    failManagedCleanup();
     try {
       sourceStaging?.hold("writers");
     } catch {
@@ -4330,8 +4328,7 @@ const FAST_FAIL_HINT_WINDOW_MS = 15_000;
 const spawnManagedChild = await loadManagedChildSpawner();
 await preparationCheckpoint();
 try {
-  // Preparation can yield while a receipt or source changes. Keep the original
-  // capsule provenance and refuse before native Testbox I/O if it no longer matches.
+  // Verify the allocation still belongs to this caller before native Testbox I/O.
   testboxLeaseFreshness?.assertCurrent();
 } catch (error) {
   cleanupOnce();
@@ -4350,6 +4347,17 @@ if (sourceStaging?.recorded) {
   }
   const leaseId = optionValue(normalizedArgs, "--id");
   sourceStaging.admitted(namespace, leaseId ? [leaseId] : undefined);
+}
+try {
+  await claimManagedCleanup();
+  await preparationCheckpoint();
+} catch (error) {
+  if (error instanceof ManagedCleanupCancelled) {
+    cancellationSignal ??= error.signal;
+  }
+  await preparationCheckpoint(error);
+  cleanupOnce();
+  throw error;
 }
 const child = spawnManagedChild(childInvocation.command, childInvocation.args, {
   cwd: childCwd,

@@ -1,10 +1,8 @@
 import fs from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 import { readConfigFileSnapshot } from "../../config/config.js";
-import type { PluginInstallRecord } from "../../config/types.plugins.js";
 import {
   formatDeferredPluginMigration,
-  readDeferredPluginMigrationCompletionsAsync,
   readDeferredPluginMigrationsAsync,
   recordDeferredPluginMigrations,
 } from "../../infra/deferred-plugin-migrations.js";
@@ -12,13 +10,14 @@ import { listUpdateRuns } from "../../infra/update-run-reader.js";
 import { renderUpdateRunReport } from "../../infra/update-run-report.js";
 import { updateRunWarningMessages } from "../../infra/update-run-step.js";
 import { loadNodeHostConfig } from "../../node-host/config.js";
-import { loadInstalledPluginIndexInstallRecords } from "../../plugins/installed-plugin-index-records.js";
 import {
   readPersistedInstalledPluginIndexRowSync,
   seedInstalledPluginIndex,
 } from "../../plugins/test-helpers/installed-plugin-index.js";
 import { runExec } from "../../process/exec.js";
 import { defaultRuntime } from "../../runtime.js";
+import { captureOpenClawStateWorkerContext } from "../../state/openclaw-state-worker-context.js";
+import { executeOpenClawStateWorker } from "../../state/openclaw-state-worker-store.js";
 import { runRegisteredCli } from "../../test-utils/command-runner.js";
 import { registerUpdateCli } from "../update-cli.js";
 // Register shared mocks before the tested runtime modules are imported.
@@ -66,9 +65,12 @@ describe("update completion ownership", () => {
       mocks.plugins.mockImplementationOnce(async () => {
         // The child completed the migration before its buffered warning reached the parent.
         expect(await readDeferredPluginMigrationsAsync()).toEqual([]);
-        expect(await readDeferredPluginMigrationCompletionsAsync()).toEqual([
-          expect.objectContaining({ pluginId: pending.pluginId }),
-        ]);
+        expect(
+          await executeOpenClawStateWorker(captureOpenClawStateWorkerContext(), {
+            type: "plugins.deferredMigrations.completions.read",
+            input: undefined,
+          }),
+        ).toEqual([expect.objectContaining({ pluginId: pending.pluginId })]);
         if (pendingAgain) {
           await recordDeferredPluginMigrations({ pending: [pending] });
         }
@@ -81,11 +83,14 @@ describe("update completion ownership", () => {
       expect(reportedResult("repair")).toMatchObject({
         status: pendingAgain ? "warning" : "ok",
       });
-      // The final Doctor pass supersedes the package-swap copy of a still-pending migration.
-      expect(reportedResult("repair")).toHaveProperty(
-        "postUpdate.doctor",
-        pendingAgain ? { status: "warning", warnings: [finalPassWarning] } : { status: "ok" },
-      );
+      // Post-plugin convergence reports the still-pending migration once, as a
+      // plugin warning; Doctor's earlier copies are retired.
+      expect(reportedResult("repair")).toHaveProperty("postUpdate.doctor", { status: "ok" });
+      if (pendingAgain) {
+        expect(reportedResult("repair")).toHaveProperty("postUpdate.plugins.warnings", [
+          expect.objectContaining({ pluginId: pending.pluginId, message: finalPassWarning }),
+        ]);
+      }
       // The earlier warning steps were persisted as reported; the run history and
       // its rendered report must match the ledger after the final pass.
       const [run] = listUpdateRuns();
@@ -168,9 +173,12 @@ describe("update completion ownership", () => {
       vi.mocked(defaultRuntime.error).mock.calls.flat().join("\n"),
     ).toHaveBeenCalledOnce();
     expect(await readDeferredPluginMigrationsAsync()).toEqual([]);
-    expect(await readDeferredPluginMigrationCompletionsAsync()).toEqual([
-      expect.objectContaining({ pluginId }),
-    ]);
+    expect(
+      await executeOpenClawStateWorker(captureOpenClawStateWorkerContext(), {
+        type: "plugins.deferredMigrations.completions.read",
+        input: undefined,
+      }),
+    ).toEqual([expect.objectContaining({ pluginId })]);
     expect(JSON.stringify(reportedResult("repair"))).not.toContain(
       "data/settings upgrade is unfinished",
     );
@@ -266,35 +274,6 @@ describe("update completion ownership", () => {
     expect(mocks.restart).not.toHaveBeenCalled();
     expectDoctorDiagnostics();
   });
-
-  it.each([false, true])(
-    "resume reads the parent migration owner's committed generation (empty=%s)",
-    async (empty) => {
-      const old = { old: { source: "path" as const } };
-      await seedInstalledPluginIndex(old);
-      expect(await loadInstalledPluginIndexInstallRecords()).toEqual(old);
-      const recordsPath = await state.writeJson("forwarded.json", old);
-      vi.stubEnv("OPENCLAW_UPDATE_POST_CORE_INSTALL_RECORDS_PATH", recordsPath);
-      vi.stubEnv("OPENCLAW_UPDATE_POST_CORE_STARTED_AT_MS", String(Date.now()));
-      const current: Record<string, PluginInstallRecord> = empty
-        ? {}
-        : { current: { source: "path" } };
-      await state.writeConfig({ plugins: { enabled: false }, gateway: { port: 19003 } });
-      await seedInstalledPluginIndex(current);
-      await writeScenario("resume");
-      await invoke("resume");
-      expectSuccess("resume", false);
-      expect(mocks.plugins).toHaveBeenCalledWith(
-        expect.objectContaining({
-          configSnapshot: expect.objectContaining({
-            config: expect.objectContaining({ gateway: expect.objectContaining({ port: 19003 }) }),
-          }),
-          pluginInstallRecords: current,
-        }),
-      );
-      expect(await events()).toEqual([]);
-    },
-  );
 
   it("legacy resume repairs Doctor-only node state before plugins even when config is current", async () => {
     vi.stubEnv("OPENCLAW_UPDATE_POST_CORE", "1");

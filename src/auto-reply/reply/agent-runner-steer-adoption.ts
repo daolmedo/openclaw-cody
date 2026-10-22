@@ -35,10 +35,6 @@ import {
 } from "./reply-run-registry.js";
 import { waitForReplyOperationBackend } from "./reply-run-registry.state.js";
 import { refreshReplyOperationTyping } from "./reply-run-typing.js";
-import {
-  resolveFollowupRunToolAuthorityFingerprint,
-  resolveFollowupRunToolAuthorityFingerprintAsync,
-} from "./reply-tool-authority.js";
 import { buildChannelSourceTurnId } from "./source-turn-id.js";
 import { prepareSteeringDelivery } from "./steering-delivery-preparation.js";
 import type { TypingSignaler } from "./typing-mode.js";
@@ -50,6 +46,7 @@ type ActiveReplySteerFallbackReason =
   | "model-fallback-changed";
 
 type ActiveReplySteerParams = {
+  assertSourceCurrent?: () => void;
   followupRun: RunReplyAgentParams["followupRun"];
   opts: RunReplyAgentParams["opts"];
   providedReplyOperation: ReplyOperation | undefined;
@@ -118,7 +115,10 @@ export async function runActiveReplySteer(
     resolveFollowupAbortSignal(followupRun)?.throwIfAborted();
     params.opts?.abortSignal?.throwIfAborted();
     followupRun.operatorAuthority?.assertCurrent();
+    params.assertSourceCurrent?.();
   };
+  let delivery: ReturnType<typeof prepareSteeringDelivery> | undefined;
+  let releaseToolAuthority: (() => void) | undefined;
   let steerSessionId = activeReplyOperation?.sessionId ?? followupRun.run.sessionId;
   const parked = parkSteerCandidate(queueKey, followupRun, resolvedQueue, runFollowup);
   if (!parked) {
@@ -193,7 +193,7 @@ export async function runActiveReplySteer(
     if (!injectionTarget) {
       return await fallback("injection_unavailable");
     }
-    const delivery = prepareSteeringDelivery({
+    delivery = prepareSteeringDelivery({
       agentId: followupRun.run.agentId,
       sessionKey,
       storePath: params.storePath,
@@ -202,11 +202,13 @@ export async function runActiveReplySteer(
       entry: params.sessionEntry,
       assertCurrent: assertReadCurrent,
     });
+    const steeringDelivery = delivery;
     const steeringAuthority = await resolveReplySteeringAuthority(
       followupRun,
       activeReplyOperation,
       assertReadCurrent,
     );
+    releaseToolAuthority = steeringAuthority.toolAuthority.release;
     assertReadCurrent();
     if (
       activeReplyOperation.key !== activeReplyKey ||
@@ -239,9 +241,9 @@ export async function runActiveReplySteer(
       }
     };
     const text = followupRun.prompt;
-    const assertLegacyPolicyCurrent = () =>
-      assertPolicy(resolveFollowupRunToolAuthorityFingerprint(followupRun, automaticFallbackRoute));
+    const assertLegacyPolicyCurrent = () => assertPolicy(steeringAuthority.toolAuthority.read());
     const sourceBound = Boolean(
+      params.assertSourceCurrent ||
       automaticFallbackRoute ||
       followupRun.operatorAuthority ||
       followupRun.abortSignal ||
@@ -257,14 +259,8 @@ export async function runActiveReplySteer(
           assertCurrent: assertSourceCurrent,
           compatAssertCurrent: assertLegacyPolicyCurrent,
           prepareCurrent: async () => {
-            assertPolicy(
-              await resolveFollowupRunToolAuthorityFingerprintAsync(
-                followupRun,
-                automaticFallbackRoute,
-                assertSourceCurrent,
-              ),
-            );
-            await delivery.prepareCurrent();
+            assertPolicy(steeringAuthority.toolAuthority.read());
+            await steeringDelivery.prepareCurrent();
             assertSourceCurrent();
           },
         }),
@@ -291,7 +287,19 @@ export async function runActiveReplySteer(
       waitForTranscriptCommit: true,
       queueIdentity: resolveAcceptedSteerRunId(params),
       abortSignal: resolveFollowupAbortSignal(followupRun),
-      onQueueAccepted: parked.accepted,
+      onQueueAccepted: (accepted) => {
+        if (!accepted) {
+          try {
+            assertReadCurrent();
+          } catch {
+            // Refusal can release deferred queue overflow synchronously. Retire
+            // revoked input before it can become a fallback or summary source.
+            parked.consume();
+            return;
+          }
+        }
+        parked.accepted(accepted);
+      },
       ...(resolvedQueue.debounceMs !== undefined ? { debounceMs: resolvedQueue.debounceMs } : {}),
       ...(followupRun.run.sourceReplyDeliveryMode
         ? { sourceReplyDeliveryMode: followupRun.run.sourceReplyDeliveryMode }
@@ -349,20 +357,23 @@ export async function runActiveReplySteer(
     await touchActiveSessionEntry();
     return "handled";
   } finally {
+    releaseToolAuthority?.();
+    delivery?.release();
     try {
-      if (followupRun.steerPending) {
-        if (isFollowupRunAborted(followupRun)) {
+      // A backend can report rejection before delivery settles, clearing
+      // steerPending while leaving the input queued for fallback. A revoked
+      // source must retire that queued input too.
+      if (isFollowupRunAborted(followupRun)) {
+        parked.consume();
+      } else {
+        try {
+          assertReadCurrent();
+        } catch {
           parked.consume();
-        } else {
-          try {
-            assertReadCurrent();
-          } catch {
-            parked.consume();
-          }
         }
-        if (followupRun.steerPending) {
-          parked.fallback();
-        }
+      }
+      if (followupRun.steerPending) {
+        parked.fallback();
       }
     } finally {
       typing.cleanup();

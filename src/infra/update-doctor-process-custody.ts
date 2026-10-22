@@ -174,6 +174,7 @@ export async function retainUpdateDoctorProcesses(
         writeReceipt(file, receipt);
       } catch (error) {
         retained.settled();
+        receipt.slots.splice(receipt.slots.indexOf(slot), 1);
         throw error;
       }
       return {
@@ -185,11 +186,8 @@ export async function retainUpdateDoctorProcesses(
         },
         settled() {
           retained.settled();
-          const index = receipt.slots.indexOf(slot);
-          if (index >= 0) {
-            receipt.slots.splice(index, 1);
-            writeReceipt(file, receipt);
-          }
+          receipt.slots.splice(receipt.slots.indexOf(slot), 1);
+          writeReceipt(file, receipt);
         },
       };
     },

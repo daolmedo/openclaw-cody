@@ -279,32 +279,30 @@ function seedUpgradeVolumeSessions(stateDir) {
   }
 }
 
-export async function seedPublishedCronJobs(stateDir, packageRoot, jobs) {
-  assert(packageRoot, "cron fixture requires the installed baseline package root");
+async function seedUpgradeVolumeCronJobs(stateDir, packageRoot) {
+  assert(packageRoot, "volume cron fixture requires the installed baseline package root");
   const packageJsonPath = path.join(path.resolve(packageRoot), "package.json");
   const manifest = readJson(packageJsonPath);
-  assert(manifest.name === "openclaw", "cron SDK must belong to the installed package");
+  assert(manifest.name === "openclaw", "volume cron SDK must belong to the installed package");
   assert(
     manifest.version === process.env.OPENCLAW_UPGRADE_SURVIVOR_BASELINE_VERSION,
-    "cron SDK version differs from the installed CLI",
+    "volume cron SDK version differs from the installed CLI",
   );
   const installedRequire = createRequire(packageJsonPath);
   // Use the published writer so the fixture cannot initialize candidate schema or codecs.
   const sdkUrl = pathToFileURL(installedRequire.resolve("openclaw/plugin-sdk/cron-store-runtime"));
   const { loadCronStore, saveCronStore } = await import(sdkUrl.href);
+  const spec = getVolumeSpec();
+  const jobs = Array.from({ length: spec.cronJobs }, (_, index) => getVolumeCronJob(index));
   const storePath = path.join(stateDir, "cron", "jobs.json");
   await saveCronStore(storePath, { version: 1, jobs });
-  const saved = (await loadCronStore(storePath)).jobs;
+  assertVolumeCronJobs((await loadCronStore(storePath)).jobs, spec, "published SDK round-trip");
   assert(!fs.existsSync(storePath), "published cron writer created a retired JSON store");
-  return saved;
 }
 
 export async function seedUpgradeVolume(stateDir, packageRoot) {
   seedUpgradeVolumeSessions(stateDir);
-  const spec = getVolumeSpec();
-  const jobs = Array.from({ length: spec.cronJobs }, (_, index) => getVolumeCronJob(index));
-  const saved = await seedPublishedCronJobs(stateDir, packageRoot, jobs);
-  assertVolumeCronJobs(saved, spec, "published SDK round-trip");
+  await seedUpgradeVolumeCronJobs(stateDir, packageRoot);
   seedUpgradeVolumeSharedState(stateDir);
 }
 

@@ -2927,6 +2927,7 @@ function createReleasePublishFixture(
     join(helperDir, "release-beta-verifier.ts"),
     "file",
   );
+  symlinkSync(resolve("scripts/tsx.mjs"), join(helperDir, "../tsx.mjs"), "file");
   writeFileSync(eventsPath, "");
   writeFileSync(githubEventPath, JSON.stringify({ inputs }));
   writeFileSync(outputPath, "");
@@ -6930,7 +6931,7 @@ if (args[0] === "view") {
     const job = workflowJob(RELEASE_PUBLISH_WORKFLOW, "publish");
     const diagnosticPath = join(fixture.root, "evidence/release-postpublish-diagnostics.json");
     const imported = fixture.run({
-      run: `node --import tsx --input-type=module -e 'await import("./.release-harness/scripts/lib/release-beta-verifier.ts")' diagnostic-import initialize`,
+      run: `node --import ./.release-harness/scripts/tsx.mjs --input-type=module -e 'await import("./.release-harness/scripts/lib/release-beta-verifier.ts")' diagnostic-import initialize`,
     });
     expect(imported.status, imported.stderr).toBe(0);
     expect(imported.stderr).toBe("");
@@ -8193,6 +8194,18 @@ test "$package_manager" = "pnpm@12.1.0"
       workflowJob(OPENCLAW_NPM_PREFLIGHT_WORKFLOW, "check_sdk_npm"),
       "Verify Plugin SDK API changes",
     );
+    expect(sdkStep.run).toContain(
+      '--summary "${GITHUB_WORKSPACE}/.artifacts/npm-sdk-proof/plugin-sdk-api-release-diff.md"',
+    );
+    expect(sdkStep.run).toContain(
+      'cat "${GITHUB_WORKSPACE}/.artifacts/npm-sdk-proof/plugin-sdk-api-release-diff.md" >> "$GITHUB_STEP_SUMMARY"',
+    );
+    expect(
+      workflowStep(
+        workflowJob(OPENCLAW_NPM_PREFLIGHT_WORKFLOW, "verify_openclaw_npm"),
+        "Upload Plugin SDK API release diff",
+      ).with?.path,
+    ).toContain("plugin-sdk-api-release-diff.md");
     const sdkCommandBlock = (sdkStep.run ?? "").match(
       /\(\n\s+cd "\$tooling_dir"\n\s+pnpm install --frozen-lockfile --ignore-scripts --filter openclaw\n\s+pnpm run plugin-sdk:api:diff -- "\$\{diff_args\[@\]\}"\n\s*\)/u,
     )?.[0];
@@ -9266,6 +9279,10 @@ test "$package_manager" = "pnpm@12.1.0"
     const drainStep = workflowStep(drain, "Drain child diagnostics");
     const decisionUpload = workflowStep(decision, "Upload release decision");
     const drainUpload = workflowStep(drain, "Upload diagnostic drain manifest");
+    const planInputsStep = workflowStep(
+      executionPlan,
+      "Prepare immutable release execution plan inputs",
+    );
     const planStep = workflowStep(executionPlan, "Seal immutable release execution plan");
     const planCache = workflowStep(executionPlan, "Cache immutable release execution plan");
     const planRestore = workflowStep(
@@ -9294,24 +9311,32 @@ test "$package_manager" = "pnpm@12.1.0"
     expectTextToIncludeAll(decisionStep.run, [
       'node scripts/full-release-validation-state.mjs "$FULL_RELEASE_STATE_MODE"',
     ]);
-    expect(planStep.run).toContain("FULL_RELEASE_PLAN_INPUTS_JSON");
-    expect(planStep.env).toMatchObject({
+    expect(planInputsStep.run).toContain("FULL_RELEASE_PLAN_INPUTS_JSON");
+    expect(planInputsStep.env).toMatchObject({
       CANDIDATE_EVIDENCE_JSON: "${{ needs.candidate_acquisition.outputs.binding_json }}",
       CANDIDATE_REQUEST_JSON: "${{ needs.resolve_target.outputs.candidate_request_json }}",
       EVIDENCE_CHANGED_PATHS: "${{ needs.evidence_reuse.outputs.changed_paths || '[]' }}",
       EVIDENCE_RUN_ID: "${{ needs.evidence_reuse.outputs.evidence_run_id }}",
       TRUSTED_WORKFLOW_JSON: "${{ needs.resolve_target.outputs.trusted_workflow_json }}",
     });
-    expect(planStep.env).not.toHaveProperty("EVIDENCE_MANIFEST");
-    expect(planStep.run).not.toContain("EVIDENCE_MANIFEST");
-    expect(planStep.run).toContain('--arg evidenceRunId "$EVIDENCE_RUN_ID"');
-    expect(planStep.run).toContain(
+    expect(planInputsStep.env).not.toHaveProperty("EVIDENCE_MANIFEST");
+    expect(planInputsStep.run).not.toContain("EVIDENCE_MANIFEST");
+    expect(planInputsStep.run).toContain('--arg evidenceRunId "$EVIDENCE_RUN_ID"');
+    expect(planInputsStep.run).toContain(
       '--argjson candidateEvidence "${CANDIDATE_EVIDENCE_JSON:-null}"',
     );
-    expect(planStep.run).toContain('--argjson candidateRequestInput "$CANDIDATE_REQUEST_JSON"');
-    expect(planStep.run).toContain("candidateRequestInput: $candidateRequestInput");
-    expect(planStep.run).not.toContain("candidateRequestInput: {");
-    expect(planStep.run).toContain('--argjson trustedWorkflow "$TRUSTED_WORKFLOW_JSON"');
+    expect(planInputsStep.run).toContain(
+      '--argjson candidateRequestInput "$CANDIDATE_REQUEST_JSON"',
+    );
+    expect(planInputsStep.run).toContain("candidateRequestInput: $candidateRequestInput");
+    expect(planInputsStep.run).not.toContain("candidateRequestInput: {");
+    expect(planInputsStep.run).toContain('--argjson trustedWorkflow "$TRUSTED_WORKFLOW_JSON"');
+    expect(planStep.run).toContain("full-release-execution-plan-inputs/plan-inputs.json");
+    expect(planStep.env).toMatchObject({
+      FULL_RELEASE_PRESEAL_RECOVERY:
+        "${{ github.run_attempt != 1 && steps.plan_cache.outputs.cache-hit != 'true' && steps.plan_restore.outcome != 'success' && steps.plan_inputs_restore.outcome == 'success' }}",
+      FULL_RELEASE_PREPARATION_SOURCE_ATTEMPT: "1",
+    });
     expect(planCache.uses).toBe(
       ACTIONS_CACHE_V6.replace("actions/cache@", "actions/cache/restore@"),
     );
@@ -9323,13 +9348,14 @@ test "$package_manager" = "pnpm@12.1.0"
     expect(planRestore.if).toBe(
       "${{ always() && github.run_attempt != 1 && steps.plan_cache.outputs.cache-hit != 'true' }}",
     );
+    expect(planRestore["continue-on-error"]).toBe(true);
     expect(planRestore.with).toMatchObject({
       "github-token": "${{ github.token }}",
       name: "full-release-execution-plan-${{ github.run_id }}",
       "run-id": "${{ github.run_id }}",
     });
     expect(planUpload.if).toBe(
-      "${{ always() && github.run_attempt == 1 && steps.plan.outputs.sha256 != '' && steps.plan.outputs.source_parent_attempt == '1' }}",
+      "${{ always() && steps.plan.outputs.sha256 != '' && steps.plan.outputs.source_parent_attempt == '1' && (steps.plan_inputs_upload.outcome == 'success' || steps.plan_inputs_restore.outcome == 'success') }}",
     );
     expect(planUpload.with?.name).toBe("full-release-execution-plan-${{ github.run_id }}");
     expect(planUpload.with?.overwrite).toBe(false);
@@ -9389,7 +9415,7 @@ test "$package_manager" = "pnpm@12.1.0"
         .map((step) => ({ jobId, step })),
     );
 
-    expect(downloadSteps).toHaveLength(8);
+    expect(downloadSteps).toHaveLength(10);
     expect(
       downloadSteps.map(({ jobId, step }) => [
         jobId,
@@ -9398,6 +9424,12 @@ test "$package_manager" = "pnpm@12.1.0"
         step.with?.path,
       ]),
     ).toEqual([
+      [
+        "resolve_target",
+        "Restore immutable plan inputs for publication admission",
+        "full-release-execution-plan-inputs-${{ github.run_id }}-1",
+        "${{ github.workspace }}/full-release-execution-plan-inputs",
+      ],
       [
         "evidence_reuse",
         "Download publication admission for reuse budgeting",
@@ -9409,6 +9441,12 @@ test "$package_manager" = "pnpm@12.1.0"
         "Restore immutable release execution plan artifact",
         "full-release-execution-plan-${{ github.run_id }}",
         "${{ github.workspace }}/full-release-execution-plan",
+      ],
+      [
+        "release_execution_plan",
+        "Restore immutable release execution plan inputs",
+        "full-release-execution-plan-inputs-${{ github.run_id }}-1",
+        "${{ github.workspace }}/full-release-execution-plan-inputs",
       ],
       [
         "release_execution_plan",
@@ -9553,7 +9591,6 @@ describe("package artifact reuse", () => {
       on?: { workflow_call?: { inputs?: Record<string, unknown> } };
     };
     const packageJson = readFileSync(PACKAGE_JSON, "utf8");
-    const scheduler = readFileSync("scripts/test-docker-all.mts", "utf8");
     const publishedUpgradeSurvivor = readFileSync(UPGRADE_SURVIVOR_RUN_SCRIPT, "utf8");
 
     expect(workflow).toContain("package_artifact_name:");
@@ -9793,17 +9830,6 @@ describe("package artifact reuse", () => {
     expect(workflow).toContain("GROUP_LABEL: ${{ matrix.group.label }}");
     expect(workflow).toContain("DOCKER_E2E_LANES: ${{ matrix.group.docker_lanes }}");
     expect(workflow).toContain("name: docker-e2e-${{ steps.plan.outputs.artifact_suffix }}");
-    expect(scheduler).toContain(
-      "published_upgrade_survivor_baseline=${shellQuote(env.OPENCLAW_UPGRADE_SURVIVOR_BASELINE_SPEC)}",
-    );
-    expect(scheduler).toContain(
-      "published_upgrade_survivor_baselines=${shellQuote(env.OPENCLAW_UPGRADE_SURVIVOR_BASELINE_SPECS)}",
-    );
-    expect(scheduler).toContain(
-      '["OPENCLAW_UPGRADE_SURVIVOR_BASELINE_SPEC", baseEnv.OPENCLAW_UPGRADE_SURVIVOR_BASELINE_SPEC]',
-    );
-    expect(scheduler).toContain('["OPENCLAW_UPGRADE_SURVIVOR_BASELINE_SPECS",');
-    expect(scheduler).toContain('["OPENCLAW_UPGRADE_SURVIVOR_SCENARIOS",');
     expect(packageJson).toContain("OPENCLAW_UPGRADE_SURVIVOR_PUBLISHED_BASELINE=1");
     expect(packageJson).toContain("test:docker:update-restart-auth");
     expect(packageJson).toContain("OPENCLAW_UPGRADE_SURVIVOR_UPDATE_RESTART_MODE=auto-auth");
@@ -10829,7 +10855,7 @@ describe("package artifact reuse", () => {
     );
     expect(openCodeGo.command).not.toContain("opencode-go/deepseek-v4-flash");
     expect(openCodeGoSmoke.command).toContain(
-      "OPENCLAW_LIVE_GATEWAY_MODELS=opencode-go/glm-5.2 OPENCLAW_LIVE_GATEWAY_SMOKE=1",
+      "OPENCLAW_LIVE_GATEWAY_MODELS=opencode-go/glm-5.3 OPENCLAW_LIVE_GATEWAY_SMOKE=1",
     );
     expect(openCodeGo.command).not.toContain("opencode-go/deepseek-v4-pro");
   });

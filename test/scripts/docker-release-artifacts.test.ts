@@ -149,6 +149,13 @@ async function createPreparedRelease(includeBrowser = true, version = "2026.8.1-
     conclusion: "success",
     head_sha: toolingSha,
   };
+  const architectureJobs = ["amd64", "arm64"].map((architecture, index) =>
+    Object.assign({}, job, {
+      id: 20 + index,
+      name: `Prepare Docker / Prepare Docker images (${architecture})`,
+      check_run_url: `https://api.github.com/repos/${repository}/check-runs/${20 + index}`,
+    }),
+  );
   const run = {
     id: Number(runId),
     run_attempt: Number(runAttempt),
@@ -179,17 +186,24 @@ async function createPreparedRelease(includeBrowser = true, version = "2026.8.1-
     if (endpoint.endsWith("/actions/jobs/7")) {
       return job;
     }
+    const architectureJob = architectureJobs.find((candidate) =>
+      endpoint.endsWith(`/actions/jobs/${candidate.id}`),
+    );
+    if (architectureJob) {
+      return architectureJob;
+    }
     if (endpoint.includes("/jobs?")) {
       return {
         jobs: [
           job,
+          ...architectureJobs,
           {
             ...job,
             id: 8,
             check_run_url: `https://api.github.com/repos/${repository}/check-runs/8`,
           },
         ],
-        total_count: 2,
+        total_count: 4,
       };
     }
     if (endpoint.endsWith(`/actions/runs/${runId}/attempts/${runAttempt}`)) {
@@ -774,8 +788,7 @@ describe("prepared Docker publication", () => {
         { preparedRunId: "0" },
         { preparedRunAttempt: 2 },
         { preparedRunAttempt: "0" },
-        { preparedRunAttempt: "1" },
-        { preparedArtifactName: dockerReleaseArtifactName(sourceSha, "3") },
+        { preparedArtifactName: dockerReleaseArtifactName(toolingSha, "3") },
         { preparedManifestSha256: "invalid" },
       ]) {
         expect(() =>

@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
-import { describe, expect, it, onTestFinished, vi } from "vitest";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "openclaw/plugin-sdk/runtime-config-snapshot";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import {
   fixture,
   completeInForeground,
@@ -20,6 +24,8 @@ import {
 import { readCodexNativeSubagentSubmissions } from "./native-subagent-submission.js";
 import { setupRunAttemptTestHooks } from "./run-attempt-test-harness.js";
 
+beforeEach(() => setRuntimeConfigSnapshot({}));
+afterEach(() => clearRuntimeConfigSnapshot());
 setupRunAttemptTestHooks();
 
 async function startAssignment(observeTurn = true) {
@@ -33,6 +39,87 @@ async function startAssignment(observeTurn = true) {
 }
 
 describe("native pending assignment inventory through registered monitor admission", () => {
+  it("settles restoration writes before reading the next assignment or reporting readiness", async () => {
+    const f = await fixture();
+    const assignments = ["first-child", "second-child"].map((childThreadId) => ({
+      runId: `codex-thread:${childThreadId}`,
+      childThreadId,
+      nativeTurnId: `${childThreadId}-turn`,
+      nativeParentThreadId: "parent-thread",
+      owner: f.historyOwner(),
+    }));
+    for (const assignment of assignments) {
+      await f.store.mutate(
+        f.identity,
+        { kind: "record-native-subagent-assignment", owner: f.historyOwner(), assignment },
+        () => {},
+      );
+    }
+    const entered = createDeferred<void>();
+    const releaseWrite = createDeferred<void>();
+    let writing = false;
+    const mutate = f.store.mutate.bind(f.store);
+    vi.spyOn(f.store, "mutate").mockImplementation(
+      async (identity, mutation, assertCurrent, authority) => {
+        if (mutation.kind !== "record-native-subagent-assignment") {
+          return await mutate(identity, mutation, assertCurrent, authority);
+        }
+        writing = true;
+        entered.resolve();
+        try {
+          await releaseWrite.promise;
+          return await mutate(identity, mutation, assertCurrent, authority);
+        } finally {
+          writing = false;
+        }
+      },
+    );
+    const readAssignments = f.store.readNativeSubagentAssignments!.bind(f.store);
+    const conflictingRead = vi.fn();
+    vi.spyOn(f.store, "readNativeSubagentAssignments").mockImplementation(async (...args) => {
+      if (writing) {
+        conflictingRead();
+        throw new Error("Plugin state authority is unavailable");
+      }
+      return await readAssignments(...args);
+    });
+    const client = createClient();
+    for (const assignment of assignments) {
+      client.setThreadRead(
+        assignment.childThreadId,
+        threadRead({
+          childThreadId: assignment.childThreadId,
+          turnId: assignment.nativeTurnId,
+          result: `Recovered ${assignment.childThreadId}`,
+          resultPhase: "final_answer",
+        }),
+      );
+    }
+    const parent = await f.register(client);
+    let ready = false;
+    void parent.ready.then(() => {
+      ready = true;
+    });
+    try {
+      await entered.promise;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ready).toBe(false);
+      expect(conflictingRead).not.toHaveBeenCalled();
+      releaseWrite.resolve();
+      await parent.ready;
+      expect(ready).toBe(true);
+      expect(conflictingRead).not.toHaveBeenCalled();
+      expect(parent.listPendingChildren()).toHaveLength(2);
+      expect(await f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toEqual(
+        assignments.map((assignment) => expect.objectContaining(assignment)),
+      );
+    } finally {
+      releaseWrite.resolve();
+      await parent.unregister();
+      client.close();
+    }
+  });
+
   it.each(["committed", "rejected", "failed", "source-revoked", "binding-retired"] as const)(
     "withholds native inference authority until its exact assignment is acknowledged (%s)",
     async (outcome) => {
@@ -48,22 +135,24 @@ describe("native pending assignment inventory through registered monitor admissi
       const entered = createDeferred<void>();
       const releaseWrite = createDeferred<void>();
       const mutate = f.store.mutate.bind(f.store);
-      vi.spyOn(f.store, "mutate").mockImplementation(async (identity, mutation, assertCurrent) => {
-        if (
-          mutation.kind === "record-native-subagent-assignment" &&
-          mutation.assignment.nativeTurnId === "child-turn"
-        ) {
-          entered.resolve();
-          await releaseWrite.promise;
-          if (outcome === "failed") {
-            throw new Error("Synthetic binding write failure");
+      vi.spyOn(f.store, "mutate").mockImplementation(
+        async (identity, mutation, assertCurrent, authority) => {
+          if (
+            mutation.kind === "record-native-subagent-assignment" &&
+            mutation.assignment.nativeTurnId === "child-turn"
+          ) {
+            entered.resolve();
+            await releaseWrite.promise;
+            if (outcome === "failed") {
+              throw new Error("Synthetic binding write failure");
+            }
+            if (outcome === "rejected") {
+              return false;
+            }
           }
-          if (outcome === "rejected") {
-            return false;
-          }
-        }
-        return await mutate(identity, mutation, assertCurrent);
-      });
+          return await mutate(identity, mutation, assertCurrent, authority);
+        },
+      );
       const granted = vi.fn();
       const capture = codexNativeSubagentMonitorRuntime
         .captureModelSource({
@@ -107,12 +196,14 @@ describe("native pending assignment inventory through registered monitor admissi
         expect(result.error).toBeUndefined();
         assert(result.value);
         result.value.assertCurrent();
-        expect(f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toEqual([
-          expect.objectContaining({
-            runId: "codex-thread:child-thread",
-            nativeTurnId: "child-turn",
-          }),
-        ]);
+        expect(await f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toEqual(
+          [
+            expect.objectContaining({
+              runId: "codex-thread:child-thread",
+              nativeTurnId: "child-turn",
+            }),
+          ],
+        );
         result.value.release();
       } else {
         expect(result.error).toBeInstanceOf(Error);
@@ -133,14 +224,14 @@ describe("native pending assignment inventory through registered monitor admissi
       const { f, client: firstClient, parent: first } = await startAssignment(observeTurn);
       await first.unregister();
       first.closeCaller();
-      expect(f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toEqual([
+      expect(await f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toEqual([
         expect.objectContaining({
           runId: "codex-thread:child-thread",
           ...(observeTurn ? { nativeTurnId: "child-turn" } : {}),
         }),
       ]);
       // Initial spawn result agent_id is never interpreted as submission_id.
-      expect(f.store.readNativeSubagentSubmissions(f.identity, f.historyOwner())).toEqual([]);
+      expect(await f.store.readNativeSubagentSubmissions(f.identity, f.historyOwner())).toEqual([]);
       firstClient.close();
       const owner = f.historyOwner(rotate ? "rotated-parent" : "parent-thread");
       if (rotate) {
@@ -174,7 +265,7 @@ describe("native pending assignment inventory through registered monitor admissi
         },
       });
       expect(delivered?.completionCustody).toBeDefined();
-      expect(f.store.readNativeSubagentAssignments?.(f.identity, owner)).toEqual([]);
+      expect(await f.store.readNativeSubagentAssignments?.(f.identity, owner)).toEqual([]);
       client.close();
       const third = await f.register(createClient(), owner);
       await third.ready;
@@ -214,15 +305,19 @@ describe("native pending assignment inventory through registered monitor admissi
         expect(f.deliver).toHaveBeenCalledExactlyOnceWith(
           expect.objectContaining({ result: "Actual child result" }),
         );
-        expect(f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toEqual([]);
+        expect(await f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toEqual(
+          [],
+        );
       } else {
         expect(f.deliver).not.toHaveBeenCalled();
-        expect(f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toEqual([
-          expect.objectContaining({
-            runId: "codex-thread:child-thread",
-            childThreadId: "child-thread",
-          }),
-        ]);
+        expect(await f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toEqual(
+          [
+            expect.objectContaining({
+              runId: "codex-thread:child-thread",
+              childThreadId: "child-thread",
+            }),
+          ],
+        );
       }
       expect(client.request).not.toHaveBeenCalledWith(
         "thread/read",
@@ -261,7 +356,9 @@ describe("native pending assignment inventory through registered monitor admissi
       await recovered.ready;
       await recovered.unregister();
       expect(f.deliver).not.toHaveBeenCalled();
-      expect(f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toHaveLength(1);
+      expect(
+        await f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner()),
+      ).toHaveLength(1);
     },
   );
 
@@ -312,8 +409,10 @@ describe("native pending assignment inventory through registered monitor admissi
       predecessorRunId: "codex-thread:child-thread",
       predecessorNativeTurnId: "child-turn",
     };
-    expect(f.store.readNativeSubagentSubmissions(f.identity, f.historyOwner())).toEqual([receipt]);
-    expect(f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toEqual([
+    expect(await f.store.readNativeSubagentSubmissions(f.identity, f.historyOwner())).toEqual([
+      receipt,
+    ]);
+    expect(await f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toEqual([
       expect.objectContaining({
         runId: "codex-thread:child-thread:turn:followup-turn",
         submission: receipt,
@@ -327,7 +426,7 @@ describe("native pending assignment inventory through registered monitor admissi
       expectedThreadId: "parent-thread",
       binding: { ...f.binding, threadId: owner.parentThreadId },
     });
-    expect(f.store.readNativeSubagentSubmissions(f.identity, owner)).toEqual([]);
+    expect(await f.store.readNativeSubagentSubmissions(f.identity, owner)).toEqual([]);
     const history = threadRead({
       turnId: "followup-turn",
       result: "Recovered follow-up",
@@ -351,8 +450,8 @@ describe("native pending assignment inventory through registered monitor admissi
           "codex-native:parent-thread:codex-thread:child-thread:turn:followup-turn:succeeded",
       }),
     );
-    expect(f.store.readNativeSubagentAssignments?.(f.identity, owner)).toEqual([]);
-    expect(f.store.readNativeSubagentSubmissions(f.identity, owner)).toEqual([]);
+    expect(await f.store.readNativeSubagentAssignments?.(f.identity, owner)).toEqual([]);
+    expect(await f.store.readNativeSubagentSubmissions(f.identity, owner)).toEqual([]);
     resumedClient.close();
     const duplicate = await f.register(createClient(), owner);
     await duplicate.ready;
@@ -516,7 +615,7 @@ describe("native pending assignment inventory through registered monitor admissi
       });
       await replacement.unregister();
       expect(f.deliver).toHaveBeenCalledOnce();
-      expect(f.store.readNativeSubagentAssignments?.(f.identity, owner)).toEqual([
+      expect(await f.store.readNativeSubagentAssignments?.(f.identity, owner)).toEqual([
         expect.objectContaining({
           runId: "codex-thread:child-thread:turn:followup-turn",
           nativeParentThreadId: "parent-thread",
@@ -565,11 +664,11 @@ describe("native pending assignment inventory through registered monitor admissi
       }
       await vi.advanceTimersByTimeAsync(600_000);
       expect(f.deliver).toHaveBeenCalledTimes(attempts);
-      const saved = f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner());
+      const saved = await f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner());
       expect(saved).toHaveLength(assignment === "empty" ? 0 : 1);
-      expect(f.store.readNativeSubagentSubmissions(f.identity, f.historyOwner())).toHaveLength(
-        assignment === "followup" ? 1 : 0,
-      );
+      expect(
+        await f.store.readNativeSubagentSubmissions(f.identity, f.historyOwner()),
+      ).toHaveLength(assignment === "followup" ? 1 : 0);
       parent.closeCaller();
       client.close();
       f.deliver.mockClear();
@@ -595,8 +694,10 @@ describe("native pending assignment inventory through registered monitor admissi
           expect.objectContaining({ result: "Pending result" }),
         );
       }
-      expect(f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toEqual([]);
-      expect(f.store.readNativeSubagentSubmissions(f.identity, f.historyOwner())).toEqual([]);
+      expect(await f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toEqual(
+        [],
+      );
+      expect(await f.store.readNativeSubagentSubmissions(f.identity, f.historyOwner())).toEqual([]);
       recoveredClient.close();
       const duplicate = await f.register(createClient());
       await duplicate.ready;
@@ -609,7 +710,7 @@ describe("native pending assignment inventory through registered monitor admissi
     const { f, client, parent } = await startAssignment();
     await completeInForeground(client);
     await parent.unregister();
-    expect(f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toEqual([]);
+    expect(await f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toEqual([]);
     client.close();
     const recovered = await f.register(createClient());
     await recovered.ready;

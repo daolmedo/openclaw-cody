@@ -16,7 +16,7 @@ import { loadOpenClawPlugins } from "../plugins/loader.js";
 import { extractTextFromChatContent } from "../shared/chat-content.js";
 import { sleep } from "../utils/sleep.js";
 import type { GatewayClient } from "./client.js";
-import { loadGatewaySessionEntryReadOnly } from "./session-utils.js";
+import { loadGatewaySessionEntryReadOnlyAsync } from "./session-utils.js";
 import { extractPayloadText } from "./test-helpers.agent-results.js";
 
 export const CLI_BACKEND_PROBE_PLUGIN_ID = "cli-backend-probe";
@@ -161,7 +161,7 @@ export async function createCliBackendProbePlugin(
   id: "${CLI_BACKEND_PROBE_PLUGIN_ID}",
   name: "CLI Backend Probe",
   register(api) {
-    api.registerTool((ctx) => ctx.sessionKey?.startsWith("agent:dev:cli-announce-") ? {
+    api.registerTool({
       name: "${CLI_ANNOUNCE_BARRIER_TOOL_NAME}",
       description: "Wait for the live test controller to release the parent turn after child completion",
       parameters: { type: "object", properties: {}, additionalProperties: false },
@@ -170,7 +170,7 @@ export async function createCliBackendProbePlugin(
         if (!response.ok) throw new Error("CLI announce barrier request failed");
         return { content: [{ type: "text", text: await response.text() }] };
       },
-    } : null, { name: "${CLI_ANNOUNCE_BARRIER_TOOL_NAME}" });
+    });
     const continuity = ${JSON.stringify(probes.continuity ?? null)};
     if (continuity) {
       api.on("before_prompt_build", (event, ctx) => {
@@ -343,7 +343,7 @@ export async function verifyCliBackendAnnounceOrdering({
   );
   // CLI requesters use an ordered agent handoff, not the embedded steer queue.
   // The committed parent reply must precede the completion in canonical history.
-  const announceEntry = loadGatewaySessionEntryReadOnly(announceSessionKey).entry;
+  const announceEntry = (await loadGatewaySessionEntryReadOnlyAsync(announceSessionKey)).entry;
   if (!announceEntry?.sessionId) {
     throw new Error("CLI announce probe lost its requester session");
   }

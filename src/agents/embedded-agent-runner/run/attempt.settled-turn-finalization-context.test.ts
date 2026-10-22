@@ -28,7 +28,7 @@ afterEach(async () => {
 });
 
 describe("settled post-tool turn finalization context", () => {
-  it("keeps detached tool receipts across empty finalization retries without retaining internal user prompts", async () => {
+  it("keeps detached tool receipts and hidden prompts across empty finalization retries", async () => {
     const { guardSessionManager } = await vi.importActual<
       typeof import("../../session-tool-result-guard-wrapper.js")
     >("../../session-tool-result-guard-wrapper.js");
@@ -131,12 +131,21 @@ describe("settled post-tool turn finalization context", () => {
       for (const messages of finalizerContexts) {
         expect(messages).toContainEqual(expect.objectContaining(toolResult));
       }
+      const persistedUsers = manager
+        .buildSessionContext()
+        .messages.filter((message) => message.role === "user");
+      const isHiddenInternalPrompt = (message: unknown) =>
+        (message as { provenance?: { kind?: string } }).provenance?.kind === "internal_system";
       expect(
-        manager
-          .buildSessionContext()
-          .messages.filter((message) => message.role === "user")
+        persistedUsers
+          .filter((message) => !isHiddenInternalPrompt(message))
           .map((message) => message.content),
       ).toEqual(["hello"]);
+      const hiddenFinalizationPrompts = persistedUsers.filter(isHiddenInternalPrompt);
+      expect(hiddenFinalizationPrompts).toHaveLength(2);
+      for (const message of hiddenFinalizationPrompts) {
+        expect(message).toMatchObject({ display: false, provenance: { kind: "internal_system" } });
+      }
       const genuineUser = { role: "user" as const, content: "Read the next file", timestamp: 5 };
       manager.appendMessage(genuineUser);
       expect(manager.buildSessionContext().messages).toContainEqual(

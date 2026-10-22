@@ -2,7 +2,7 @@ import "../test-utils/prepare-compiled-subprocesses.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs";
 import path from "node:path";
-import { expect, it, vi } from "vitest";
+import { expect, it, onTestFinished, vi } from "vitest";
 import {
   buildFileEntry,
   buildMultimodalChunkForIndexing,
@@ -11,6 +11,11 @@ import {
 import { readMemoryFile } from "../../packages/memory-host-sdk/src/host/read-file.js";
 import type { MemoryWorkspaceFiles } from "../../packages/memory-host-sdk/src/host/workspace-files.js";
 import { withinTest } from "../../test/helpers/promise.js";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../config/runtime-snapshot.js";
+import * as artifactCleanup from "../config/sessions/session-accessor.sqlite-artifact-cleanup.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createGatewayRequestContext } from "../gateway/server-request-context.js";
 import { makeContextParams } from "../gateway/server-request-context.test-support.js";
@@ -60,6 +65,15 @@ const cleanupParams = {
   transcriptContentMarker: '"runId":"dreaming-narrative-',
   orphanTranscriptMinAgeMs: 300_000,
   archiveRemovedEntryTranscripts: false,
+};
+
+const disabledCron = {
+  isEnabled: async () => false,
+  list: async () => [],
+  add: async () => {},
+  update: async () => {},
+  remove: async () => ({ removed: false }),
+  removeStaleJobFamily: async () => 0,
 };
 
 function createManagedMemoryCore(config: OpenClawConfig, logger: OpenClawPluginApi["logger"]) {
@@ -148,6 +162,8 @@ it.each([
           cron: { enabled: false },
           agents: { entries: { main: { workspace: state.workspaceDir } } },
         };
+        setRuntimeConfigSnapshot(config, config);
+        onTestFinished(clearRuntimeConfigSnapshot);
         const sessionKey = "agent:main:dreaming-narrative-light-interrupted";
         const sessionId = "historical-narrative";
         const updatedAt = Date.now() - 600_000;
@@ -178,7 +194,15 @@ it.each([
             on: hooks,
             registerService: (service) => services.push(service),
           });
+        const backgroundTasks: Promise<unknown>[] = [];
         if (!owner) {
+          api.lifecycle.runInBackgroundContext = (run) => {
+            const task = run();
+            if (task instanceof Promise) {
+              backgroundTasks.push(task);
+            }
+            return task;
+          };
           Object.assign(api.runtime, { config: { current: () => config } });
           memoryCore.register?.(api);
         }
@@ -197,14 +221,7 @@ it.each([
           stateDir: state.stateDir,
           logger,
           scheduler,
-          getCron: () => ({
-            isEnabled: async () => false,
-            list: async () => [],
-            add: async () => {},
-            update: async () => {},
-            remove: async () => ({ removed: false }),
-            removeStaleJobFamily: async () => 0,
-          }),
+          getCron: () => disabledCron,
         };
         try {
           await withPendingPreparation(
@@ -221,17 +238,29 @@ it.each([
                 return preparation;
               });
               owner?.bindGateway();
+              if (owner) {
+                const runInBackgroundContext = api.lifecycle.runInBackgroundContext;
+                api.lifecycle.runInBackgroundContext = (run) => {
+                  const task = runInBackgroundContext ? runInBackgroundContext(run) : run();
+                  if (task instanceof Promise) {
+                    backgroundTasks.push(task);
+                  }
+                  return task;
+                };
+              }
               await service.start(context);
+              backgroundTasks.length = 0;
               const startup = (
                 hook as (event: { port: number }, ctx: { config: OpenClawConfig }) => Promise<void>
               )({ port: 0 }, { config });
               // On the regression, the hook settles with a warning instead of joining preparation.
-              await Promise.race([joining.promise, startup]);
+              await Promise.race([joining.promise, Promise.all(backgroundTasks)]);
               const prepared = wait("main", { env: state.env });
               expect(prepared).toBeDefined();
               activate();
               await prepared;
               await startup;
+              await Promise.all(backgroundTasks);
               expect.soft(logger.warn.mock.calls).toEqual([]);
               expect.soft(getSessionEntry({ agentId: "main", sessionKey })).toBeUndefined();
               expect
@@ -330,11 +359,96 @@ it("cancels pending cleanup when the startup admission owner stops", async () =>
   );
 });
 
-it("keeps the identity guard for creation outside startup preparation", async () => {
+it("does not warn when fresh agent stores are created during dreaming startup cleanup", async () => {
+  await withOpenClawTestState(
+    { label: "dreaming-fresh-startup", layout: "state-only" },
+    async (state) => {
+      const agentIds = ["main", "researcher"];
+      const config: OpenClawConfig = {
+        cron: { enabled: false },
+        agents: {
+          entries: Object.fromEntries(
+            agentIds.map((id) => [id, { workspace: path.join(state.stateDir, `workspace-${id}`) }]),
+          ),
+        },
+      };
+      const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+      const owner = createManagedMemoryCore(config, logger);
+      const backgroundTasks: Promise<unknown>[] = [];
+      const service = owner.registry.services.find(
+        (entry) => entry.service.id === "memory-core-dreaming",
+      )?.service;
+      const hook = owner.registry.typedHooks.find(
+        (entry) => entry.hookName === "gateway_start",
+      )?.handler;
+      if (!service || service.apiVersion === 2 || !hook) {
+        throw new Error("Memory Core did not register its startup lifecycle");
+      }
+      const scheduler = createTestPluginServiceScheduler();
+      const context = {
+        config,
+        stateDir: state.stateDir,
+        logger,
+        scheduler,
+        getCron: () => disabledCron,
+      };
+      const createStore = AsyncLocalStorage.bind((agentId: string) => {
+        openOpenClawAgentDatabase({ agentId });
+      });
+      const cleanup = artifactCleanup.cleanupSessionLifecycleArtifactsCore;
+      const startedAgents: string[] = [];
+      vi.spyOn(artifactCleanup, "cleanupSessionLifecycleArtifactsCore").mockImplementation(
+        (params) => {
+          if ("kind" in params || !params.agentId) {
+            throw new Error("Expected agent-scoped persistent startup cleanup");
+          }
+          expect(fs.existsSync(state.agentDir(params.agentId))).toBe(false);
+          const pending = cleanup(params);
+          // First creation races after the real cleanup captures the absent source.
+          createStore(params.agentId);
+          startedAgents.push(params.agentId);
+          return pending;
+        },
+      );
+      try {
+        owner.bindGateway();
+        const runInBackgroundContext = owner.api.lifecycle.runInBackgroundContext;
+        owner.api.lifecycle.runInBackgroundContext = (run) => {
+          const task = runInBackgroundContext ? runInBackgroundContext(run) : run();
+          if (task instanceof Promise) {
+            backgroundTasks.push(task);
+          }
+          return task;
+        };
+        await service.start(context);
+        backgroundTasks.length = 0;
+        await (hook as (event: { port: number }, ctx: { config: OpenClawConfig }) => Promise<void>)(
+          { port: 0 },
+          { config },
+        );
+        await Promise.all(backgroundTasks);
+        expect(startedAgents).toEqual(agentIds);
+        expect(logger.warn).not.toHaveBeenCalled();
+        expect(logger.error).not.toHaveBeenCalled();
+      } finally {
+        scheduler.beginClose();
+        await service.stop?.(context);
+        await scheduler.stop();
+        await owner.dispose();
+        vi.restoreAllMocks();
+      }
+    },
+  );
+});
+
+it("keeps the identity guard when an existing database is replaced", async () => {
   await withOpenClawTestState(
     { label: "cleanup-owner-change", layout: "state-only" },
     async (state) => {
+      const databasePath = openOpenClawAgentDatabase({ agentId: "main" }).path;
+      await closeOpenClawAgentDatabasesAsync(state.stateDir);
       const cleanup = cleanupSessionLifecycleArtifacts(cleanupParams);
+      fs.renameSync(databasePath, `${databasePath}.previous`);
       openOpenClawAgentDatabase({ agentId: "main" });
       await expect(cleanup).rejects.toThrow("SQLite lifecycle cleanup database owner changed");
       await closeOpenClawAgentDatabasesAsync(state.stateDir);
@@ -366,6 +480,8 @@ it.for([
           },
         },
       };
+      setRuntimeConfigSnapshot(config, config);
+      onTestFinished(clearRuntimeConfigSnapshot);
       const subscriptions: Array<{ notify: () => void; signal: AbortSignal }> = [];
       const memoryFiles: MemoryWorkspaceFiles = {
         assertCurrent() {},

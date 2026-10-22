@@ -68,7 +68,7 @@ function fixture() {
   return { rootDir, source, actions, input, load };
 }
 
-it.each(["plain", "overlapping package", "native companion"])(
+it.each(["plain", "overlapping package", "native companion", "external dependency junctions"])(
   "captures unchanged Doctor %s source once with independent callbacks",
   async (layout) => {
     const plugin = fixture();
@@ -83,6 +83,40 @@ it.each(["plain", "overlapping package", "native companion"])(
         path.join(plugin.rootDir, "package.json"),
         '{"type":"module","dependencies":{"shared":"1.0.0"}}',
       );
+    } else if (layout === "external dependency junctions") {
+      // Use real filesystem links: Windows junctions are absolute even when
+      // capture's dependency producer supplies a relative target.
+      const dependencies = dirs.make("doctor-custody-dependencies-");
+      const shared = path.join(dependencies, "shared");
+      const consumer = path.join(dependencies, "consumer");
+      fs.mkdirSync(shared);
+      fs.mkdirSync(path.join(consumer, "node_modules"), { recursive: true });
+      fs.writeFileSync(
+        path.join(shared, "package.json"),
+        '{"name":"shared","type":"module","main":"index.mjs"}',
+      );
+      fs.writeFileSync(path.join(shared, "index.mjs"), 'export const value = "first";');
+      fs.writeFileSync(path.join(shared, "resource.txt"), "first");
+      fs.writeFileSync(
+        path.join(consumer, "package.json"),
+        '{"name":"consumer","type":"module","main":"index.mjs","dependencies":{"shared":"1.0.0"}}',
+      );
+      fs.writeFileSync(
+        path.join(consumer, "index.mjs"),
+        `import fs from 'node:fs';
+         import { value } from 'shared';
+         const resource = fs.readFileSync(new URL('./node_modules/shared/resource.txt', import.meta.url), 'utf8');
+         export const version = value === resource ? value : 'broken resource';`,
+      );
+      fs.symlinkSync(shared, path.join(consumer, "node_modules", "shared"), "junction");
+      fs.mkdirSync(path.join(plugin.rootDir, "node_modules"));
+      fs.symlinkSync(consumer, path.join(plugin.rootDir, "node_modules", "consumer"), "junction");
+      fs.symlinkSync(shared, path.join(plugin.rootDir, "node_modules", "shared"), "junction");
+      fs.writeFileSync(
+        path.join(plugin.rootDir, "package.json"),
+        '{"type":"module","dependencies":{"consumer":"1.0.0","shared":"1.0.0"}}',
+      );
+      fs.writeFileSync(plugin.actions, "export { version } from 'consumer';");
     } else if (layout === "native companion") {
       fs.writeFileSync(path.join(plugin.rootDir, "a.so"), "synthetic native fixture");
       fs.writeFileSync(path.join(plugin.rootDir, "z-helper.dat"), "original companion");
@@ -104,101 +138,6 @@ it.each(["plain", "overlapping package", "native companion"])(
       expect(results[0]!.changes[3]).not.toBe(results[1]!.changes[3]);
       expect(acquisitions[0]).toBeGreaterThan(0);
       expect(acquisitions[1]! - acquisitions[0]!).toBe(0);
-    });
-  },
-);
-
-it.each(["content", "root", "native companion"])(
-  "recaptures changed %s without changing old callbacks",
-  async (change) => {
-    const plugin = fixture();
-    if (change === "native companion") {
-      fs.writeFileSync(path.join(plugin.rootDir, "a.so"), "synthetic native fixture");
-      fs.writeFileSync(path.join(plugin.rootDir, "z-helper.dat"), "original companion");
-    }
-    const copies = vi.spyOn(sourceFiles, "copyPluginSourceFile");
-    await withPluginGenerationSourceCustody(async () => {
-      await using firstCache = createPluginCache();
-      const first = withPluginCache(firstCache, plugin.load);
-      if (change === "root") {
-        const moved = path.join(dirs.make("doctor-replaced-source-"), "old");
-        fs.renameSync(plugin.rootDir, moved);
-        fs.cpSync(moved, plugin.rootDir, { recursive: true });
-      }
-      if (change === "native companion") {
-        fs.writeFileSync(path.join(plugin.rootDir, "z-helper.dat"), "changed companion");
-      } else {
-        fs.writeFileSync(plugin.actions, 'export const version = "second";');
-      }
-      await using secondCache = createPluginCache();
-      const second = withPluginCache(secondCache, plugin.load);
-      const previous = await first.migrateLegacyState(plugin.input);
-      const current = await second.migrateLegacyState(plugin.input);
-      expect(previous.changes.slice(0, 3)).toEqual(["first", "1", "original resource"]);
-      expect(current.changes.slice(0, 3)).toEqual([
-        change === "native companion" ? "first" : "second",
-        "1",
-        "original resource",
-      ]);
-      if (change === "native companion") {
-        expect([previous.changes[4], current.changes[4]]).toEqual([
-          "original companion",
-          "changed companion",
-        ]);
-      }
-      expect(copies.mock.calls.filter(([source]) => source === plugin.source)).toHaveLength(2);
-    });
-  },
-);
-
-it.each(["removed", "retargeted"])(
-  "recaptures a %s optional dependency while its old files still exist",
-  async (change) => {
-    const plugin = fixture();
-    const dependency = (value: string) => {
-      const root = dirs.make("doctor-optional-package-");
-      fs.writeFileSync(path.join(root, "package.json"), '{"name":"optional","main":"index.cjs"}');
-      fs.writeFileSync(path.join(root, "index.cjs"), `module.exports = ${JSON.stringify(value)};`);
-      return root;
-    };
-    const oldRoot = dependency("old dependency");
-    const newRoot = dependency("new dependency");
-    const modules = path.join(plugin.rootDir, "node_modules");
-    fs.mkdirSync(modules);
-    const link = path.join(modules, "optional");
-    fs.symlinkSync(oldRoot, link, "junction");
-    fs.writeFileSync(
-      path.join(plugin.rootDir, "package.json"),
-      '{"type":"module","optionalDependencies":{"optional":"1.0.0"}}',
-    );
-    fs.writeFileSync(
-      plugin.source,
-      `
-    import { createRequire } from "node:module";
-    const require = createRequire(import.meta.url);
-    export const stateMigrations = [{
-      id: "repair", label: "repair", detectLegacyState() { return { preview: [] }; },
-      migrateLegacyState() {
-        let value;
-        try { value = require("optional"); } catch { value = "missing dependency"; }
-        return { changes: [value], warnings: [] };
-      }
-    }];
-  `,
-    );
-    await withPluginGenerationSourceCustody(async () => {
-      await using firstCache = createPluginCache();
-      const first = withPluginCache(firstCache, plugin.load);
-      fs.unlinkSync(link);
-      if (change === "retargeted") {
-        fs.symlinkSync(newRoot, link, "junction");
-      }
-      await using secondCache = createPluginCache();
-      const second = withPluginCache(secondCache, plugin.load);
-      expect((await first.migrateLegacyState(plugin.input)).changes).toEqual(["old dependency"]);
-      expect((await second.migrateLegacyState(plugin.input)).changes).toEqual([
-        change === "retargeted" ? "new dependency" : "missing dependency",
-      ]);
     });
   },
 );

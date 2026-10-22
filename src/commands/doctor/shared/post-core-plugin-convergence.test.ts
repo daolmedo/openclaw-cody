@@ -48,7 +48,7 @@ import type { PluginInstallRecord } from "../../../config/types.plugins.js";
 import { resolvePluginNpmGenerationProjectDir } from "../../../plugins/install-paths.js";
 import {
   loadInstalledPluginIndexInstallRecords,
-  readPersistedInstalledPluginIndexInstallRecords,
+  readPersistedInstalledPluginIndexInstallRecordsAsync,
 } from "../../../plugins/installed-plugin-index-records.js";
 import { seedInstalledPluginIndex } from "../../../plugins/test-helpers/installed-plugin-index.js";
 import { VERSION } from "../../../version.js";
@@ -201,6 +201,7 @@ describe("runPostCorePluginConvergence", () => {
     });
     expect(mocks.repairMissingConfiguredPluginInstalls).toHaveBeenCalledWith({
       cfg,
+      repairVersionDrift: false,
       env: {
         OPENCLAW_COMPATIBILITY_HOST_VERSION: VERSION,
         OPENCLAW_UPDATE_POST_CORE_CONVERGENCE: "1",
@@ -219,6 +220,7 @@ describe("runPostCorePluginConvergence", () => {
     });
     expect(mocks.repairMissingConfiguredPluginInstalls).toHaveBeenCalledWith({
       cfg,
+      repairVersionDrift: false,
       env: {
         OPENCLAW_COMPATIBILITY_HOST_VERSION: "2026.7.2-beta.7",
         OPENCLAW_UPDATE_POST_CORE_CONVERGENCE: "1",
@@ -388,6 +390,7 @@ describe("runPostCorePluginConvergence", () => {
 
     expect(mocks.repairMissingConfiguredPluginInstalls).toHaveBeenCalledWith({
       cfg,
+      repairVersionDrift: false,
       env: {
         OPENCLAW_BUNDLED_PLUGINS_DIR: bundledRoot,
         OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR: "1",
@@ -878,7 +881,7 @@ describe("runPostCorePluginConvergence", () => {
     expect(installAttempts).toBe(0);
     expect(projectsAfterFirst).toHaveLength(1);
     expect(fs.readdirSync(path.join(stateDir, "npm", "projects"))).toEqual(projectsAfterFirst);
-    expect(readPersistedInstalledPluginIndexInstallRecords({ env })).not.toHaveProperty(
+    expect(await readPersistedInstalledPluginIndexInstallRecordsAsync({ env })).not.toHaveProperty(
       "bundleddemo",
     );
     expect(first.installRecords).not.toHaveProperty("bundleddemo");

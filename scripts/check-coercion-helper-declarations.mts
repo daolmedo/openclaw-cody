@@ -62,6 +62,11 @@ export const CANONICAL_COERCION_HELPER_OWNERS = [
     ],
   },
   {
+    file: "packages/normalization-core/src/session-key-comparison.ts",
+    kind: "function",
+    names: ["normalizeSessionKeyForComparison"],
+  },
+  {
     file: "packages/normalization-core/src/string-normalization.ts",
     kind: "function",
     names: [
@@ -196,6 +201,7 @@ export const CANONICAL_COERCION_HELPER_OWNERS = [
 export const CANONICAL_COERCION_MODULES = [
   "packages/normalization-core/src/agent-id.ts",
   "packages/normalization-core/src/string-coerce.ts",
+  "packages/normalization-core/src/session-key-comparison.ts",
   "packages/normalization-core/src/string-normalization.ts",
   "packages/normalization-core/src/number-coercion.ts",
   "packages/normalization-core/src/record-coerce.ts",
@@ -228,6 +234,12 @@ export const DEFERRED_CANONICAL_COERCION_EXPORTS = [
     file: "scripts/lib/error-format.mts",
     name: "formatErrorMessage",
     reason: "Dependency-light scripts retain a deliberately smaller formatting policy.",
+  },
+  {
+    file: "scripts/lib/error-format.mts",
+    name: "formatErrorMessageWithCauses",
+    reason:
+      "Dependency-light release diagnostics need bounded cause-chain rendering before install.",
   },
 ] as const satisfies readonly { file: string; name: string; reason: string }[];
 

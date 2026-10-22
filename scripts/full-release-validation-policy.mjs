@@ -15,6 +15,7 @@ import { compareAscii, sortJsonValueKeys } from "./lib/canonical-json.mjs";
 import { hasRequiredCrossOsSuites } from "./lib/cross-os-release-checks/suite-filter.mjs";
 import { candidateArtifactJsonFromBinding } from "./lib/full-release-candidate-reuse.mjs";
 import {
+  FULL_RELEASE_CHILD_EVIDENCE_JOB,
   MAX_RELEASE_ARTIFACT_BYTES,
   serializeReleaseArtifact,
 } from "./lib/full-release-evidence.mjs";
@@ -730,15 +731,25 @@ export function composeReleaseAttemptJobs(attempts, expected = {}) {
     const completedNames = new Set(
       attempt.jobs.filter((job) => job?.status === "completed").map((job) => job.name),
     );
+    const runningNames = new Set(
+      ["queued", "in_progress"].includes(expected.effectiveRunStatus) &&
+        expectedAttempt === effectiveRunAttempt &&
+        effectiveRunAttempt > plannedRunAttempt
+        ? attempt.jobs
+            .filter((job) => job?.status === "in_progress" && (job.runner_id || job.runner_name))
+            .map((job) => job.name)
+        : [],
+    );
     for (const rawJob of attempt.jobs) {
       const job = normalizedAttemptJob(rawJob, expectedAttempt);
-      // Skipped jobs and GitHub's runnerless queued rerun copies (beside a completed
-      // sibling in the same attempt) carry no independent evidence. GitHub may
-      // mirror the completed sibling's steps onto these copies, so runner identity is
-      // the stable discriminator. Drop them before identity checks because they collide.
+      // GitHub's runnerless queued copies can outlive the real rerun job. While
+      // the latest rerun is active, retain its running job so collection stays
+      // pending even when the aggregate run status still says queued. Terminal
+      // evidence still requires the completed sibling. Mirrored steps do not
+      // identify a real runner.
       const ghost = job.status === "queued" && !rawJob.runner_id && !rawJob.runner_name;
       const skipped = job.status === "completed" && job.conclusion === "skipped";
-      if (skipped || (ghost && completedNames.has(job.name))) {
+      if (skipped || (ghost && (completedNames.has(job.name) || runningNames.has(job.name)))) {
         continue;
       }
       if (names.has(job.name)) {
@@ -766,6 +777,7 @@ export function composeReleaseChildAttemptEvidence({ attempts, expected, run }) 
   const provenance = validateReleaseChildRunProvenance(run, expected);
   const composite = composeReleaseAttemptJobs(attempts, {
     effectiveRunAttempt: provenance.effectiveRunAttempt,
+    effectiveRunStatus: run.status,
     plannedRunAttempt: expected.plannedRunAttempt,
   });
   return {
@@ -1090,6 +1102,7 @@ function releaseExecutionPlanShape(payload) {
       ...(Object.hasOwn(payload, "publicationAdmissionContract")
         ? ["publicationAdmissionContract", "publicationAdmission"]
         : []),
+      ...(Object.hasOwn(payload, "sealParentRunAttempt") ? ["sealParentRunAttempt"] : []),
     ]),
   ].toSorted((left, right) => (left === right ? 0 : left < right ? -1 : 1));
   const expectedChildKeys = hasAttemptEvidence
@@ -1097,6 +1110,7 @@ function releaseExecutionPlanShape(payload) {
     : HISTORICAL_EXECUTION_PLAN_CHILD_KEYS;
   if (
     (hasAttemptEvidence && ![2, 3].includes(attemptEvidenceVersion)) ||
+    (Object.hasOwn(payload, "sealParentRunAttempt") && !hasAttemptEvidence) ||
     (Object.hasOwn(payload, "knownFlakyJobs") && !hasAttemptEvidence) ||
     (Object.hasOwn(payload, "coveragePolicy") && attemptEvidenceVersion !== 3) ||
     !hasExactKeys(payload, expectedPlanKeys) ||
@@ -1144,6 +1158,9 @@ function executionPlanDigestPayload(plan) {
           ...(plan.childReuse !== undefined ? { childReuse: plan.childReuse } : {}),
           ...(Object.hasOwn(plan, "knownFlakyJobs") ? { knownFlakyJobs: plan.knownFlakyJobs } : {}),
           attemptEvidenceVersion: plan.attemptEvidenceVersion,
+          ...(Object.hasOwn(plan, "sealParentRunAttempt")
+            ? { sealParentRunAttempt: plan.sealParentRunAttempt }
+            : {}),
         }
       : {}),
     blockers: plan.blockers,
@@ -1189,6 +1206,7 @@ export function buildReleaseExecutionPlanArtifact({
   publicationAdmission,
   qualificationCoverage,
   qualificationInputs,
+  sealParentRunAttempt,
   targetVersion,
   telegramWaiver,
   trustedWorkflow,
@@ -1205,6 +1223,17 @@ export function buildReleaseExecutionPlanArtifact({
     : undefined;
   if (attemptAware && ![2, 3].includes(normalizedAttemptEvidenceVersion)) {
     throw new Error("release execution plan attempt evidence version is invalid");
+  }
+  const normalizedParentRunAttempt = positiveInteger(expected.parentRunAttempt);
+  const normalizedSealParentRunAttempt =
+    sealParentRunAttempt === undefined ? undefined : positiveInteger(sealParentRunAttempt);
+  if (
+    normalizedParentRunAttempt === undefined ||
+    (sealParentRunAttempt !== undefined &&
+      (normalizedSealParentRunAttempt === undefined ||
+        normalizedSealParentRunAttempt <= normalizedParentRunAttempt))
+  ) {
+    throw new Error("release execution plan seal attempt is invalid");
   }
   const normalizedReuse = normalizedEvidenceReuse(evidenceReuse);
   if (!validEvidenceReuseIdentity(normalizedReuse)) {
@@ -1259,7 +1288,10 @@ export function buildReleaseExecutionPlanArtifact({
     version: 1,
     kind: "openclaw.full-release-execution-plan",
     parentRunId: String(expected.parentRunId),
-    parentRunAttempt: positiveInteger(expected.parentRunAttempt),
+    parentRunAttempt: normalizedParentRunAttempt,
+    ...(sealParentRunAttempt === undefined
+      ? {}
+      : { sealParentRunAttempt: normalizedSealParentRunAttempt }),
     workflowRef: boundedString(expected.workflowRef, MAX_LABEL_LENGTH),
     workflowSha: boundedString(expected.workflowSha, MAX_LABEL_LENGTH),
     targetSha: boundedString(expected.targetSha, MAX_LABEL_LENGTH),
@@ -1432,6 +1464,9 @@ export function validateReleaseExecutionPlanArtifact(payload, expected = {}) {
     payload.kind !== "openclaw.full-release-execution-plan" ||
     !/^[1-9][0-9]*$/u.test(String(payload.parentRunId ?? "")) ||
     positiveInteger(payload.parentRunAttempt) === undefined ||
+    (Object.hasOwn(payload, "sealParentRunAttempt") &&
+      (positiveInteger(payload.sealParentRunAttempt) === undefined ||
+        Number(payload.sealParentRunAttempt) <= Number(payload.parentRunAttempt))) ||
     !/^[a-f0-9]{40}$/u.test(String(payload.workflowSha ?? "")) ||
     (payload.targetSha !== "" && !/^[a-f0-9]{40}$/u.test(String(payload.targetSha ?? ""))) ||
     (expected.parentRunId !== undefined &&
@@ -1464,6 +1499,9 @@ export function validateReleaseExecutionPlanArtifact(payload, expected = {}) {
   const plan = {
     ...payload,
     parentRunAttempt: positiveInteger(payload.parentRunAttempt),
+    ...(Object.hasOwn(payload, "sealParentRunAttempt")
+      ? { sealParentRunAttempt: positiveInteger(payload.sealParentRunAttempt) }
+      : {}),
     parentRunId: String(payload.parentRunId),
     children,
     blockers: normalizeIssues(payload.blockers, "release_blocker"),
@@ -1535,6 +1573,11 @@ export function planReleaseChildRerun({ childKey, jobs }) {
   if (failed.length === 0) {
     throw new Error(`${childKey} has no blocking failed job to rerun`);
   }
+  // Receipt publication is best-effort at the workflow boundary. A green child
+  // can therefore need only this failed metadata job, never its passing workloads.
+  if (failed.length === 1 && failed[0] === FULL_RELEASE_CHILD_EVIDENCE_JOB) {
+    return { failed, mode: "receipt", producer: FULL_RELEASE_CHILD_EVIDENCE_JOB };
+  }
   // These consumers bind their producer's artifact to the current run attempt, so a
   // failed-jobs rerun that leaves the green producer behind stays red (#161317).
   const producer = "install_smoke_release_checks / installer_smoke_candidate_payload";
@@ -1590,20 +1633,7 @@ function releaseState(cancelled, activeRunIds, blockers, errors) {
   );
 }
 
-export function classifyReleaseSnapshot({
-  cancelled = false,
-  children,
-  extraBlockers = [],
-  extraErrors = [],
-  localFailures = [],
-}) {
-  const selected = children.filter((child) => child.selected);
-  const active = selected.filter(
-    (child) => child.runId && child.runAttempt && child.status !== "completed",
-  );
-  const childErrors = selected.flatMap((child) =>
-    (child.errors ?? []).filter((error) => error.kind !== "dispatch_missing"),
-  );
+function releaseChildBlockers(selected) {
   const childJobBlockers = selected.flatMap((child) =>
     child.jobs.filter(isFailedJob).map((job) => ({
       child: child.key,
@@ -1640,18 +1670,35 @@ export function classifyReleaseSnapshot({
       runId: child.runId,
       url: child.url,
     }));
+  return [...childJobBlockers, ...terminalBlockers];
+}
+
+export function classifyReleaseSnapshot({
+  cancelled = false,
+  children,
+  extraBlockers = [],
+  extraErrors = [],
+  localFailures = [],
+}) {
+  const selected = children.filter((child) => child.selected);
+  const active = selected.filter(
+    (child) => child.runId && child.runAttempt && child.status !== "completed",
+  );
+  const childErrors = selected.flatMap((child) =>
+    (child.errors ?? []).filter((error) => error.kind !== "dispatch_missing"),
+  );
+  const childBlockers = releaseChildBlockers(selected);
   const rawBlockers = [
     ...localFailures,
     ...extraBlockers,
     ...dispatchBlockers(selected),
-    ...childJobBlockers,
-    ...terminalBlockers,
+    ...childBlockers,
   ];
   const blockers = normalizeIssues(rawBlockers, "release_blocker");
   const errors = normalizeIssues([...extraErrors, ...childErrors], "orchestration_error");
 
   const activeRunIds = active.map((child) => String(child.runId)).toSorted();
-  const primary = [...childJobBlockers, ...terminalBlockers]
+  const primary = childBlockers
     .filter((issue) => issue.primaryAt)
     .toSorted((left, right) => String(left.primaryAt).localeCompare(String(right.primaryAt), "en"));
   return {
@@ -2427,26 +2474,53 @@ function verifyStateTransition(decision, drain, executionPlan) {
         "compatible collector evidence for the same execution plan is required",
     );
   }
-  if (
-    decision.state.startsWith("blocked_") &&
-    drain.state === "blocked_complete" &&
-    !decision.blockers.every((blocker) =>
-      drain.blockers.some(
-        (candidate) =>
-          JSON.stringify(candidate) === JSON.stringify(blocker) ||
-          // A verified newer attempt can replace a job URL while retaining the
-          // same blocker. Both URLs must belong to their accepted job evidence.
-          (executionPlan.attemptEvidenceVersion !== undefined &&
-            JSON.stringify({ ...candidate, url: blocker.url }) === JSON.stringify(blocker) &&
-            acceptedJobBlockerAttempt(drain, candidate) >
-              acceptedJobBlockerAttempt(decision, blocker)) ||
-          (blocker.kind === "workflow_failure" &&
-            candidate.kind === "job_failure" &&
-            ["child", "runId"].every((key) => candidate[key] === blocker[key])),
-      ),
-    )
-  ) {
-    throw new Error("diagnostic drain changed or removed a release decision blocker");
+  if (decision.state.startsWith("blocked_") && drain.state === "blocked_complete") {
+    // Display rows are capped and can shift as earlier-sorted jobs finish. The
+    // complete index owns retention; child evidence owns permitted replacements.
+    const transitionBlockers = (state) => [
+      ...state.blockers,
+      ...releaseChildBlockers(
+        Object.entries(state.children).map(([key, child]) =>
+          Object.assign({}, child, { key, jobs: child.timing.jobs }),
+        ),
+      ).map((issue) => normalizeIssue(issue, "release_blocker")),
+    ];
+    const previous = new Map(
+      transitionBlockers(decision).map((blocker) => [blockerIndex([blocker])[0], blocker]),
+    );
+    const current = transitionBlockers(drain);
+    const currentIndex = new Set(drain.blockerIndex);
+    const inconsistentDisplay = [decision, drain].some(
+      (state) =>
+        state.blockerCount !== null &&
+        blockerIndex(state.blockers).some((hash) => !state.blockerIndex.includes(hash)),
+    );
+    if (
+      inconsistentDisplay ||
+      !decision.blockerIndex.every((hash) => {
+        if (currentIndex.has(hash)) {
+          return true;
+        }
+        const blocker = previous.get(hash);
+        return (
+          blocker &&
+          current.some(
+            (candidate) =>
+              // A verified newer attempt can replace a job URL while retaining
+              // the same blocker. Both URLs belong to accepted job evidence.
+              (executionPlan.attemptEvidenceVersion !== undefined &&
+                JSON.stringify({ ...candidate, url: blocker.url }) === JSON.stringify(blocker) &&
+                acceptedJobBlockerAttempt(drain, candidate) >
+                  acceptedJobBlockerAttempt(decision, blocker)) ||
+              (blocker.kind === "workflow_failure" &&
+                candidate.kind === "job_failure" &&
+                ["child", "runId"].every((key) => candidate[key] === blocker[key])),
+          )
+        );
+      })
+    ) {
+      throw new Error("diagnostic drain changed or removed a release decision blocker");
+    }
   }
 }
 

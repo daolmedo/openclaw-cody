@@ -12,7 +12,6 @@ import { getUpdateRun, recordUpdateRunPhase } from "../../infra/update-run-ledge
 import { assertUpdateRecoveryAdmission } from "../../infra/update-run-recovery-admission.js";
 import { UpdateRecoveryRequiredError } from "../../infra/update-run-recovery.js";
 import { isUpdateGatewayReadinessPending } from "../../infra/update-run-step.js";
-import { DEFAULT_UPDATE_STEP_TIMEOUT_MS } from "../../infra/update-run-timeouts.js";
 import { readCurrentGitUpdateRecovery } from "../../infra/update-runner-git-recovery.js";
 import type { UpdateRunResult } from "../../infra/update-runner-types.js";
 import type { UpdateStepResult } from "../../infra/update-step-result.js";
@@ -297,8 +296,6 @@ async function settleUpdateCommandTerminalResult<T>(
         formatErrorMessage(failure),
         {
           cause: failure,
-          automaticTriage:
-            failure instanceof UpdateCommandFailure ? failure.automaticTriage : undefined,
         },
       );
     }
@@ -436,10 +433,7 @@ export async function resolveSettledUpdateCommandResult(
           }
         }
       },
-      // This branch has no whole-run deadline; bound contention waits by the update step budget.
-      parseUpdateTimeoutMs(params.opts.timeout) ??
-        params.opts.run?.defaultStepTimeoutMs ??
-        DEFAULT_UPDATE_STEP_TIMEOUT_MS,
+      params.opts.run?.deadline?.remainingMs() ?? params.opts.run?.defaultStepTimeoutMs ?? 0,
     );
   } catch (cause) {
     throw new UpdateCommandPendingRecoveryFailure(result, formatErrorMessage(cause), { cause });

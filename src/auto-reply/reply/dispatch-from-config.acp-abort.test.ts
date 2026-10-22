@@ -30,7 +30,7 @@ import {
   sessionStoreMocks,
   setDiscordTestRegistry,
 } from "./dispatch-from-config.shared.test-harness.js";
-import { createAcpRuntime } from "./dispatch-from-config.test-harness.js";
+import { createAcpRuntime } from "./dispatch-from-config.test-support.js";
 import { expectedNoQueuedReplyResult } from "./dispatch-result-expectations.test-support.js";
 import {
   REPLY_OPERATION_RUN_STATE,
@@ -216,12 +216,9 @@ describe("dispatchReplyFromConfig ACP abort", () => {
     sessionStoreMocks.loadSessionStoreEntry.mockImplementation(
       () => sessionStoreMocks.currentEntry,
     );
-    sessionStoreMocks.loadSessionStore.mockReset().mockReturnValue({});
-    sessionStoreMocks.readSessionEntry.mockReset().mockReturnValue(undefined);
     sessionStoreMocks.resolveSessionStorePathCore
       .mockReset()
       .mockReturnValue("/tmp/mock-sessions.json");
-    sessionStoreMocks.resolveSessionStoreEntry.mockReset().mockReturnValue({ existing: undefined });
     acpMocks.listAcpSessionEntries.mockReset().mockResolvedValue([]);
     acpMocks.readAcpSessionEntry.mockReset().mockReturnValue(null);
     acpMocks.upsertAcpSessionMeta.mockReset().mockResolvedValue(null);

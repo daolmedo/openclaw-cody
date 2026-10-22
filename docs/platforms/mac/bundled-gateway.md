@@ -71,7 +71,7 @@ retain their existing startup policies.
 
 When the native app creates identity, device-auth, or approval tables before
 the worker starts, node startup completes that recognized version-zero database
-through the canonical initializer before plugins read their state. Existing
+through the shared initializer before plugins read their state. Existing
 native rows are preserved. This does not migrate an already-versioned shared
 Gateway database or adopt unknown or occupied bootstrap state.
 
@@ -81,13 +81,19 @@ On a fresh Mac, choose **This Mac** during onboarding. **Getting things ready**
 prepares the included runtime, starts the Gateway, and verifies that it is
 ready. This setup needs no runtime download, Node installation, Terminal,
 Homebrew, or administrator access. Connecting an AI provider can still require
-internet access.
+internet access. The first-run handoff keeps waiting while the app retries
+Gateway startup, then opens automatic setup once the Gateway is ready. A terminal
+failure or cancellation leaves onboarding unfinished.
 
 The app creates `<state>/bin/openclaw`, a small shell wrapper that runs the
-current bundled CLI with Bun and the included SQLite library. It also links
-`openclaw-mac` beside it and adds that bin directory to the usual shell profile
-files. An existing operator-created `openclaw` file is preserved; only the
-app's own wrapper or a recognized `install-cli.sh` wrapper is replaced.
+current bundled CLI with Bun and the included SQLite library. When the app runs
+from a persistent location, it also links `openclaw-mac` beside it, and the
+default profile adds that bin directory to the usual shell profile files. Named
+profiles, and copies running from Downloads, the Desktop, a disk image, or a
+temporary directory such as `/tmp`, leave shell profiles unchanged; run their
+wrapper by its full path, such as `~/.openclaw-<profile>/bin/openclaw`. An
+existing operator-created `openclaw` file is preserved; only the app's own
+wrapper or a recognized `install-cli.sh` wrapper is replaced.
 
 Unbundled DEBUG builds retain the developer installer and channel chooser.
 That installer uses a private temporary directory for downloads and build tools,
@@ -102,12 +108,14 @@ is no longer available on reattachment, local setup becomes available again.
 An unreadable service ownership record blocks automatic installation instead
 of being treated as a missing service; check the LaunchAgent and retry.
 
-Chrome-extension preparation also runs automatically for the default app
-profile, including remote-only and attach-only Macs. It uses the validated
-private runtime, registers the native helper before requesting the Store
-extension, and leaves Chrome’s permission approval to you. Browser setup does not
-run Gateway-wide Doctor or migrate Gateway state. The Dashboard’s **Set up Chrome
-on this device** action retries the same serialized operation. See
+Choose **Settings → This Mac → Set up Chrome on this device** in the Dashboard to
+prepare the Chrome extension, including on remote-only and attach-only Macs.
+Startup does not inspect or change Chrome data. After you start setup, the default
+app profile maintains registration on CLI updates during that app session.
+Setup uses the validated private runtime, registers the native helper before
+requesting the Store extension, and leaves Chrome’s permission approval to you.
+It does not run Gateway-wide Doctor or migrate Gateway state. The same action
+retries setup when needed. See
 [Chrome extension](/tools/chrome-extension).
 
 ## Manual recovery
@@ -335,6 +343,12 @@ updated and verified through its own captured CLI. The app-owned local companion
 Gateway is then updated separately; the update receipt stays pending until both
 required runtimes are healthy. The bundled private worker is not a Node LaunchAgent,
 and absent node services or named profiles do not trigger legacy node lifecycle work.
+
+To install a local rebuild over a release app, package it with the release
+identity. A default debug package keeps separate permissions, default-profile
+preferences, and saved Gateway profiles, and raises login-keychain prompts for
+the release app's Keychain items. See
+[Replace an installed release app](/platforms/mac/dev-setup#replace-an-installed-release-app).
 
 ### Existing app-managed Node services
 

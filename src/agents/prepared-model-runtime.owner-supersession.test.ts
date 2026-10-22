@@ -4,19 +4,35 @@ import {
   getPreparedModelRuntimeTestApi,
   usePreparedModelRuntimeHarness,
 } from "./prepared-model-runtime.test-harness.js";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { isDeepStrictEqual } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import { createDeferred, withinTest } from "../../test/helpers/promise.js";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../config/runtime-snapshot.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { GatewayReloadHandlerParams } from "../gateway/server-reload-contracts.js";
+import {
+  createDefaultGatewayReloadState,
+  createHotTailPlan,
+} from "../gateway/server-reload-handlers.config.test-support.js";
+import { createGatewayReloadHandlers } from "../gateway/server-reload-hot.js";
 import { publishConfiguredModelRuntimeSnapshots } from "../gateway/server-startup-model-runtime.js";
+import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
+import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import { retireAgentDeleteRuntime } from "./agent-delete-databases.js";
 import { withAgentDeletion } from "./agent-lifecycle-registry.js";
+import * as pluginModelCatalog from "./plugin-model-catalog.js";
+import * as configuredRefresh from "./prepared-model-runtime.configured-refresh.js";
 import { PreparedModelRuntimePublicationSupersededError } from "./prepared-model-runtime.errors.js";
 import {
   getPreparedModelRuntimeSnapshot,
   loadPublishedGatewayReplyDispatchRuntime,
   markPreparedModelRuntimeSnapshotsStale,
+  prepareModelRuntimeSnapshot,
   publishPreparedModelRuntimeSnapshot,
   refreshPreparedModelRuntimeSnapshots,
   retirePreparedModelRuntimeAgent,
@@ -39,6 +55,162 @@ function holdNextCatalogWrite() {
 }
 
 describe("prepared model runtime owner selection", () => {
+  it.for(["success", "preserved admission", "failure before retired cleanup"] as const)(
+    "follows an admitted hot reload through catalog pruning: %s",
+    async (outcome, { signal }) => {
+      const fails = outcome === "failure before retired cleanup";
+      mocks.configuredAgentIds = ["default", "deferred"];
+      const initial: OpenClawConfig = {
+        agents: { entries: { default: {}, deferred: {} } },
+        models: {
+          providers: { fixture: { baseUrl: "https://provider.example.test/v1", models: [] } },
+        },
+        messages: { responsePrefix: "initial" },
+      };
+      const latest: OpenClawConfig = {
+        agents: initial.agents,
+        messages: { responsePrefix: "latest" },
+      };
+      setRuntimeConfigSnapshot(initial);
+      const started = createDeferred();
+      const pruning = createDeferred();
+      const releasePruning = createDeferred();
+      const retiredCleanup = createDeferred();
+      const releaseAcquisition = createDeferred();
+      const producerClosed = createDeferred();
+      const pruningError = new Error("replacement catalog pruning failed");
+      const refreshNow = configuredRefresh.refreshPreparedModelRuntimeSnapshotsNow;
+      // Cancellation precedes producer cleanup; observe the real terminal boundary.
+      const refreshObservation = vi
+        .spyOn(configuredRefresh, "refreshPreparedModelRuntimeSnapshotsNow")
+        .mockImplementation(async (...args) => {
+          try {
+            return await refreshNow(...args);
+          } finally {
+            if (args[0] === initial) {
+              producerClosed.resolve();
+            }
+          }
+        });
+      const prune = vi
+        .spyOn(pluginModelCatalog, "pruneRemovedProviderPluginModelCatalogs")
+        .mockImplementation(async () => {
+          pruning.resolve();
+          await releasePruning.promise;
+          if (fails) {
+            throw pruningError;
+          }
+          return false;
+        });
+      mocks.prepareStaticCatalog.mockImplementation(async (input) => {
+        const options = input as { config: OpenClawConfig; signal: AbortSignal };
+        if (options.config.messages?.responsePrefix === "initial") {
+          const aborted = createDeferred();
+          const onAbort = () => aborted.resolve();
+          options.signal.addEventListener("abort", onAbort, { once: true });
+          started.resolve();
+          try {
+            await Promise.race([aborted.promise, releaseAcquisition.promise]);
+            if (fails) {
+              await retiredCleanup.promise;
+            }
+            options.signal.throwIfAborted();
+          } finally {
+            options.signal.removeEventListener("abort", onAbort);
+          }
+        }
+        return { entries: [] };
+      });
+      let state: ReturnType<GatewayReloadHandlerParams["getState"]> =
+        createDefaultGatewayReloadState();
+      const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+      const handlers = createGatewayReloadHandlers({
+        scheduler: createTestGatewayScheduler(),
+        deps: {} as GatewayReloadHandlerParams["deps"],
+        broadcast: vi.fn(),
+        getState: () => state,
+        setState: (next) => {
+          state = next;
+        },
+        getPluginRegistry: () => createEmptyPluginRegistry(),
+        startChannel: vi.fn(async () => new Map()),
+        stopChannel: vi.fn(async () => {}),
+        releaseChannelRouteHandoffs: vi.fn(),
+        pruneInactiveChannelAccountState: vi.fn(),
+        reloadPlugins: vi.fn(),
+        logHooks: log,
+        logChannels: log,
+        logCron: log,
+        logReload: log,
+        cronReconciliation: {
+          arm: vi.fn(() => ({ complete: vi.fn(async () => {}) })),
+          invalidate: vi.fn(),
+        },
+        requestRecoveryRestart: vi.fn(() => ({ status: "emitted" as const })),
+      });
+      const startup = publishConfiguredModelRuntimeSnapshots({ cfg: initial });
+      let settled = false;
+      const observed = startup.then(
+        () => {
+          settled = true;
+          return undefined;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        },
+      );
+      let reload: Promise<unknown> | undefined;
+      let reader: ReturnType<typeof loadPublishedGatewayReplyDispatchRuntime> | undefined;
+      try {
+        await withinTest(started.promise, signal);
+        reload = handlers
+          .applyHotReload(createHotTailPlan({ changedPaths: ["models.providers.fixture"] }), latest)
+          .catch((error: unknown) => error);
+        await withinTest(pruning.promise, signal);
+        if (!fails) {
+          await withinTest(producerClosed.promise, signal);
+          await withinTest(nextTurn(), signal);
+        }
+        if (outcome === "preserved admission") {
+          markPreparedModelRuntimeSnapshotsStale("replacement still preparing", {
+            preserveReplacementWait: true,
+          });
+        }
+        expect(settled).toBe(false);
+        releasePruning.resolve();
+        if (fails) {
+          expect(await withinTest(reload, signal)).toBe("applied-restart-required");
+          retiredCleanup.resolve();
+        }
+        const result = await withinTest(observed, signal);
+        if (!fails) {
+          expect(result).toBeUndefined();
+          for (const agentId of mocks.configuredAgentIds) {
+            reader = loadPublishedGatewayReplyDispatchRuntime({ agentId });
+            await expect(withinTest(reader, signal)).resolves.toMatchObject({
+              agentId,
+              config: latest,
+            });
+          }
+          expect(await withinTest(reload, signal)).toBe("applied");
+        } else {
+          expect(result).toBe(pruningError);
+        }
+      } finally {
+        releasePruning.resolve();
+        releaseAcquisition.resolve();
+        retiredCleanup.resolve();
+        await Promise.allSettled([startup, observed, reload, reader]);
+        handlers.stopRestartRetries();
+        await closePreparedModelRuntimeSnapshots();
+        prune.mockRestore();
+        refreshObservation.mockRestore();
+        clearRuntimeConfigSnapshot();
+      }
+    },
+  );
+
   it.for(["success", "failure", "shutdown", "foreground grace"] as const)(
     "follows active startup acquisition through a scoped replacement's %s",
     async (outcome, { signal }) => {
@@ -173,17 +345,17 @@ describe("prepared model runtime owner selection", () => {
           "UPDATE agent_deletion_journal SET operation_id = ? WHERE agent_id = ?",
         );
         replaceJournal.run("replacement", input.agentId);
-        await expect(
-          retireAgentDeleteRuntime(input.config, deletion, [input.agentDir]),
-        ).rejects.toThrow("no longer owns");
+        await expect(retireAgentDeleteRuntime(deletion, [input.agentDir])).rejects.toThrow(
+          "no longer owns",
+        );
         expect(deleted.isCurrent()).toBe(true);
         expect(sharing.isCurrent()).toBe(true);
 
         replaceJournal.run(deletion.entry.operationId, input.agentId);
         await deletion.rollback();
-        await expect(
-          retireAgentDeleteRuntime(input.config, deletion, [input.agentDir]),
-        ).rejects.toThrow("no longer owns");
+        await expect(retireAgentDeleteRuntime(deletion, [input.agentDir])).rejects.toThrow(
+          "no longer owns",
+        );
         expect(deleted.isCurrent()).toBe(true);
         expect(sharing.isCurrent()).toBe(true);
       },
@@ -270,6 +442,73 @@ describe("prepared model runtime owner selection", () => {
     } finally {
       release.resolve();
       await Promise.allSettled([first, skipped, latest]);
+    }
+  });
+
+  it("follows a config replacement while waiting for an auth publication", async () => {
+    mocks.configuredAgentIds = ["default"];
+    const config = {};
+    const nextConfig = { messages: { responsePrefix: "updated" } };
+    await refreshPreparedModelRuntimeSnapshots(config, { gatewayLifecycle: true });
+    const input = fixture.agentInput("default", config);
+    const { started, release } = holdNextCatalogWrite();
+    let reader: ReturnType<typeof prepareModelRuntimeSnapshot> | undefined;
+    let replacement: ReturnType<typeof refreshPreparedModelRuntimeSnapshots> | undefined;
+    try {
+      mocks.mutationListener?.({ agentDir: input.agentDir, affectsInheritedStores: false });
+      await started.promise;
+      reader = prepareModelRuntimeSnapshot(input);
+      const result = expect(reader).resolves.toMatchObject({ config: nextConfig });
+      replacement = refreshPreparedModelRuntimeSnapshots(nextConfig, { gatewayLifecycle: true });
+      release.resolve();
+
+      await result;
+      await replacement;
+      expect((await reader).isCurrent()).toBe(true);
+    } finally {
+      release.resolve();
+      await Promise.allSettled([reader, replacement]);
+    }
+  });
+
+  it("finishes config replacement after a second adopted auth mutation", async () => {
+    mocks.configuredAgentIds = ["default"];
+    const config = {};
+    const nextConfig = { messages: { responsePrefix: "updated" } };
+    await refreshPreparedModelRuntimeSnapshots(config, { gatewayLifecycle: true });
+    const input = fixture.agentInput("default", config);
+    const configWrite = holdNextCatalogWrite();
+    const authWrite = holdNextCatalogWrite();
+    const replacement = refreshPreparedModelRuntimeSnapshots(nextConfig, {
+      gatewayLifecycle: true,
+    });
+    const result = expect(replacement).resolves.toBeUndefined();
+    void result.catch(() => undefined);
+    let reader: ReturnType<typeof prepareModelRuntimeSnapshot> | undefined;
+    try {
+      await configWrite.started.promise;
+      mocks.authStorage.getAll.mockReturnValue({
+        custom: { type: "api_key", key: "first-update" },
+      });
+      mocks.mutationListener?.({ agentDir: input.agentDir, affectsInheritedStores: false });
+      configWrite.release.resolve();
+      await authWrite.started.promise;
+      reader = prepareModelRuntimeSnapshot(input);
+      void reader.catch(() => undefined);
+      const credentials = { custom: { type: "api_key" as const, key: "latest-update" } };
+      mocks.authStorage.getAll.mockReturnValue(credentials);
+      mocks.mutationListener?.({ agentDir: input.agentDir, affectsInheritedStores: false });
+      authWrite.release.resolve();
+
+      await result;
+      await expect(reader).resolves.toMatchObject({ config: nextConfig });
+      const snapshot = await reader;
+      expect(snapshot.isCurrent()).toBe(true);
+      expect(snapshot.createStores().authStorage.getAll()).toEqual(credentials);
+    } finally {
+      configWrite.release.resolve();
+      authWrite.release.resolve();
+      await Promise.allSettled([reader, replacement]);
     }
   });
 

@@ -118,17 +118,16 @@ export function filterPreparedProviderCatalog(
   catalog: ModelCatalogSnapshot,
   includesProvider: (provider: string) => boolean,
 ): ModelCatalogSnapshot {
+  const includes = (entry: { provider: string }) => includesProvider(entry.provider);
   return {
     ...catalog,
-    entries: catalog.entries.filter((entry) => includesProvider(entry.provider)),
-    routeVariants: catalog.routeVariants.filter((entry) => includesProvider(entry.provider)),
-    staticEntries: catalog.staticEntries?.filter((entry) => includesProvider(entry.provider)),
+    entries: catalog.entries.filter(includes),
+    routeVariants: catalog.routeVariants.filter(includes),
+    staticEntries: catalog.staticEntries?.filter(includes),
     acceptedDiscoveryOrigins: catalog.acceptedDiscoveryOrigins?.filter(({ provider }) =>
       includesProvider(provider),
     ),
-    providerOutcomes: catalog.providerOutcomes?.filter((outcome) =>
-      includesProvider(outcome.provider),
-    ),
+    providerOutcomes: catalog.providerOutcomes?.filter(includes),
     nativeProviderOutcomes: filterNativeModelCatalogScopes(
       catalog.nativeProviderOutcomes,
       includesProvider,
@@ -227,11 +226,7 @@ export function prepareModelCatalogPublication(
   const acceptedRows = new Map<string, Set<string>>();
   for (const [owner, keys] of hookRows) {
     const provider = normalizeProvider(owner);
-    const accepted = acceptedRows.get(provider) ?? new Set<string>();
-    for (const key of keys) {
-      accepted.add(key);
-    }
-    acceptedRows.set(provider, accepted);
+    acceptedRows.set(provider, new Set([...(acceptedRows.get(provider) ?? []), ...keys]));
   }
   const outcomeProviders = new Set(
     catalog.providerOutcomes?.map((outcome) => normalizeProvider(outcome.provider)),
@@ -344,8 +339,22 @@ export function prepareModelCatalogPublication(
     ).toSorted(compareModelCatalogEntries);
   // Route dedupe follows another round of normalization callbacks; acquire its policy afresh.
   const routeKeyOf = createModelCatalogIdentityKeyResolver();
+  const providerOutcomes: NonNullable<ModelCatalogSnapshot["providerOutcomes"]>[number][] = [];
+  for (const outcome of catalog.providerOutcomes ?? []) {
+    const accepted = previous?.providerOutcomes?.find(
+      (candidate) => candidate.provider === outcome.provider,
+    );
+    providerOutcomes.push(
+      outcome.status !== "ready" &&
+        retainedProviders.has(normalizeProvider(outcome.provider)) &&
+        accepted?.listedModelIds !== undefined
+        ? { ...outcome, listedModelIds: accepted.listedModelIds }
+        : outcome,
+    );
+  }
   const published: ModelCatalogSnapshot = {
     ...catalog,
+    providerOutcomes,
     entries: retain(catalog.entries, previous?.entries ?? []),
     routeVariants: retain(catalog.routeVariants, previous?.routeVariants ?? [], (entry) =>
       JSON.stringify([routeKeyOf(entry), entry.api, entry.baseUrl, entry.nativeRuntime]),

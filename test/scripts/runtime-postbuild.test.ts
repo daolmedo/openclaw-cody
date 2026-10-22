@@ -194,6 +194,7 @@ describe("runtime postbuild static assets", () => {
       "dist/extensions/onepassword/onepassword-secret-ref-resolver.js",
       "dist/extensions/vault/vault-secret-id.js",
       "dist/extensions/vault/vault-secret-ref-resolver.js",
+      "dist/extensions/workboard/src/workboard-schema.postgres.sql",
     ]);
     expect(payload.sources).not.toContain(
       "extensions/diffs-language-pack/assets/viewer-runtime.js",
@@ -1401,112 +1402,29 @@ describe("previous release update compatibility", () => {
     ]);
   });
 
-  it.each(["source scripts", "different owner", "mutable binding", "dist path", "unknown script"])(
-    "distinguishes source completion contracts from unknown dynamic imports (%s)",
-    (variant) => {
-      const declaration = variant === "mutable binding" ? "let" : "const";
-      const directory = variant === "dist path" ? "dist" : "scripts";
-      const script =
-        variant === "unknown script" ? "unknown.mts" : "stage-bundled-plugin-runtime.mts";
-      const expression = `await (async () => {
-        ${declaration} stagingFile = path.join(root, "${directory}", "${script}");
-        await import(pathToFileURL(stagingFile).href);
-        await import(pathToFileURL(path.join(root, "scripts", "lib", "dist-artifact-ownership.mts")).href);
+  it("records literal dist imports alongside computed package assets", () => {
+    const { inventory } = recordImportedFixture(
+      `await (async () => {
+        await import(pathToFileURL(path.join(root, "node-runtime-recovery.mjs")).href);
+        await import(pathToFileURL(path.join(root, "scripts", "stage-bundled-plugin-runtime.mts")).href);
         return (await import("./surface-abcdefgh.js")).x;
-      })()`;
-      const record = () =>
-        recordImportedFixture(
-          expression,
+      })()`,
+      { "surface-abcdefgh.js": "//#region src/infra/value.ts\nexport const x = 1;\n" },
+    );
+    expect(inventory.releases[0]?.chunks).toEqual([
+      {
+        path: "surface-abcdefgh.js",
+        imports: [
           {
-            "surface-abcdefgh.js": "//#region src/infra/value.ts\nexport const x = 1;\n",
+            importer: "command.js",
+            owner: "src/cli/update-cli/update-command-service-command.ts",
+            exports: ["x"],
           },
-          undefined,
-          variant === "different owner"
-            ? undefined
-            : "src/cli/update-cli/update-command-runtime.ts",
-        );
-      if (variant !== "source scripts") {
-        expect(record).toThrow("Nonliteral post-swap import");
-        return;
-      }
-      expect(record().inventory.releases[0]?.chunks.map((chunk) => chunk.path)).toEqual([
-        "surface-abcdefgh.js",
-      ]);
-    },
-  );
-
-  it.each([
-    { name: "published bootstrap" },
-    { name: "different owner", owner: "src/cli/update-cli/update-command-runtime.ts" },
-    {
-      name: "mutable root",
-      binding: "let driverRoot = resolveOpenClawPackageRootSync({ moduleUrl: import.meta.url });",
-    },
-    { name: "unknown root", binding: "" },
-    { name: "target root", binding: "const driverRoot = root;" },
-    {
-      name: "cwd root",
-      binding: "const driverRoot = resolveOpenClawPackageRootSync({ cwd: process.cwd() });",
-    },
-    {
-      name: "different module",
-      binding: "const driverRoot = resolveOpenClawPackageRootSync({ moduleUrl: targetUrl });",
-    },
-    {
-      name: "extra root options",
-      binding:
-        "const driverRoot = resolveOpenClawPackageRootSync({ moduleUrl: import.meta.url, cwd: root });",
-    },
-    { name: "extra path", target: 'path.join(driverRoot, "node-runtime-recovery.mjs", "extra")' },
-    { name: "dist path", target: 'path.join(driverRoot, "dist", "node-runtime-recovery.mjs")' },
-    { name: "traversal", target: 'path.join(driverRoot, "../node-runtime-recovery.mjs")' },
-    { name: "dynamic path", target: "path.join(driverRoot, entry)" },
-    {
-      name: "different URL form",
-      url: 'new URL("node-runtime-recovery.mjs", import.meta.url).href',
-    },
-    { name: "import options", suffix: ", { with: options }" },
-    { name: "for-of shadow", prefix: "for (const driverRoot of roots) ", declaration: "" },
-    {
-      name: "for initializer shadow",
-      prefix: "for (const driverRoot = root; driverRoot;) ",
-      declaration: "",
-    },
-    { name: "arrow shadow", prefix: "const load = async (driverRoot) => ", declaration: "" },
-  ])(
-    "records dist edges while qualifying the package bootstrap ($name)",
-    ({
-      name,
-      owner = "src/cli/update-cli/update-command-node-runtime-resolution.ts",
-      binding = "const driverRoot = resolveOpenClawPackageRootSync({ moduleUrl: import.meta.url });",
-      target = 'path.join(driverRoot, "node-runtime-recovery.mjs")',
-      url = `pathToFileURL(${target}).href`,
-      suffix = "",
-      prefix = "",
-      declaration = "const { findUsableNodeRuntime } = ",
-    }) => {
-      const expression = `await (async () => {
-        ${binding}
-        if (!driverRoot) return;
-        ${prefix}${declaration}await import(${url}${suffix});
-        return (await import("./surface-abcdefgh.js")).x;
-      })()`;
-      const record = () =>
-        recordImportedFixture(
-          expression,
-          { "surface-abcdefgh.js": "//#region src/infra/value.ts\nexport const x = 1;\n" },
-          undefined,
-          owner,
-        );
-      if (name !== "published bootstrap") {
-        expect(record).toThrow("Nonliteral post-swap import");
-        return;
-      }
-      expect(record().inventory.releases[0]?.chunks.map((chunk) => chunk.path)).toEqual([
-        "surface-abcdefgh.js",
-      ]);
-    },
-  );
+        ],
+        exports: [{ exported: "x", origin: { module: "src/infra/value.ts", symbol: "x" } }],
+      },
+    ]);
+  });
 
   it.each(
     previousReleaseInventory.releases
@@ -1580,6 +1498,147 @@ describe("previous release update compatibility", () => {
       expect(bridge.markPluginRegistryRetired()).toBe("current");
     },
   );
+
+  it.each([
+    {
+      access: "exact Promise.all destructuring",
+      statement:
+        'const [{ x: selected }, { y }] = await Promise.all([import("./left-abcdefgh.js"), import("./right-abcdefgh.js")]);',
+      names: [["x"], ["y"]],
+    },
+    {
+      access: "namespace binding",
+      statement:
+        'const [left, { y }] = await Promise.all([import("./left-abcdefgh.js"), import("./right-abcdefgh.js")]);',
+      names: [
+        ["x", "y"],
+        ["x", "y"],
+      ],
+    },
+    {
+      access: "object rest binding",
+      statement:
+        'const [{ x, ...rest }, { y }] = await Promise.all([import("./left-abcdefgh.js"), import("./right-abcdefgh.js")]);',
+      names: [
+        ["x", "y"],
+        ["x", "y"],
+      ],
+    },
+    {
+      access: "array rest binding",
+      statement:
+        'const [{ x }, ...rest] = await Promise.all([import("./left-abcdefgh.js"), import("./right-abcdefgh.js")]);',
+      names: [
+        ["x", "y"],
+        ["x", "y"],
+      ],
+    },
+    {
+      access: "default binding",
+      statement:
+        'const [{ x = 0 }, { y }] = await Promise.all([import("./left-abcdefgh.js"), import("./right-abcdefgh.js")]);',
+      names: [
+        ["x", "y"],
+        ["x", "y"],
+      ],
+    },
+    {
+      access: "intermediate array",
+      statement:
+        'const modules = await Promise.all([import("./left-abcdefgh.js"), import("./right-abcdefgh.js")]); const [{ x }, { y }] = modules;',
+      names: [
+        ["x", "y"],
+        ["x", "y"],
+      ],
+    },
+    {
+      access: "empty object binding",
+      statement:
+        'const [{}, { y }] = await Promise.all([import("./left-abcdefgh.js"), import("./right-abcdefgh.js")]);',
+      names: [
+        ["x", "y"],
+        ["x", "y"],
+      ],
+    },
+    {
+      access: "nested binding",
+      statement:
+        'const [{ x: { value } }, { y }] = await Promise.all([import("./left-abcdefgh.js"), import("./right-abcdefgh.js")]);',
+      names: [
+        ["x", "y"],
+        ["x", "y"],
+      ],
+    },
+    {
+      access: "omitted array binding",
+      statement:
+        'const [, { y }] = await Promise.all([import("./left-abcdefgh.js"), import("./right-abcdefgh.js")]);',
+      names: [
+        ["x", "y"],
+        ["x", "y"],
+      ],
+    },
+    {
+      access: "optional call",
+      statement:
+        'const [{ x }, { y }] = await Promise.all?.([import("./left-abcdefgh.js"), import("./right-abcdefgh.js")]);',
+      names: [
+        ["x", "y"],
+        ["x", "y"],
+      ],
+    },
+    {
+      access: "spread import array",
+      statement:
+        'const [{ x }, { y }] = await Promise.all([...[], import("./left-abcdefgh.js"), import("./right-abcdefgh.js")]);',
+      names: [
+        ["x", "y"],
+        ["x", "y"],
+      ],
+    },
+    {
+      access: "unawaited Promise.all",
+      statement:
+        'const modules = Promise.all([import("./left-abcdefgh.js"), import("./right-abcdefgh.js")]);',
+      names: [
+        ["x", "y"],
+        ["x", "y"],
+      ],
+    },
+    {
+      access: "different combiner",
+      statement:
+        'const [{ x }, { y }] = await Promise.race([import("./left-abcdefgh.js"), import("./right-abcdefgh.js")]);',
+      names: [
+        ["x", "y"],
+        ["x", "y"],
+      ],
+    },
+    {
+      access: "mixed array",
+      statement:
+        'const [{ x }, { y }] = await Promise.all([import("./left-abcdefgh.js"), import("./right-abcdefgh.js"), 1]);',
+      names: [
+        ["x", "y"],
+        ["x", "y"],
+      ],
+    },
+  ])("records conservative module contracts for $access", ({ statement, names }) => {
+    const { inventory } = recordImportedFixture(`await (async () => { ${statement} })()`, {
+      "left-abcdefgh.js": "//#region src/infra/left.ts\nexport const x = 1, y = 2;\n",
+      "right-abcdefgh.js": "//#region src/infra/right.ts\nexport const x = 3, y = 4;\n",
+    });
+    expect(
+      inventory.releases[0]?.chunks.map((chunk) => ({
+        path: chunk.path,
+        imported: chunk.imports.flatMap((entry) => entry.exports),
+        exported: chunk.exports.map((entry) => entry.exported),
+      })),
+    ).toEqual([
+      { path: "left-abcdefgh.js", imported: names[0], exported: names[0] },
+      { path: "right-abcdefgh.js", imported: names[1], exported: names[1] },
+    ]);
+  });
 
   it.each([
     {
@@ -1898,12 +1957,17 @@ describe("previous release update compatibility", () => {
   it.each([
     { latest: "2026.9.3", beta: "2026.9.4-beta.1", missing: "2026.9.4-beta.1" },
     { latest: "2026.9.4", beta: "2026.9.4", missing: "2026.9.4" },
+    { latest: "2026.9.3", beta: "2026.9.3", extendedStable: "2026.9.33", missing: "2026.9.33" },
   ])(
     "prints a complete refresh command when $missing leaves the window",
-    ({ latest, beta, missing }) => {
+    ({ latest, beta, extendedStable, missing }) => {
       const output = writeWindowInventory(createTempDir("update-compat-tag-refresh-"));
       const newIntegrity = `sha512-${Buffer.alloc(64, 1).toString("base64")}`;
-      const tags = { latest, beta };
+      const tags = {
+        latest,
+        beta,
+        ...(extendedStable ? { "extended-stable": extendedStable } : {}),
+      };
       const expectedCalls = [
         ["view", "openclaw", "dist-tags", "--json"],
         ["view", `openclaw@${missing}`, "openclaw.schemaVersions", "--json"],
@@ -1957,6 +2021,10 @@ describe("previous release update compatibility", () => {
   it.each([
     { tags: { beta: "2026.9.3" }, invalid: "latest" },
     { tags: { latest: "2026.9.3", beta: "not-a-release" }, invalid: "beta" },
+    {
+      tags: { latest: "2026.9.3", beta: "2026.9.3", "extended-stable": "not-a-release" },
+      invalid: "extended-stable",
+    },
   ])("refuses an absent or invalid $invalid dist-tag", ({ tags, invalid }) => {
     const output = writeWindowInventory(createTempDir("update-compat-invalid-tags-"));
     const npmArgs = ["view", "openclaw", "dist-tags", "--json"];
@@ -2018,17 +2086,26 @@ describe("previous release update compatibility", () => {
     expect(current.y()).toBe("npm");
   });
 
-  it("retains published cleanup-scope imports after package replacement", () => {
+  it("retains only terminal cleanup-scope imports after package replacement", () => {
     const target = "runtime-cleanup-abcdefgh.mjs";
     const { root, inventory } = recordImportedFixture(
-      `(await import("./${target}")).runCliDisposerAfterPending()`,
+      `(async () => {
+        const { prepare } = await import("./prepare-abcdefgh.mjs");
+        prepare();
+        try { return; } finally {
+          return (await import("./${target}")).runCliDisposerAfterPending();
+        }
+      })()`,
       {
+        "prepare-abcdefgh.mjs":
+          "//#region src/infra/gateway-scheduler.ts\nexport function prepare() {}\n",
         [target]:
           '//#region src/cli/runtime-cleanup.ts\nexport function runCliDisposerAfterPending() { return "old"; }\n',
       },
       undefined,
       "src/cli/runtime-cleanup-scope.ts",
     );
+    expect(inventory.releases[0]?.chunks.map((chunk) => chunk.path)).toEqual([target]);
     fsSync.unlinkSync(path.join(root, "dist", target));
     write(
       root,
@@ -2116,6 +2193,12 @@ describe("previous release update compatibility", () => {
     ["config-doctor", "missing"],
     ["native-hook-relay", "present"],
     ["native-hook-relay", "missing"],
+    ["control-ui", "present"],
+    ["control-ui", "missing"],
+    ["control-ui.build-123-fixture", "present"],
+    ["control-ui.build-123-fixture", "missing"],
+    ["control-ui.build-123-fixture.retired", "present"],
+    ["control-ui.build-123-fixture.retired", "missing"],
   ])(
     "excludes the isolated %s graph when the runtime binding is %s",
     async (directory, runtime) => {

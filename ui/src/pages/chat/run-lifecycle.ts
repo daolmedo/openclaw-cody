@@ -33,7 +33,6 @@ import { readChatSessionActionAccess } from "./chat-session-action-access.ts";
 import { formatConnectError } from "./connect-error.ts";
 import {
   getChatSessionProjection,
-  observeChatRunModel,
   reduceChatSessionProjection,
   setChatRunOwner,
 } from "./history-merge.ts";
@@ -55,6 +54,17 @@ export type ChatRunError = {
   /** Display ownership only; the session reducer retains each run's diagnostic. */
   runId?: string;
 };
+
+/** Only the latest terminal failure owns the visible recovery actions. */
+export function chatFailureRunId(
+  error: ChatRunError | null | undefined,
+  session: GatewaySessionRow | undefined,
+) {
+  return (
+    error?.runId ??
+    (session?.status === "failed" || session?.status === "timeout" ? session.lastRunId : undefined)
+  );
+}
 
 export type ChatRunUiStatus = {
   phase: "done" | "interrupted";
@@ -99,7 +109,6 @@ type ReconcileOptions = {
   agentId?: string;
   sessionKeys?: readonly (string | null | undefined)[];
   clearLocalRun?: boolean;
-  clearChatStream?: boolean;
   clearIndicators?: boolean;
   clearToolStream?: boolean;
   clearToolStreamForRun?: boolean;
@@ -496,12 +505,12 @@ export function reconcileChatRunLifecycle(host: RunLifecycleHost, options: Recon
   if (options.clearIndicators ?? true) {
     clearRunIndicators(host, runId);
   }
-  if (options.clearChatStream) {
+  if (options.clearLocalRun) {
     host.chatStream = null;
     host.chatStreamStartedAt = null;
-  }
-  if (options.clearLocalRun) {
-    observeChatRunModel(host, undefined);
+    if (!runId || host.chatReasoning?.runId === runId) {
+      host.chatReasoning = null;
+    }
     if (host.chatRunId) {
       host.chatRunLifecycleGeneration = (host.chatRunLifecycleGeneration ?? 0) + 1;
     }
@@ -672,7 +681,6 @@ export function reconcileChatRunFromSessionRow(
     reconcileChatRunLifecycle(host, {
       runId,
       clearLocalRun: true,
-      clearChatStream: true,
       clearToolStreamForRun: true,
       clearRunStatus: true,
     });
@@ -704,7 +712,6 @@ export function reconcileChatRunFromSessionRow(
     sessionKey: host.sessionKey,
     sessionKeys: [row.key],
     clearLocalRun: true,
-    clearChatStream: true,
     clearToolStreamForRun: true,
     publishRunStatus: options.publishRunStatus,
     // Shared rows can finish this run before its persisted reply event arrives.
